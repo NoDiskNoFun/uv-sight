@@ -30,7 +30,8 @@
     After a shot there is a lockout ("lockout", default 1.5 s): further
     impacts are ignored (vibration) and the tilt indicator pauses.
   - A training session starts with the first shot or with "shots start".
-  - A session ends after 1 h without a detected shot or with "shots stop".
+  - A session ends after "session_end" minutes (default 60) without a
+    detected shot, or with "shots stop".
     Normal movement does not count.
   - Scores: 0-10 or "x" (inner ten: 10 points, counted separately).
   - A session consists of ends. Each "score" line closes an end and is
@@ -149,26 +150,20 @@ const float VBAT_RECOVER_OFFSET = 0.25;
 // Brightness: percent -> LED current on a perceptual curve
 const float    BRIGHT_MAX_MA   = 15.0;  // current at 100 %
 const float    BRIGHT_GAMMA    = 2.2;   // 50 % looks about half as bright
-const float    BRIGHT_SMOOTH   = 0.35;  // auto mode: share of the change per reading (every 2 s)
 const uint8_t  PWM_BITS        = 12;    // fine steps at low brightness
 const uint16_t PWM_MAX         = (1u << PWM_BITS) - 1;
 
 // Tilt indicator (adjustable here in the sketch)
-const float    TILT_BLINK_MIN_HZ = 1.0;   // blink rate just outside the tolerance
-const float    TILT_BLINK_MAX_HZ = 8.0;   // blink rate at strong tilt (max ~10)
-const float    TILT_FULL_DEG     = 10.0;  // full blink rate from this tilt on
-const float    TILT_HYST_DEG     = 0.3;   // hysteresis against flicker at the tolerance edge
-const uint32_t TILT_SMOOTH_MS    = 400;   // smoothing against hand tremor
+const float    TILT_HYST_FRAC    = 0.3;   // hysteresis at the tolerance edge, share of level_tol
 const float    CAL_MIN_ANGLE_DEG = 15.0;  // minimum angle between calibration steps
 const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration measurement
 
 // Shot counter
 const uint8_t  SLOT_COUNT      = 32;
-const uint32_t SESSION_IDLE_MS = 60UL * 60UL * 1000UL; // 1 h without a shot = end of session
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "1.8";
+const char*    FW_VERSION        = "1.9";
 const uint8_t  PROTO_VERSION     = 4;
 
 // Bluetooth
@@ -205,6 +200,12 @@ struct Config {
   float    brightMax;    // % : fixed brightness, or brightness at dark_on and darker (auto)
   float    brightMin;    // % : auto: brightness at dark_off, where the light starts
   float    tiltOffset;   // %-points below brightMax while tilt-blinking
+  uint16_t sessionEndMin; // minutes without a shot until the session ends
+  uint16_t tiltSmoothMs;  // smoothing of the cant reading against hand tremor
+  float    tiltFullDeg;   // cant at which the blink rate reaches its end value
+  float    blinkMinHz;    // blink rate just outside the tolerance (normal style)
+  float    blinkMaxHz;    // blink rate from tiltFullDeg on (normal style)
+  float    fadeS;         // auto brightness: time to follow a change, s (0 = instant)
                          // (new fields are appended at the end so older stored
                          //  settings stay valid and get the default for them)
 };
@@ -233,7 +234,13 @@ const Config DEFAULTS = {
   0,       // brightMode (fixed)
   61.0f,   // brightMax (= 5 mA, the former default)
   25.0f,   // brightMin
-  32.0f    // tiltOffset (tilt blink at about 1 mA, the former default)
+  32.0f,   // tiltOffset (tilt blink at about 1 mA, the former default)
+  60,      // sessionEndMin
+  400,     // tiltSmoothMs
+  10.0f,   // tiltFullDeg
+  1.0f,    // blinkMinHz
+  8.0f,    // blinkMaxHz
+  5.0f     // fadeS
 };
 
 Config cfg = DEFAULTS;
@@ -259,6 +266,12 @@ const SettingDef SETTINGS[] = {
   {"bright",    S_F,   offsetof(Config, brightMax),   1,    100,  0, false, "%",      "brightness (fixed), or at dark_on and darker (auto)"},
   {"bright_min", S_F,  offsetof(Config, brightMin),   1,    100,  0, false, "%",      "auto: brightness at dark_off, where the light starts"},
   {"tilt_offset", S_F, offsetof(Config, tiltOffset),  0,    99,   0, false, "%",      "tilt blinking: points below the brightest level"},
+  {"fade",      S_F,   offsetof(Config, fadeS),       0,    30,   0, false, "s",      "auto brightness: time to follow a change, 0 = instant"},
+  {"tilt_full", S_F,   offsetof(Config, tiltFullDeg), 1,    30,   1, false, "deg",    "cant at which the blink rate reaches its end value"},
+  {"blink_min", S_F,   offsetof(Config, blinkMinHz),  0.5,  12,   1, false, "Hz",     "blink rate just outside the tolerance (normal style)"},
+  {"blink_max", S_F,   offsetof(Config, blinkMaxHz),  0.5,  12,   1, false, "Hz",     "blink rate at tilt_full and beyond (normal style)"},
+  {"tilt_smooth", S_U16, offsetof(Config, tiltSmoothMs), 50, 2000, 0, false, "ms",   "smoothing of the cant reading against hand tremor"},
+  {"session_end", S_U16, offsetof(Config, sessionEndMin), 5, 480, 0, false, "min",   "minutes without a shot until the session ends"},
   {"vf",        S_F,   offsetof(Config, vf),          2.5,  3.6,  2, false, "V",      "LED forward voltage"},
   {"cutoff",    S_F,   offsetof(Config, cutoff),      3.0,  3.7,  2, false, "V",      "battery cutoff"},
   {"level_tol", S_F,   offsetof(Config, levelTol),    0.2,  10,   1, false, "deg",    "tilt tolerance"},
@@ -941,7 +954,8 @@ void updateTilt() {
     for (uint8_t i = 0; i < 3; i++) tiltF[i] = a[i];
     tiltFilterOk = true;
   } else {
-    const float alpha = (float)LEVEL_LOOP_MS / (float)TILT_SMOOTH_MS;
+    float alpha = (float)LEVEL_LOOP_MS / (float)(cfg.tiltSmoothMs ? cfg.tiltSmoothMs : 1);
+    if (alpha > 1) alpha = 1;
     for (uint8_t i = 0; i < 3; i++) tiltF[i] += alpha * (a[i] - tiltF[i]);
   }
 
@@ -950,16 +964,16 @@ void updateTilt() {
   tiltDeg = fabsf(atan2f(gL, gD)) * 57.29578f;
 
   if (!tilted && tiltDeg > cfg.levelTol)                      tilted = true;
-  else if (tilted && tiltDeg < cfg.levelTol - TILT_HYST_DEG)  tilted = false;
+  else if (tilted && tiltDeg < cfg.levelTol * (1.0f - TILT_HYST_FRAC)) tilted = false;
 }
 
 float blinkHz() {
-  float span = TILT_FULL_DEG - cfg.levelTol;
+  float span = cfg.tiltFullDeg - cfg.levelTol;
   float f = (span <= 0) ? 1.0f : (tiltDeg - cfg.levelTol) / span;
   if (f < 0) f = 0;
   if (f > 1) f = 1;
   if (lvl.style == 1) f = 1.0f - f;   // inverted: fastest just outside the tolerance
-  return TILT_BLINK_MIN_HZ + f * (TILT_BLINK_MAX_HZ - TILT_BLINK_MIN_HZ);
+  return cfg.blinkMinHz + f * (cfg.blinkMaxHz - cfg.blinkMinHz);
 }
 
 // Average the gravity direction over ~0.6 s
@@ -1260,7 +1274,7 @@ void finishSession(bool manual) {
   shotLog.next = (shotLog.next + 1) % SLOT_COUNT;
   const bool ok = logSave();
 
-  say(String(manual ? "Session ended" : "Session ended automatically (1 h without a shot)") +
+  say(String(manual ? "Session ended" : "Session ended automatically (" + String(cfg.sessionEndMin) + " min without a shot)") +
       ": " + String(s.ends) + " ends (" + String(s.invalidEnds) + " invalid), " +
       String(s.scores) + " arrows scored, avg " + String(s.avgX100 / 100.0f, 2) +
       ", " + String(s.xCount) + " X, " + String(s.minutes) + " min" +
@@ -1519,6 +1533,7 @@ void handleSet(const String& args) {
   say(key + " = " + shown + "  (active, permanent with 'save')",
       "{\"t\":\"ack\",\"cmd\":\"set\",\"k\":\"" + key + "\",\"v\":" + shown + "}");
   if (cfg.darkOn >= cfg.darkOff) err("Warning: dark_on should be lower than dark_off.");
+  if (cfg.tiltFullDeg <= cfg.levelTol) err("Warning: tilt_full should be higher than level_tol.");
 }
 
 // Reboot into the UF2 bootloader, same as a double click on the reset button.
@@ -1724,7 +1739,11 @@ void evaluate() {
   // Steady brightness: jump after wake-up or in fixed mode, glide in auto mode
   const float target = brightTarget();
   if (brightNow < 0 || cfg.brightMode == 0) brightNow = target;
-  else brightNow += BRIGHT_SMOOTH * (target - brightNow);
+  else {
+    // share of the difference to follow per reading (exponential fade)
+    const float alpha = cfg.fadeS <= 0 ? 1.0f : 1.0f - expf(-(SENSOR_INTERVAL_MS / 1000.0f) / cfg.fadeS);
+    brightNow += alpha * (target - brightNow);
+  }
   dutyFull = dutyForVbat(lastVbat, percentToMa(brightNow));
   dutyTilt = dutyForVbat(lastVbat, percentToMa(tiltBrightness()));
 }
@@ -1807,8 +1826,8 @@ void loop() {
   // Shot detection only if the counter is on and the bow is in use
   imuSetFast(active && shotLog.shotsOn);
 
-  // End the session automatically after 1 h without a shot
-  if (sessionActive && (now - sessionLastShotMs) >= SESSION_IDLE_MS) {
+  // End the session automatically after session_end minutes without a shot
+  if (sessionActive && (now - sessionLastShotMs) >= cfg.sessionEndMin * 60000UL) {
     finishSession(false);
   }
 

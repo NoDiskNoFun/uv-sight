@@ -14,7 +14,7 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, browser tests of the app with simulated data. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 1.7, protocol 4, app 1.4 |
+> | Firmware / protocol / app | Firmware 1.9, protocol 4, app 1.8 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -41,9 +41,9 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 
 ## Features
 
-- **Automatic illumination:** The UV LED lights the sight's fluorescent fibre when it is dark and the bow is in use. Brightness is held steady over the whole battery discharge via PWM.
+- **Automatic illumination:** The UV LED lights the sight's fluorescent fibre when it is dark and the bow is in use. Brightness is set in percent, either fixed or fading in with the dusk. It is held steady over the whole battery discharge via PWM.
 - **Motion-based power management:** When the bow lies still, LED, light sensor and Bluetooth switch off and the board sleeps. Picking the bow up wakes it within about half a second.
-- **Cant indicator:** The LED blinks when the bow is canted sideways, faster the more it is tilted. Aiming up or down does not count. Modes: off, auto (during a session) and on (always).
+- **Cant indicator:** The LED blinks when the bow is canted sideways, faster the more it is tilted, or inverted: faster the closer to level. Aiming up or down does not count. Modes: off, auto (during a session) and on (always).
 - **Shot counter:** Detects every shot through the impact on the riser (IMU tap detection via hardware interrupt). Shots are grouped into ends and training sessions.
 - **Scoring:** Enter the scores of each end (0–10, X, M). Each end is checked against the counted shots. The last 32 sessions are stored on the device.
 - **Battery:** USB-C charging at a fixed 50 mA, charge status, battery percentage and a deep-discharge cutoff for the LED.
@@ -211,14 +211,16 @@ When a firmware update changes the layout of a file, that file starts over with 
 
 - **Active:** The bow was moved within the timeout (default 5 min). LED logic, light sensor and Bluetooth run.
 - **Idle:** The bow lies still. Everything is off, the board wakes every 0.5 s briefly to check the IMU. A Bluetooth connection is dropped when the board goes idle; a connection alone does not keep it awake.
-- A running session survives idle phases. It is only ended by 1 h without a shot, by `shots stop`, or by a restart of the board.
+- A running session survives idle phases. It is only ended by `session_end` minutes without a shot, by `shots stop`, or by a restart of the board.
 
 ### Illumination
 
 - Every 2 s the light sensor is read (0 = dark, 4095 = bright).
-- Below `dark_on` it counts as dark, above `dark_off` as bright again. The gap prevents flicker.
 - `confirm` readings in a row are needed to switch. Right after picking up the bow the decision is immediate.
-- The LED brightness (`ma`) is kept steady by PWM as the battery voltage drops.
+- **Brightness in percent** on a perceptual scale: 50 % looks about half as bright as 100 %. 100 % is 15 mA average, the former default of 5 mA is 61 %.
+- **Fixed** (`bright_mode 0`): below `dark_on` the LED switches on with `bright`, above `dark_off` it switches off. The gap prevents flicker.
+- **Auto** (`bright_mode 1`): getting darker, the LED comes on at `dark_off` with `bright_min` and gets brighter until it reaches `bright` at `dark_on`; below that it stays at `bright`. Getting brighter, it dims the same way and goes off above `dark_off`. The blend follows the light sensor logarithmically and glides over `fade` seconds instead of jumping.
+- The brightness is kept steady by PWM (12 bit) as the battery voltage drops.
 - Test modes: `mode on` (always on), `mode off` (always off), `mode auto` (normal). The mode is not saved.
 
 ### Cant indicator
@@ -228,7 +230,11 @@ When a firmware update changes the layout of a file, that file starts over with 
 | bright | LED off | LED blinks |
 | dark | LED on | LED blinks |
 
-- Blinking uses the reduced current `tilt_ma`. Just outside the tolerance it blinks at 1 Hz, from 10° on at 8 Hz, in between the rate rises linearly. A new rate takes effect at the start of the next blink cycle.
+- Blinking uses `bright` minus `tilt_offset` percentage points (0 = same brightness), independent of the current auto brightness.
+- **Style normal:** just outside the tolerance `blink_min` (1 Hz), from `tilt_full` (10°) on `blink_max` (8 Hz), in between the rate rises linearly.
+- **Style inverted** (`level style inverted`): just outside the tolerance `blink_max`, from `tilt_full` on `blink_min`, so fast blinking means you are close to level. Within the tolerance the LED behaves as in normal style (on when dark, off when bright).
+- The cant reading is smoothed over `tilt_smooth` against hand tremor. Leaving the tolerance switches at `level_tol`, returning at 70 % of it, so the edge does not flicker.
+- A new rate takes effect at the start of the next blink cycle.
 - Only sideways cant counts. Aiming up or down is ignored thanks to the two-step calibration.
 - After a shot the indicator pauses for `lockout` (default 1.5 s).
 
@@ -255,7 +261,7 @@ Each step waits 3 s, then measures for about 0.6 s. If the two positions differ 
   - Mismatch: the device asks `save anyway? (yes/no)`. `yes` saves your values and your arrow count wins over the sensor count. `no` discards the input and the end stays open. Any other command also discards the input.
   - `score skip` closes an end without scores: it is stored as invalid, the sensor's arrow count is used, all arrows count 0 points and are left out of the average.
 - **Scores:** `0`–`10` and `x` (inner ten: 10 points, counted separately). Several values per line, for example `score x 10 9 9 8 7`. If one value is invalid, the whole line is rejected. The app shows 0 as M (miss).
-- **Session end:** automatically after 1 h without a shot, or with `shots stop`. An open last end with exactly 1 shot is ignored (bow set down); with more shots it is stored as invalid. Sessions without any end are discarded.
+- **Session end:** automatically after `session_end` minutes (default 60) without a shot, or with `shots stop`. An open last end with exactly 1 shot is ignored (bow set down); with more shots it is stored as invalid. Sessions without any end are discarded.
 - **Stored per session:** ends, shots, scored arrows, average, X count, duration in minutes, invalid ends and arrows, flags (corrected by hand, ended by hand). There is no clock on the board; the app derives the date.
 - The log holds 32 sessions and overwrites the oldest one when full.
 
@@ -282,7 +288,7 @@ These are estimates, not measurements.
 | Mode | Current (approx.) | Runtime with 85 mAh |
 |---|---|---|
 | Idle (bow lies still) | 0.04–0.08 mA | several weeks up to about 2 months |
-| Active at night, LED at 5 mA | about 6 mA | about 14 h |
+| Active at night, LED at 61 % (5 mA) | about 6 mA | about 14 h |
 | Active in daylight, training, no LED | 0.5–1 mA | several days |
 
 Measurements taken with a USB power meter are not meaningful for battery runtime: with USB connected, the USB interface of the chip is active and the LED draws from the battery, not from USB.
@@ -312,6 +318,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `log` | Stored sessions, 1 = newest | – |
 | `level` | Cant indicator status | – |
 | `level off` / `auto` / `on` | Cant indicator mode | Immediately |
+| `level style normal` / `inverted` | Blink faster when tilted / when close to level | Immediately |
 | `level cal` / `level cal2` | Calibration step 1 / 2 | After step 2 |
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
 | `dfu` | Reboot into update mode (USB needed) | – |
@@ -322,15 +329,23 @@ Range is about 10 m at the default `tx_power` of 0 dBm; +8 dBm roughly doubles i
 
 ## Settings reference
 
-Change with `set <name> <value>`, keep with `save`. Out-of-range values are rejected.
+Change with `set <name> <value>`, keep with `save`. Out-of-range values are rejected. Settings saved by firmware before 1.8 in mA (`ma`, `tilt_ma`) are converted to percent automatically on the first start.
 
 | Name | Meaning | Unit | Default | Min | Max |
 |---|---|---|---|---|---|
-| `dark_on` | Light reading below which it is dark | 0–4095 | 900 | 0 | 4095 |
-| `dark_off` | Light reading above which it is bright again | 0–4095 | 1200 | 0 | 4095 |
+| `dark_on` | Fixed: light on below. Auto: full brightness from here down | 0–4095 | 900 | 0 | 4095 |
+| `dark_off` | Fixed: light off above. Auto: light starts here with `bright_min` | 0–4095 | 1200 | 0 | 4095 |
 | `confirm` | Consecutive readings (2 s each) before switching | count | 2 | 1 | 10 |
-| `ma` | Average LED current, steady light | mA | 5.0 | 0.5 | 15 |
-| `tilt_ma` | Average LED current while cant-blinking | mA | 1.0 | 0.2 | 15 |
+| `bright_mode` | 0 = fixed, 1 = auto (fades with the light sensor) | – | 0 | 0 | 1 |
+| `bright` | Brightness (fixed), or at `dark_on` and darker (auto) | % | 61 | 1 | 100 |
+| `bright_min` | Auto: brightness at `dark_off`, where the light starts | % | 25 | 1 | 100 |
+| `tilt_offset` | Cant blinking: percentage points below `bright` | % | 32 | 0 | 99 |
+| `fade` | Auto: time to follow a change in darkness, 0 = instant | s | 5 | 0 | 30 |
+| `tilt_full` | Cant at which the blink rate reaches its end value | degrees | 10.0 | 1 | 30 |
+| `blink_min` | Slow blink rate (normal: just outside the tolerance) | Hz | 1.0 | 0.5 | 12 |
+| `blink_max` | Fast blink rate (normal: from `tilt_full` on); above ~10 Hz it looks steady | Hz | 8.0 | 0.5 | 12 |
+| `tilt_smooth` | Smoothing of the cant reading against hand tremor | ms | 400 | 50 | 2000 |
+| `session_end` | Minutes without a shot until the session ends | min | 60 | 5 | 480 |
 | `vf` | Forward voltage of the UV LED (for the brightness control) | V | 3.00 | 2.50 | 3.60 |
 | `cutoff` | Battery cutoff for the LED, equals 0 % | V | 3.40 | 3.00 | 3.70 |
 | `level_tol` | Cant tolerance | degrees | 1.0 | 0.2 | 10 |
@@ -354,13 +369,11 @@ These are set at the top of the sketch and need a rebuild.
 | Constant | Value | Meaning |
 |---|---|---|
 | `SLOT_COUNT` | 32 | Stored sessions (1–255). Changing it resets the log. |
-| `SESSION_IDLE_MS` | 1 h | Time without a shot until the session ends automatically |
+| `BRIGHT_MAX_MA` | 15 mA | LED current at 100 % |
+| `BRIGHT_GAMMA` | 2.2 | Perceptual curve from percent to current |
+| `PWM_BITS` | 12 | PWM resolution for fine steps at low brightness |
 | `MAX_SCORES_LINE` | 40 | Maximum values per `score` line |
-| `TILT_BLINK_MIN_HZ` | 1.0 Hz | Blink rate just outside the tolerance |
-| `TILT_BLINK_MAX_HZ` | 8.0 Hz | Blink rate at strong cant (above ~10 Hz it looks like steady light) |
-| `TILT_FULL_DEG` | 10° | Cant at which the maximum rate is reached |
-| `TILT_HYST_DEG` | 0.3° | Hysteresis at the tolerance edge |
-| `TILT_SMOOTH_MS` | 400 ms | Smoothing against hand tremor |
+| `TILT_HYST_FRAC` | 0.3 | Hysteresis at the tolerance edge as a share of `level_tol` |
 | `CAL_MIN_ANGLE_DEG` | 15° | Minimum angle between the calibration steps |
 | `CAL_COUNTDOWN_MS` | 3000 ms | Wait before a calibration measurement |
 | `SENSOR_INTERVAL_MS` | 2000 ms | Light and battery reading interval |
@@ -403,11 +416,12 @@ If the device chooser stays empty, give Chrome the permission *Nearby devices* (
 
 ### Tabs
 
-- **Status:** battery ring with percentage and voltage, session, LED, ambient light, cant, charging. Refreshes every 5 s while open.
+- **Status:** battery ring with percentage and voltage, session, UV light with brightness and mode (fixed/auto), ambient light, cant with mode and style, charging, and runtime estimates with light and resting. Refreshes every 5 s while open.
+- **Runtime estimate:** remaining capacity (battery capacity × percentage) divided by an estimated current: LED at `bright` plus about 0.6 mA for the awake board, 0.2 mA each for shot detection and the cant indicator when switched on; resting about 0.06 mA. In auto mode the estimate assumes full brightness. Set the battery capacity under *Settings → Firmware and app* (default 85 mAh, stored on the phone).
 - **Training:** current end with live shot count, session statistics, keypad in target ring colours (`1 2 3 / 4 5 6 / 7 8 9 / 10 X M`, undo), save end, skip end, end session. Scoring works without a connection; Save, Skip and End reconnect automatically (up to 10 s) and keep your entries if the sight is out of range. Entries survive an app restart. Mismatch questions appear as a dialog; *Edit scores* keeps your entries for correction.
 - **History:** sessions from the device are archived on the phone without duplicates, with date, chart of the average and CSV export. Removing an entry only affects the phone.
 - **Dates:** the sight has no clock. The app takes the date from the phone: when a session ends while connected, from `ago` when fetched later, or from the start time it remembered while it saw the session running. Only if the app was never connected during a session and the sight restarted before the session was fetched, the list shows "Before <fetch time>".
-- **Settings:** shot counter, cant indicator (off/auto/on), LED test, all settings grouped with slider, number field, description, default and range, save bar, restore defaults, guided cant calibration, update mode, install button, versions.
+- **Settings:** battery capacity for the estimate, shot counter, cant indicator (off/auto/on) and blink style (normal/inverted), LED test, brightness mode (fixed/auto), all settings grouped with slider, number field, description, default and range, save bar, restore defaults, guided cant calibration, update mode, install button, versions.
 - **Console:** raw lines and free command input for troubleshooting.
 
 The archive is stored in Chrome's site data. Clearing Chrome's site data deletes it; export CSV now and then as a backup.
@@ -423,7 +437,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | Type | Fields | Sent |
 |---|---|---|
 | `hello` | `proto`, `fw`, `name`, `imu` | On `app on` |
-| `status` | `light`, `dark`, `vbat`, `pct`, `chg` (`charging`/`full`/`no USB`), `led` (`on`/`off`/`blinking`), `duty`, `mode`, `lowbat`, `tilt` (degrees or `null`), `session`, `end`, `endShots` | On `status`, with `live on` every 2 s, every `report` s |
+| `status` | `light`, `dark`, `vbat`, `pct`, `chg` (`charging`/`full`/`no USB`), `led` (`on`/`off`/`blinking`), `duty` (0–4095), `bright` (%), `mode`, `lowbat`, `tilt` (degrees or `null`), `session`, `end`, `endShots` | On `status`, with `live on` every 2 s, every `report` s |
 | `cfgStart` | `n` | Start of the settings list |
 | `cfgItem` | `k`, `v`, `def`, `min`, `max`, `dec`, `zero`, `unit`, `d` | One per setting |
 | `cfgEnd` | – | End of the settings list |
@@ -436,7 +450,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `logStart` | `count`, `epoch` | Start of the log |
 | `slot` | `i`, `id`, `ago`, `ends`, `shots`, `scored`, `avg`, `x`, `min`, `invalidEnds`, `invalidArrows`, `mismatch`, `manual` | One per stored session |
 | `logEnd` | – | End of the log |
-| `level` | `mode` (`off`/`auto`/`on`), `on`, `cal`, `tol`, `active`, `tilt` | On `level`, after changes |
+| `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `on`, `cal`, `tol`, `active`, `tilt` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
 | `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`) | Device events |
 | `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu` | Confirmation of a command |
@@ -460,6 +474,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | Protocol warning in the app | Firmware and app versions do not match. Update both. |
 | Status reports keep coming after `live off` | That is the periodic `report`. Set `report 0` to switch it off. |
 | LED switches nervously at dusk | Raise `confirm` or widen the gap between `dark_on` and `dark_off`. |
+| Fibre too bright in full darkness | Lower `bright`; in auto mode it applies from `dark_on` down. |
 | Shots are not counted | Check `shots` is on and the housing is screwed rigidly. Lower `tap_ths`. |
 | Carrying the bow counts as a shot | Raise `tap_ths`. Setting the bow down at the end of a session is handled automatically. |
 | Cant indicator never blinks | Check `level`: mode, calibration, and in auto mode a running session. |

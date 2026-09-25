@@ -369,6 +369,7 @@
           <div><b id="tX">0</b><span>X</span></div>
         </div>
         <div class="last-end" id="tLast" hidden></div>
+        <div class="last-end" id="tOffline" hidden>Not connected. Keep scoring: the app reconnects when you tap Save.</div>
       </div>
 
       <div class="entry" id="entry" aria-live="polite"></div>
@@ -385,7 +386,7 @@
         <button class="r-gold"  data-v="9">9</button>
         <button class="r-gold"  data-v="10">10</button>
         <button class="r-gold"  data-v="X">X</button>
-        <button class="r-miss"  data-v="0">0</button>
+        <button class="r-miss"  data-v="M" aria-label="Miss">M</button>
         <button class="undo" id="btnUndo">↶ Undo</button>
       </div>
 
@@ -406,6 +407,7 @@
     <div class="chart" id="chart" hidden>
       <h3>Average per session</h3>
       <svg id="chartSvg" viewBox="0 0 320 150" preserveAspectRatio="none" role="img" aria-label="Average per session"></svg>
+      <p class="gnote" id="chartHint" hidden></p>
     </div>
     <ul class="sessions" id="sessionList"></ul>
     <div class="empty" id="historyEmpty">
@@ -486,11 +488,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 3;
+const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.0";
+const APP_VERSION     = "1.3";
 
 // ---------------------------------------------------------------------------
 // State
@@ -512,6 +514,21 @@ let awaitingEnd = false;   // score line sent, waiting for end / confirm / err
 let awaitTimer = null;
 let confirmOpen = false;
 let lastEnd = null;        // last closed end, for the summary line
+let reconnecting = false;  // Save/Skip/End is re-establishing the connection
+const TRAIN_KEY = "uvsight.training.v1";
+const RECONNECT_TIMEOUT_MS = 10000;
+
+// Entries and the last known session survive app restarts and lost connections
+function saveTraining() {
+  try { localStorage.setItem(TRAIN_KEY, JSON.stringify({ entries, session: state.session })); } catch {}
+}
+function loadTraining() {
+  try {
+    const t = JSON.parse(localStorage.getItem(TRAIN_KEY));
+    if (t && Array.isArray(t.entries)) entries = t.entries;
+    if (t && t.session && t.session.active) state.session = t.session;
+  } catch {}
+}
 
 const $ = (id) => document.getElementById(id);
 const decoder = new TextDecoder();
@@ -702,6 +719,7 @@ function handleLine(line) {
       toast(m.text, true);
       break;
   }
+  if (m.t === "session" || m.t === "end" || m.t === "sessionEnd" || m.t === "shot") saveTraining();
   render();
 }
 
@@ -777,9 +795,10 @@ function render() {
   const lv = state.level;
   let tiltText;
   if (s.tilt !== null && s.tilt !== undefined) tiltText = s.tilt.toFixed(1) + "°";
-  else if (!lv || !lv.on)                      tiltText = "Off";
+  else if (!lv || lv.mode === "off")           tiltText = "Off";
   else if (!lv.cal)                            tiltText = "Not calibrated";
-  else                                         tiltText = "Waits for a session";
+  else if (lv.mode === "auto")                 tiltText = "Waits for a session";
+  else                                         tiltText = "Waiting for a reading";
   $("vTilt").textContent = tiltText;
 
   $("vCharge").textContent = chargeLabel(s.chg);
@@ -799,28 +818,31 @@ function ringClass(v) {
   if (v === "2" || v === "1") return "r-white";
   return "r-miss";
 }
-const points = (v) => (v === "X" ? 10 : Number(v));
+const points = (v) => (v === "X" ? 10 : v === "M" ? 0 : Number(v));
 
 function renderTraining() {
   const connected = state.conn === "connected";
   const ses = state.session;
+  const known = !!(ses && ses.active);          // session known (live or last seen)
   const off  = connected && ses && !ses.counter;
   const idle = connected && ses && ses.counter && !ses.active;
-  const run  = !!(ses && ses.active);
+  const run  = known || !connected;             // scoring works without a connection
 
-  $("trainNotConnected").hidden = connected || run;
+  $("trainNotConnected").hidden = true;
   $("trainOff").hidden  = !off;
   $("trainIdle").hidden = !idle;
   $("trainRun").hidden  = !run;
+  $("tOffline").hidden  = connected;
   if (!run) return;
 
-  $("tEnd").textContent     = "End " + ses.end;
-  $("tCounted").textContent = ses.endShots;
-  $("tCountedLbl").textContent = ses.endShots === 1 ? "shot counted" : "shots counted";
-  $("tEnds").textContent    = ses.ends;
-  $("tArrows").textContent  = ses.scored;
-  $("tAvg").textContent     = Number(ses.avg).toFixed(2);
-  $("tX").textContent       = ses.x;
+  const dash = "–";
+  $("tEnd").textContent     = known ? "End " + ses.end : "Scoring";
+  $("tCounted").textContent = known ? ses.endShots : dash;
+  $("tCountedLbl").textContent = known && ses.endShots === 1 ? "shot counted" : "shots counted";
+  $("tEnds").textContent    = known ? ses.ends : dash;
+  $("tArrows").textContent  = known ? ses.scored : dash;
+  $("tAvg").textContent     = known ? Number(ses.avg).toFixed(2) : dash;
+  $("tX").textContent       = known ? ses.x : dash;
 
   const le = $("tLast");
   if (lastEnd) {
@@ -853,12 +875,12 @@ function renderTraining() {
     box.appendChild(sum);
   }
 
-  const busy = awaitingEnd || !connected;
+  const busy = awaitingEnd || reconnecting;
   $("btnSend").disabled = busy || !entries.length;
-  $("btnSend").textContent = awaitingEnd ? "Saving…" : `Save end (${entries.length})`;
+  $("btnSend").textContent = reconnecting ? "Connecting…" : awaitingEnd ? "Saving…" : `Save end (${entries.length})`;
   $("btnUndo").disabled = busy || !entries.length;
-  $("btnSkip").disabled = busy || ses.endShots === 0;
-  $("btnStop").disabled = busy;
+  $("btnSkip").disabled = busy || !known || ses.endShots === 0;
+  $("btnStop").disabled = busy || !known;
   document.querySelectorAll("#keypad [data-v]").forEach((b) => {
     b.disabled = busy || entries.length >= MAX_ARROWS;
   });
@@ -876,12 +898,68 @@ function setAwaiting(on) {
   }
 }
 
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+// Reconnect if needed. Returns true when the sight is connected.
+let connectPromise = null;
+function ensureConnected() {
+  if (state.conn === "connected") return Promise.resolve(true);
+  if (connectPromise) return connectPromise;
+  connectPromise = (async () => {
+    try {
+      // Known device from this app session, or one Chrome remembers
+      if (!device && navigator.bluetooth && navigator.bluetooth.getDevices) {
+        const list = await navigator.bluetooth.getDevices();
+        device = list.find((d) => d.name && d.name.startsWith("UV-Sight")) || null;
+        if (device) device.addEventListener("gattserverdisconnected", onDisconnected);
+      }
+      if (!device) {                      // first time: the chooser needs this tap
+        await connect();
+        return state.conn === "connected";
+      }
+      await withTimeout(openGatt(), RECONNECT_TIMEOUT_MS);
+      return true;
+    } catch (e) {
+      try { if (device) device.gatt.disconnect(); } catch {}   // also cancels a pending connect
+      setConn("off");
+      return false;
+    } finally {
+      connectPromise = null;
+    }
+  })();
+  return connectPromise;
+}
+
+// Runs an action that needs the sight; reconnects first if necessary
+async function withConnection(action) {
+  if (state.conn !== "connected") {
+    reconnecting = true;
+    render();
+    const ok = await ensureConnected();
+    reconnecting = false;
+    if (!ok) {
+      toast("Sight not reachable. Your scores are kept, tap again when you are in range.", true);
+      render();
+      return false;
+    }
+  }
+  action();
+  return true;
+}
+
 function sendEnd() {
-  if (!entries.length || awaitingEnd) return;
-  const tokens = entries.map((v) => (v === "X" ? "x" : v));
-  setAwaiting(true);
-  send("score " + tokens.join(" "));
-  render();
+  if (!entries.length || awaitingEnd || reconnecting) return;
+  withConnection(() => {
+    const tokens = entries.map((v) => (v === "X" ? "x" : v === "M" ? "0" : v));
+    setAwaiting(true);
+    send("score " + tokens.join(" "));
+    render();
+  });
 }
 
 function askMismatch(m) {
@@ -924,9 +1002,10 @@ $("keypad").addEventListener("click", (e) => {
   if (entries.length >= MAX_ARROWS) return;
   entries.push(b.dataset.v);
   if (navigator.vibrate) navigator.vibrate(12);
+  saveTraining();
   render();
 });
-$("btnUndo").addEventListener("click", () => { entries.pop(); render(); });
+$("btnUndo").addEventListener("click", () => { entries.pop(); saveTraining(); render(); });
 $("btnSend").addEventListener("click", sendEnd);
 
 $("btnSkip").addEventListener("click", async () => {
@@ -938,9 +1017,12 @@ $("btnSkip").addEventListener("click", async () => {
     yes: "Skip end", no: "Cancel", danger: true,
   });
   if (!ok) return;
-  entries = [];
-  send("score skip");
-  render();
+  withConnection(() => {
+    entries = [];
+    saveTraining();
+    send("score skip");
+    render();
+  });
 });
 
 $("btnStop").addEventListener("click", async () => {
@@ -949,7 +1031,7 @@ $("btnStop").addEventListener("click", async () => {
   if (entries.length) text += " Scores you haven't saved yet are lost.";
   if (s.endShots > 1) text += ` The ${s.endShots} shots of the open end are stored as invalid.`;
   const ok = await dialog({ title: "End session?", text, yes: "End session", no: "Cancel", danger: true });
-  if (ok) send("shots stop");
+  if (ok) withConnection(() => send("shots stop"));
 });
 
 $("btnCounterOn").addEventListener("click", () => send("shots on"));
@@ -1048,8 +1130,13 @@ function renderHistory() {
 
 function renderChart(list) {
   const pts = list.filter((r) => r.scored > 0).slice(0, 20).reverse();
-  $("chart").hidden = pts.length < 2;
-  if (pts.length < 2) return;
+  const enough = pts.length >= 2;
+  $("chart").hidden = list.length === 0;
+  $("chartSvg").style.display = enough ? "" : "none";
+  $("chartHint").hidden = enough;
+  $("chartHint").textContent = "The chart appears as soon as two sessions with scores are stored on this phone" +
+    (pts.length === 1 ? ". One is there so far." : ".");
+  if (!enough) return;
   const W = 320, H = 150, L = 30, R = 8, T = 10, B = 18;
   const vals = pts.map((r) => Number(r.avg));
   let lo = Math.floor(Math.min(...vals) - 0.3), hi = Math.ceil(Math.max(...vals) + 0.3);
@@ -1127,7 +1214,7 @@ const GROUPS = [
   { title: "Cant",         keys: ["level_tol"], cal: true },
   { title: "Shot detection", keys: ["tap_ths", "lockout"] },
   { title: "Battery",      keys: ["cutoff"] },
-  { title: "Power and Bluetooth", keys: ["ths", "timeout", "report"] },
+  { title: "Power and Bluetooth", keys: ["ths", "timeout", "report", "tx_power"] },
 ];
 const DESCS = {
   dark_on: "The light turns on below this reading.",
@@ -1143,12 +1230,14 @@ const DESCS = {
   ths: "Lower wakes the sight with smaller movements.",
   timeout: "The sight sleeps after this time without movement.",
   report: "Automatic status message while connected.",
+  tx_power: "More range, slightly more current while the sight is active. Rounded to the steps the radio supports.",
 };
 const LABELS = {
   dark_on: "Dark below", dark_off: "Bright above", confirm: "Readings before switching",
   ma: "Brightness", tilt_ma: "Cant blink brightness", vf: "LED forward voltage",
   level_tol: "Tolerance", tap_ths: "Shot threshold", lockout: "Pause after a shot",
   cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Status report every",
+  tx_power: "Radio power",
 };
 
 function shownValue(it, v) {
@@ -1202,6 +1291,25 @@ function settingRow(it) {
   return div;
 }
 
+// Row with a segmented control, e.g. Off / Auto / On
+function segRow(label, desc, current, modes, onPick) {
+  const row = document.createElement("div");
+  row.className = "switchrow";
+  row.innerHTML = `<div><div class="lbl"></div><div class="desc"></div></div><div class="seg" role="group"></div>`;
+  row.querySelector(".lbl").textContent = label;
+  row.querySelector(".desc").textContent = desc;
+  const seg = row.querySelector(".seg");
+  seg.setAttribute("aria-label", label);
+  for (const m of modes) {
+    const b = document.createElement("button");
+    b.textContent = m[0].toUpperCase() + m.slice(1);
+    b.setAttribute("aria-pressed", String(m === current));
+    b.addEventListener("click", () => onPick(m));
+    seg.appendChild(b);
+  }
+  return row;
+}
+
 function switchRow(label, desc, checked, onChange) {
   const row = document.createElement("div");
   row.className = "switchrow";
@@ -1245,19 +1353,13 @@ function renderSettings() {
     if (!on && ses.active) { cb.checked = true; toast("End the running session first.", true); return; }
     send(on ? "shots on" : "shots off");
   }));
-  sw.appendChild(switchRow("Cant indicator", "Blinks the LED when the bow is canted, during a session.", !!lv.on,
-    (on) => send(on ? "level on" : "level off")));
-  const modeRow = document.createElement("div");
-  modeRow.className = "switchrow";
-  modeRow.innerHTML = `<div><div class="lbl">LED test</div><div class="desc">Force the light on or off. Back to Auto on restart.</div></div>
-    <div class="seg" role="group" aria-label="LED mode">
-      <button data-m="auto">Auto</button><button data-m="on">On</button><button data-m="off">Off</button></div>`;
-  const cur = (state.status && state.status.mode) || "auto";
-  modeRow.querySelectorAll("[data-m]").forEach((b) => {
-    b.setAttribute("aria-pressed", String(b.dataset.m === cur));
-    b.addEventListener("click", () => send("mode " + b.dataset.m));
-  });
-  sw.appendChild(modeRow);
+  const lvMode = lv.mode || "off";
+  sw.appendChild(segRow("Cant indicator",
+    lvMode === "auto" ? "Blinks only during a session."
+    : lvMode === "on" ? "Blinks whenever the bow is in use."
+    : "No blinking.", lvMode, ["off", "auto", "on"], (m) => send("level " + m)));
+  sw.appendChild(segRow("LED test", "Back to Auto on restart.",
+    (state.status && state.status.mode) || "auto", ["off", "auto", "on"], (m) => send("mode " + m)));
 
   // Groups
   const host = $("setGroups");
@@ -1440,6 +1542,7 @@ if (!navigator.bluetooth) {
   $("unsupported").hidden = false;
   $("btnConnect").disabled = true;
 }
+loadTraining();
 render();
 renderHistory();
 

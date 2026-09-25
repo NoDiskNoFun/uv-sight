@@ -14,7 +14,7 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, browser tests of the app with simulated data. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 1.6, protocol 4, app 1.2 |
+> | Firmware / protocol / app | Firmware 1.7, protocol 4, app 1.4 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -404,8 +404,9 @@ If the device chooser stays empty, give Chrome the permission *Nearby devices* (
 ### Tabs
 
 - **Status:** battery ring with percentage and voltage, session, LED, ambient light, cant, charging. Refreshes every 5 s while open.
-- **Training:** current end with live shot count, session statistics, keypad in target ring colours (`1 2 3 / 4 5 6 / 7 8 9 / 10 X M`, undo), save end, skip end, end session. Mismatch questions appear as a dialog; *Edit scores* keeps your entries for correction.
+- **Training:** current end with live shot count, session statistics, keypad in target ring colours (`1 2 3 / 4 5 6 / 7 8 9 / 10 X M`, undo), save end, skip end, end session. Scoring works without a connection; Save, Skip and End reconnect automatically (up to 10 s) and keep your entries if the sight is out of range. Entries survive an app restart. Mismatch questions appear as a dialog; *Edit scores* keeps your entries for correction.
 - **History:** sessions from the device are archived on the phone without duplicates, with date, chart of the average and CSV export. Removing an entry only affects the phone.
+- **Dates:** the sight has no clock. The app takes the date from the phone: when a session ends while connected, from `ago` when fetched later, or from the start time it remembered while it saw the session running. Only if the app was never connected during a session and the sight restarted before the session was fetched, the list shows "Before <fetch time>".
 - **Settings:** shot counter, cant indicator (off/auto/on), LED test, all settings grouped with slider, number field, description, default and range, save bar, restore defaults, guided cant calibration, update mode, install button, versions.
 - **Console:** raw lines and free command input for troubleshooting.
 
@@ -426,7 +427,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `cfgStart` | `n` | Start of the settings list |
 | `cfgItem` | `k`, `v`, `def`, `min`, `max`, `dec`, `zero`, `unit`, `d` | One per setting |
 | `cfgEnd` | – | End of the settings list |
-| `session` | `counter`, `active`; if active also `end`, `endShots`, `ends`, `invalidEnds`, `shots`, `scored`, `sum`, `x`, `avg`, `min`, `pending` | On `shots`, after every change |
+| `session` | `counter`, `active`; if active also `epoch`, `nextId`, `end`, `endShots`, `ends`, `invalidEnds`, `shots`, `scored`, `sum`, `x`, `avg`, `min`, `pending` | On `shots`, after every change |
 | `shot` | `end`, `endShots`, `total` | Every detected shot |
 | `end` | `n`, `valid`; valid: `arrows`, `sum`, `x`, `avg`; invalid: `arrows`, `reason` | An end was closed |
 | `confirm` | `end`, `counted`, `entered` | Mismatch, answer with `yes` or `no` |
@@ -442,7 +443,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |
 
-**Session identity:** `epoch` is a random number of the log, newly created whenever the log starts empty. `id` is a running session number. `epoch` + `id` identify a session uniquely. `ago` is the number of minutes since the session was saved, or `null` after a reboot of the board.
+**Session identity:** `epoch` is a random number of the log, newly created whenever the log starts empty. `id` is a running session number. `epoch` + `id` identify a session uniquely. A running session already reports the key it will get (`epoch` + `nextId`). `ago` is the number of minutes since the session was saved, or `null` after a reboot of the board.
 
 **Why short lines:** long lines (about 1,500 characters) were lost or corrupted over Bluetooth in practice. The settings are therefore sent as one short line per item. No line is longer than about 350 characters.
 
@@ -473,7 +474,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 
 ## Known limitations
 
-- **No clock:** sessions have no timestamp on the device. Dates come from the app and are unknown after a board reboot.
+- **No clock:** sessions have no timestamp on the device. Dates come from the phone and are only approximate ("Before …") if the app never saw the session running and the sight restarted before it was fetched.
 - **Shot detection by impact threshold:** setting the bow down hard can count as a shot. The threshold has to be tuned per bow and mounting position.
 - **No Bluetooth security:** anyone in range can connect and change settings while the bow is active.
 - **Cold:** below 0 °C LiPo capacity drops noticeably; runtime will be shorter than estimated.

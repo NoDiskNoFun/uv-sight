@@ -153,7 +153,7 @@ const uint32_t SESSION_IDLE_MS = 60UL * 60UL * 1000UL; // 1 h without a shot = e
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "1.5";
+const char*    FW_VERSION        = "1.6";
 const uint8_t  PROTO_VERSION     = 4;
 
 // Bluetooth
@@ -163,7 +163,6 @@ const uint16_t ADV_SLOW_INTERVAL = 1636;  // ~1 s afterwards
 const uint16_t ADV_FAST_TIMEOUT  = 10;    // s
 const uint16_t CONN_INT_MIN      = 160;   // 200 ms (unit 1.25 ms)
 const uint16_t CONN_INT_MAX      = 320;   // 400 ms
-const int8_t   BLE_TX_POWER      = 0;     // dBm, enough for ~10 m
 const uint16_t BLE_MTU           = 247;   // max. packet size (default would be 23)
 const uint8_t  BLE_SEND_RETRIES  = 50;    // retries per packet when the queue is full
 const uint16_t BLE_RETRY_MS      = 20;    // wait between retries
@@ -186,6 +185,7 @@ struct Config {
   float    tiltMa;       // LED current while tilt-blinking in mA
   float    levelTol;     // tilt tolerance in degrees
   uint32_t lockoutMs;    // after a shot: ignore impacts + pause tilt indicator, ms
+  int8_t   txPower;      // Bluetooth transmit power in dBm
                          // (new fields are appended at the end so older stored
                          //  settings stay valid and get the default for them)
 };
@@ -209,13 +209,14 @@ const Config DEFAULTS = {
   10,      // reportS
   1.0f,    // tiltMa
   1.0f,    // levelTol (degrees)
-  1500     // lockoutMs
+  1500,    // lockoutMs
+  0        // txPower (dBm, about 10 m)
 };
 
 Config cfg = DEFAULTS;
 
 // One table for all settings: used by "set", "get" and the JSON cfg list
-enum SType : uint8_t { S_U8, S_U16, S_U32, S_F };
+enum SType : uint8_t { S_U8, S_I8, S_U16, S_U32, S_F };
 struct SettingDef {
   const char* key;
   SType       type;
@@ -241,6 +242,7 @@ const SettingDef SETTINGS[] = {
   {"lockout",   S_U32, offsetof(Config, lockoutMs),   200,  5000, 0, false, "ms",     "after a shot: no counting, no tilt"},
   {"timeout",   S_U32, offsetof(Config, timeoutS),    10,   3600, 0, false, "s",      "without movement until idle"},
   {"report",    S_U32, offsetof(Config, reportS),     2,    600,  0, true,  "s",      "between status reports, 0 = off"},
+  {"tx_power",  S_I8,  offsetof(Config, txPower),     -20,  8,    0, false, "dBm",    "radio power, higher = more range and current"},
 };
 const uint8_t SETTING_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
 
@@ -406,6 +408,7 @@ float getSetting(const Config& c, const SettingDef& d) {
   const uint8_t* p = (const uint8_t*)&c + d.off;
   switch (d.type) {
     case S_U8:  return *p;
+    case S_I8:  return (int8_t)*p;
     case S_U16: { uint16_t x; memcpy(&x, p, 2); return x; }
     case S_U32: { uint32_t x; memcpy(&x, p, 4); return x; }
     default:    { float x;    memcpy(&x, p, 4); return x; }
@@ -416,6 +419,7 @@ void setSetting(Config& c, const SettingDef& d, float v) {
   uint8_t* p = (uint8_t*)&c + d.off;
   switch (d.type) {
     case S_U8:  *p = (uint8_t)lroundf(v); break;
+    case S_I8:  { int8_t x = (int8_t)lroundf(v); memcpy(p, &x, 1); break; }
     case S_U16: { uint16_t x = (uint16_t)lroundf(v); memcpy(p, &x, 2); break; }
     case S_U32: { uint32_t x = (uint32_t)lroundf(v); memcpy(p, &x, 4); break; }
     default:    { memcpy(p, &v, 4); break; }
@@ -431,6 +435,23 @@ const SettingDef* findSetting(const String& key) {
     if (key == SETTINGS[i].key) return &SETTINGS[i];
   }
   return nullptr;
+}
+
+// The radio only supports certain power steps: use the nearest one
+int8_t snapTxPower(int8_t v) {
+  static const int8_t steps[] = { -20, -16, -12, -8, -4, 0, 2, 3, 4, 5, 6, 7, 8 };
+  int8_t best = steps[0];
+  for (int8_t s : steps) if (abs(s - v) < abs(best - v)) best = s;
+  return best;
+}
+
+void applyTxPower() {
+  cfg.txPower = snapTxPower(cfg.txPower);
+  Bluefruit.setTxPower(cfg.txPower);
+  if (Bluefruit.Advertising.isRunning()) {   // refresh the advertised power value
+    Bluefruit.Advertising.stop();
+    Bluefruit.Advertising.start(0);
+  }
 }
 
 // ============================================================================
@@ -1402,6 +1423,7 @@ void handleSet(const String& args) {
   setSetting(cfg, *d, v);
   imuSetThs(cfg.wakeThs);        // apply IMU thresholds right away
   imuSetTapThs(cfg.tapThs);
+  if (key == "tx_power") applyTxPower();
 
   const String shown = fmtSetting(*d, getSetting(cfg, *d));
   say(key + " = " + shown + "  (active, permanent with 'save')",
@@ -1466,6 +1488,7 @@ void handleCommand(String line) {
     cfg = DEFAULTS;
     imuSetThs(cfg.wakeThs);
     imuSetTapThs(cfg.tapThs);
+    applyTxPower();
     if (appMode) sendCfg();
     else         out("Default values loaded (permanent with 'save').");
   }
@@ -1524,7 +1547,8 @@ void bleInit() {
   Bluefruit.autoConnLed(false);                  // blue board LED off (saves power)
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);  // large packets + bigger send queue
   Bluefruit.begin();
-  Bluefruit.setTxPower(BLE_TX_POWER);
+  cfg.txPower = snapTxPower(cfg.txPower);
+  Bluefruit.setTxPower(cfg.txPower);
   Bluefruit.setName(BLE_NAME);
   Bluefruit.Periph.setConnInterval(CONN_INT_MIN, CONN_INT_MAX);
   Bluefruit.Periph.setConnectCallback(onConnect);

@@ -492,7 +492,7 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.3";
+const APP_VERSION     = "1.4";
 
 // ---------------------------------------------------------------------------
 // State
@@ -648,7 +648,10 @@ function handleLine(line) {
       }
       cfgBuf = null;
       break;
-    case "session": state.session = m; break;
+    case "session":
+      state.session = m;
+      rememberStart(m);
+      break;
     case "level":   state.level   = m; break;
     case "shot":
       if (state.session) {
@@ -1055,6 +1058,39 @@ function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = nu
 // History: archive on this phone (localStorage)
 // ---------------------------------------------------------------------------
 const ARCHIVE_KEY = "uvsight.archive.v1";
+const STARTS_KEY  = "uvsight.starts.v1";     // log key -> start time of sessions seen running
+const STARTS_KEEP_MS = 90 * 24 * 3600 * 1000;
+
+function loadStarts() {
+  try { return JSON.parse(localStorage.getItem(STARTS_KEY)) || {}; } catch { return {}; }
+}
+
+// A running session reports the key it will get in the log (epoch + nextId).
+// Its start time is remembered, so the date is known even if the sight
+// restarts before the session is fetched.
+function rememberStart(m) {
+  if (!m.active || !m.epoch || !m.nextId) return;
+  const starts = loadStarts();
+  const key = `${m.epoch}-${m.nextId}`;
+  if (starts[key]) return;                                  // first sighting is kept
+  starts[key] = Date.now() - (m.min || 0) * 60000;
+  const cutoff = Date.now() - STARTS_KEEP_MS;
+  for (const k of Object.keys(starts)) if (starts[k] < cutoff) delete starts[k];
+  try { localStorage.setItem(STARTS_KEY, JSON.stringify(starts)); } catch {}
+}
+
+// Fill missing dates from remembered start times; returns true if something changed
+function resolveDates(a) {
+  const starts = loadStarts();
+  let changed = false;
+  for (const r of a) {
+    if (r.endedAt === null && starts[r.key]) {
+      r.endedAt = starts[r.key] + r.min * 60000;
+      changed = true;
+    }
+  }
+  return changed;
+}
 let syncEpoch = null, syncCount = 0;
 
 function loadArchive() {
@@ -1069,7 +1105,11 @@ function saveArchive(a) {
 function archiveSlot(epoch, sl) {
   const a = loadArchive();
   const key = `${epoch}-${sl.id}`;
-  const endedAt = (sl.ago !== null && sl.ago !== undefined) ? Date.now() - sl.ago * 60000 : null;
+  let endedAt = (sl.ago !== null && sl.ago !== undefined) ? Date.now() - sl.ago * 60000 : null;
+  if (endedAt === null) {
+    const started = loadStarts()[key];
+    if (started) endedAt = started + sl.min * 60000;
+  }
   const found = a.find((r) => r.key === key);
   if (found) {
     if (found.endedAt === null && endedAt !== null) { found.endedAt = endedAt; saveArchive(a); renderHistory(); }
@@ -1090,14 +1130,19 @@ function sortedArchive() {
   return loadArchive().sort((x, y) => sortTime(y) - sortTime(x) || y.id - x.id);
 }
 
-function fmtDate(r) {
-  if (r.endedAt === null) return "Date unknown";
-  const d = new Date(r.endedAt - r.min * 60000);   // show the start of the session
+function fmtStamp(ms) {
+  const d = new Date(ms);
   return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }) + ", " +
          d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
+function fmtDate(r) {
+  if (r.endedAt === null) return "Before " + fmtStamp(r.importedAt);   // fetched then, so it was earlier
+  return fmtStamp(r.endedAt - r.min * 60000);                          // start of the session
+}
 
 function renderHistory() {
+  const all = loadArchive();
+  if (resolveDates(all)) saveArchive(all);
   const list = sortedArchive();
   const ul = $("sessionList");
   ul.textContent = "";
@@ -1169,9 +1214,11 @@ async function showSession(r) {
 
 function exportCsv() {
   const list = sortedArchive();
-  const head = "start,ends,shots,scored,average,x,minutes,invalid_ends,invalid_arrows,corrected,ended_by_hand";
+  const head = "start,start_known,fetched,ends,shots,scored,average,x,minutes,invalid_ends,invalid_arrows,corrected,ended_by_hand";
   const rows = list.map((r) => [
     r.endedAt === null ? "" : new Date(r.endedAt - r.min * 60000).toISOString(),
+    r.endedAt === null ? 0 : 1,
+    new Date(r.importedAt).toISOString(),
     r.ends, r.shots, r.scored, Number(r.avg).toFixed(2), r.x, r.min,
     r.invalidEnds, r.invalidArrows, r.mismatch ? 1 : 0, r.manual ? 1 : 0,
   ].join(","));

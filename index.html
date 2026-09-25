@@ -1,0 +1,1451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#E9ECE6" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141C17" media="(prefers-color-scheme: dark)">
+<title>UV-Sight</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root {
+    --paper:   #E9ECE6;
+    --surface: #F7F8F5;
+    --ink:     #1B2A22;
+    --muted:   #5E6B62;
+    --line:    #C9D0C6;
+    --gold:    #E8B21C;
+    --red:     #C8392B;
+    --blue:    #2F6DB5;
+    --ok:      #2E7D4F;
+    --radius-l: 18px;
+    --radius-s: 10px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    color-scheme: light dark;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:   #141C17;
+      --surface: #1E2922;
+      --ink:     #E3E9E2;
+      --muted:   #93A198;
+      --line:    #33423A;
+      --gold:    #F2C230;
+      --red:     #E0584A;
+      --blue:    #5B93D6;
+      --ok:      #58B27E;
+    }
+  }
+  *, *::before, *::after { box-sizing: inherit; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.45 var(--font);
+    display: flex;
+    flex-direction: column;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 3px solid var(--blue); outline-offset: 2px; }
+
+  /* Header */
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 18px 10px;
+  }
+  header h1 { font-size: 1.35rem; font-weight: 750; letter-spacing: -0.01em; margin: 0; flex: 1; }
+  .conn {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: .9rem; color: var(--muted);
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+  .conn[data-s="connected"] .dot  { background: var(--ok); }
+  .conn[data-s="connecting"] .dot { background: var(--gold); }
+  .btn {
+    border: 0; border-radius: 999px; padding: 10px 18px; min-height: 44px;
+    background: var(--ink); color: var(--paper); font-weight: 650; cursor: pointer;
+  }
+  .btn.secondary { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line); }
+  .btn:disabled { opacity: .5; }
+
+  main { flex: 1; overflow-y: auto; padding: 4px 18px 24px; }
+  .view[hidden] { display: none; }
+
+  /* Banner */
+  .banner {
+    border-radius: var(--radius-s); padding: 12px 14px; margin: 6px 0 14px;
+    background: color-mix(in srgb, var(--red) 14%, var(--surface));
+    border-left: 5px solid var(--red);
+  }
+  .banner.info {
+    background: color-mix(in srgb, var(--blue) 12%, var(--surface));
+    border-left-color: var(--blue);
+  }
+
+  /* Target gauge: the one bold element */
+  .gauge {
+    display: grid; place-items: center; margin: 8px auto 18px; position: relative;
+    width: min(72vw, 280px); aspect-ratio: 1;
+  }
+  .gauge svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .gauge .ring-bg { fill: none; stroke: var(--line); }
+  .gauge .ring-val { fill: none; stroke: var(--gold); stroke-linecap: round; transition: stroke-dashoffset .6s ease; }
+  .gauge[data-level="low"] .ring-val { stroke: var(--red); }
+  .gauge .face { fill: var(--surface); }
+  .gauge .inner { fill: none; stroke: var(--line); stroke-width: 1.5; }
+  .gauge-text { position: absolute; text-align: center; }
+  .gauge-pct { font-size: clamp(3rem, 16vw, 4.6rem); font-weight: 780; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.03em; }
+  .gauge-sub { color: var(--muted); font-size: .95rem; margin-top: 6px; }
+
+  /* Readings */
+  .readings { list-style: none; margin: 0; padding: 0; background: var(--surface); border-radius: var(--radius-l); }
+  .readings li {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+    padding: 14px 16px; border-top: 1px solid var(--line);
+  }
+  .readings li:first-child { border-top: 0; }
+  .readings .k { color: var(--muted); }
+  .readings .v { font-weight: 650; font-variant-numeric: tabular-nums; text-align: right; }
+  .readings .v small { font-weight: 400; color: var(--muted); }
+  .stale .gauge, .stale .readings { opacity: .45; }
+
+  .empty { text-align: center; padding: 36px 8px; color: var(--muted); }
+  .empty .btn { margin-top: 16px; }
+  .fw { color: var(--muted); font-size: .85rem; text-align: center; margin-top: 16px; }
+
+  /* Console */
+  .console {
+    background: var(--surface); border-radius: var(--radius-l); padding: 10px 12px;
+    height: calc(100dvh - 250px); min-height: 220px; overflow: auto;
+    font: 12.5px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .console .in  { color: var(--blue); }
+  .console .err { color: var(--red); }
+  .console .raw { color: var(--muted); }
+  .cmdline { display: flex; gap: 8px; margin-top: 10px; }
+  .cmdline input {
+    flex: 1; min-width: 0; min-height: 44px; border-radius: 999px; border: 2px solid var(--line);
+    background: var(--surface); color: var(--ink); padding: 0 16px; font: inherit;
+  }
+
+  /* Tabs */
+  nav {
+    display: flex; border-top: 1px solid var(--line); background: var(--surface);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  nav button {
+    flex: 1; border: 0; background: none; padding: 12px 2px 14px; min-height: 56px; font-size: .88rem;
+    color: var(--muted); font-weight: 600; cursor: pointer; position: relative;
+  }
+  nav button[aria-selected="true"] { color: var(--ink); }
+  nav button[aria-selected="true"]::before {
+    content: ""; position: absolute; top: 0; left: 30%; right: 30%; height: 3px;
+    background: var(--gold); border-radius: 0 0 3px 3px;
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed; left: 50%; bottom: calc(80px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%) translateY(20px); opacity: 0; pointer-events: none;
+    background: var(--ink); color: var(--paper); padding: 12px 18px; border-radius: 14px;
+    width: max-content; max-width: calc(100vw - 32px); text-align: center; transition: opacity .2s, transform .2s;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err  { background: var(--red); color: #fff; }
+
+  /* Training */
+  .card { background: var(--surface); border-radius: var(--radius-l); padding: 16px; }
+  .training-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .training-head h2 { margin: 0; font-size: 1.9rem; font-weight: 780; letter-spacing: -0.02em; }
+  .counted { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .counted b { color: var(--ink); font-size: 1.15rem; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 12px; }
+  .stats div { text-align: center; }
+  .stats b { display: block; font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+  .stats span { color: var(--muted); font-size: .8rem; }
+  .last-end { color: var(--muted); font-size: .92rem; margin-top: 10px; }
+  .last-end b { color: var(--ink); }
+
+  .entry {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    min-height: 58px; margin: 14px 0 10px; padding: 8px 10px;
+    border: 2px dashed var(--line); border-radius: var(--radius-s);
+  }
+  .entry .hint { color: var(--muted); font-size: .92rem; }
+  .entry .sum { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .chip {
+    width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center;
+    font-weight: 750; font-size: .95rem; font-variant-numeric: tabular-nums;
+  }
+
+  /* Target ring colours: constant in both themes */
+  .r-gold  { background: #F2C230; color: #1B1B1B; }
+  .r-red   { background: #D6402F; color: #fff; }
+  .r-blue  { background: #2F6DB5; color: #fff; }
+  .r-black { background: #232323; color: #fff; box-shadow: inset 0 0 0 1.5px #555; }
+  .r-white { background: #FAFAF7; color: #1B1B1B; box-shadow: inset 0 0 0 1.5px #BFC5BD; }
+  .r-miss  { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line); }
+
+  .keypad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .keypad button {
+    border: 0; border-radius: var(--radius-s); min-height: 60px;
+    font-size: 1.55rem; font-weight: 780; cursor: pointer; font-variant-numeric: tabular-nums;
+  }
+  .keypad button:active { transform: scale(.96); }
+  .keypad .undo {
+    grid-column: 1 / -1; min-height: 50px; font-size: 1rem; font-weight: 650;
+    background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line);
+  }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .actions .send { grid-column: 1 / -1; min-height: 54px; font-size: 1.05rem; }
+  .actions .btn { border-radius: var(--radius-s); }
+
+  dialog {
+    border: 0; border-radius: var(--radius-l); padding: 22px 20px 16px; max-width: 360px;
+    background: var(--surface); color: var(--ink);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog h3 { margin: 0 0 8px; font-size: 1.2rem; }
+  dialog p { margin: 0 0 18px; color: var(--muted); }
+  dialog .row { display: flex; gap: 10px; justify-content: flex-end; }
+  dialog .danger { background: var(--red); color: #fff; }
+
+  /* History */
+  .toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
+  .toolbar .btn { flex: 1; border-radius: var(--radius-s); }
+  .chart { background: var(--surface); border-radius: var(--radius-l); padding: 14px 14px 8px; margin-bottom: 14px; }
+  .chart h3 { margin: 0 0 6px; font-size: 1rem; }
+  .chart svg { width: 100%; height: 150px; display: block; }
+  .chart .axis { stroke: var(--line); stroke-width: 1; }
+  .chart .lineAvg { fill: none; stroke: var(--gold); stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+  .chart .pt { fill: var(--gold); }
+  .chart text { fill: var(--muted); font-size: 11px; }
+  .sessions { list-style: none; margin: 0; padding: 0; background: var(--surface); border-radius: var(--radius-l); }
+  .sessions li { border-top: 1px solid var(--line); }
+  .sessions li:first-child { border-top: 0; }
+  .sessions button {
+    width: 100%; text-align: left; border: 0; background: none; padding: 14px 16px; cursor: pointer;
+    display: grid; grid-template-columns: 1fr auto; gap: 2px 12px;
+  }
+  .sessions .date { font-weight: 650; }
+  .sessions .avg  { font-size: 1.35rem; font-weight: 780; font-variant-numeric: tabular-nums; grid-row: span 2; align-self: center; }
+  .sessions .meta { color: var(--muted); font-size: .9rem; }
+  .sessions .flag { color: var(--red); font-size: .85rem; grid-column: 1 / -1; }
+
+  /* Settings */
+  .group { background: var(--surface); border-radius: var(--radius-l); padding: 4px 16px; margin-bottom: 14px; }
+  .group h3 { margin: 14px 0 4px; font-size: 1.05rem; }
+  .group .gnote { color: var(--muted); font-size: .9rem; margin: 0 0 6px; }
+  .setting { padding: 12px 0; border-top: 1px solid var(--line); }
+  .setting:first-of-type { border-top: 0; }
+  .setting .top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .setting .val { font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .setting .desc { color: var(--muted); font-size: .85rem; }
+  .setting .ctl { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .setting input[type=range] { flex: 1; accent-color: var(--gold); min-height: 36px; }
+  .setting input[type=number] {
+    width: 84px; min-height: 40px; border-radius: var(--radius-s); border: 2px solid var(--line);
+    background: var(--paper); color: var(--ink); padding: 0 8px; font: inherit; text-align: right;
+  }
+  .setting label.off { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: .9rem; }
+  .switchrow { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+  .switchrow:first-of-type { border-top: 0; }
+  .switchrow .desc { color: var(--muted); font-size: .85rem; }
+  .switch { position: relative; width: 52px; height: 30px; flex: none; }
+  .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; position: absolute; cursor: pointer; }
+  .switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--line); pointer-events: none; transition: background .15s; }
+  .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #fff; transition: transform .15s; }
+  .switch input:checked + span { background: var(--ok); }
+  .switch input:checked + span::after { transform: translateX(22px); }
+  .seg { display: inline-flex; border-radius: 999px; box-shadow: inset 0 0 0 2px var(--line); padding: 3px; }
+  .seg button { border: 0; background: none; padding: 7px 14px; border-radius: 999px; cursor: pointer; font-weight: 600; color: var(--muted); }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+  .savebar {
+    position: sticky; bottom: 0; display: flex; gap: 10px; align-items: center;
+    background: var(--ink); color: var(--paper); border-radius: var(--radius-l); padding: 10px 10px 10px 16px; margin-top: 6px;
+  }
+  .savebar span { flex: 1; font-size: .92rem; }
+  .savebar .btn { background: var(--gold); color: #1B1B1B; }
+  .wizard { border: 2px solid var(--gold); border-radius: var(--radius-s); padding: 12px 14px; margin: 8px 0 12px; }
+  .wizard p { margin: 0 0 10px; }
+  .wizard .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .wizard .errtext { color: var(--red); }
+  .muted { color: var(--muted); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .switch span, .switch span::after { transition: none; }
+    .keypad button:active { transform: none; }
+    .gauge .ring-val, .toast { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>UV-Sight</h1>
+  <span class="conn" id="conn" data-s="off"><span class="dot"></span><span id="connText">Not connected</span></span>
+</header>
+
+<main>
+  <!-- Status -->
+  <section class="view" id="view-status">
+    <div id="unsupported" class="banner" hidden>
+      This browser can't use Bluetooth. Open the app in Chrome on Android, loaded over https.
+    </div>
+    <div id="protoWarn" class="banner" hidden></div>
+
+    <div id="statusEmpty" class="empty">
+      <p id="emptyText">Move the bow so the sight wakes up, then connect.</p>
+      <button class="btn" id="btnConnect">Connect</button>
+    </div>
+
+    <div id="statusBody" hidden>
+      <div id="lowbat" class="banner" hidden>Battery empty. The LED is off until you charge.</div>
+
+      <div class="gauge" id="gauge" aria-label="Battery">
+        <svg viewBox="0 0 120 120" aria-hidden="true">
+          <circle class="face" cx="60" cy="60" r="52"/>
+          <circle class="inner" cx="60" cy="60" r="40"/>
+          <circle class="inner" cx="60" cy="60" r="28"/>
+          <circle class="ring-bg" cx="60" cy="60" r="54" stroke-width="8"/>
+          <circle class="ring-val" id="ringVal" cx="60" cy="60" r="54" stroke-width="8"
+                  stroke-dasharray="339.3" stroke-dashoffset="339.3"/>
+        </svg>
+        <div class="gauge-text">
+          <div class="gauge-pct" id="pct">–</div>
+          <div class="gauge-sub" id="batSub">battery</div>
+        </div>
+      </div>
+
+      <ul class="readings">
+        <li><span class="k">Session</span><span class="v" id="vSession">–</span></li>
+        <li><span class="k">UV light</span><span class="v" id="vLed">–</span></li>
+        <li><span class="k">Ambient light</span><span class="v" id="vLight">–</span></li>
+        <li><span class="k">Cant</span><span class="v" id="vTilt">–</span></li>
+        <li><span class="k">Charging</span><span class="v" id="vCharge">–</span></li>
+      </ul>
+
+      <div style="text-align:center; margin-top:18px">
+        <button class="btn secondary" id="btnReconnect" hidden>Reconnect</button>
+      </div>
+      <p class="fw" id="fw"></p>
+    </div>
+  </section>
+
+  <!-- Training -->
+  <section class="view" id="view-training" hidden>
+    <div id="trainNotConnected" class="empty">
+      <p>Connect to the sight on the Status tab first.</p>
+    </div>
+
+    <div id="trainOff" class="empty" hidden>
+      <p>The shot counter is off.</p>
+      <button class="btn" id="btnCounterOn">Turn shot counter on</button>
+    </div>
+
+    <div id="trainIdle" class="empty" hidden>
+      <p>No session running. The first shot starts one automatically.</p>
+      <button class="btn secondary" id="btnStart">Start session now</button>
+    </div>
+
+    <div id="trainRun" hidden>
+      <div class="card">
+        <div class="training-head">
+          <h2 id="tEnd">End 1</h2>
+          <span class="counted"><b id="tCounted">0</b> <span id="tCountedLbl">shots counted</span></span>
+        </div>
+        <div class="stats">
+          <div><b id="tEnds">0</b><span>ends</span></div>
+          <div><b id="tArrows">0</b><span>arrows</span></div>
+          <div><b id="tAvg">0.00</b><span>average</span></div>
+          <div><b id="tX">0</b><span>X</span></div>
+        </div>
+        <div class="last-end" id="tLast" hidden></div>
+      </div>
+
+      <div class="entry" id="entry" aria-live="polite"></div>
+
+      <div class="keypad" id="keypad">
+        <button class="r-white" data-v="1">1</button>
+        <button class="r-white" data-v="2">2</button>
+        <button class="r-black" data-v="3">3</button>
+        <button class="r-black" data-v="4">4</button>
+        <button class="r-blue"  data-v="5">5</button>
+        <button class="r-blue"  data-v="6">6</button>
+        <button class="r-red"   data-v="7">7</button>
+        <button class="r-red"   data-v="8">8</button>
+        <button class="r-gold"  data-v="9">9</button>
+        <button class="r-gold"  data-v="10">10</button>
+        <button class="r-gold"  data-v="X">X</button>
+        <button class="r-miss"  data-v="0">0</button>
+        <button class="undo" id="btnUndo">↶ Undo</button>
+      </div>
+
+      <div class="actions">
+        <button class="btn send" id="btnSend">Save end</button>
+        <button class="btn secondary" id="btnSkip">Skip end</button>
+        <button class="btn secondary" id="btnStop">End session</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- History -->
+  <section class="view" id="view-history" hidden>
+    <div class="toolbar">
+      <button class="btn secondary" id="btnSync">Get sessions from sight</button>
+      <button class="btn secondary" id="btnExport">Export CSV</button>
+    </div>
+    <div class="chart" id="chart" hidden>
+      <h3>Average per session</h3>
+      <svg id="chartSvg" viewBox="0 0 320 150" preserveAspectRatio="none" role="img" aria-label="Average per session"></svg>
+    </div>
+    <ul class="sessions" id="sessionList"></ul>
+    <div class="empty" id="historyEmpty">
+      <p>No sessions on this phone yet. Finished sessions are stored here automatically while the app is connected, or fetched with the button above.</p>
+    </div>
+  </section>
+
+  <!-- Settings -->
+  <section class="view" id="view-settings" hidden>
+    <div class="empty" id="setNotConnected"><p>Connect to the sight on the Status tab to change settings.</p></div>
+    <div class="empty" id="setLoading" hidden>
+      <p id="setLoadingText">Loading settings…</p>
+      <button class="btn secondary" id="btnCfgRetry" hidden>Try again</button>
+    </div>
+    <div id="setBody" hidden>
+      <div class="group" id="setSwitches"></div>
+      <div id="setGroups"></div>
+      <div class="savebar" id="saveBar" hidden>
+        <span>Changes are active but not saved. The sight forgets them on restart.</span>
+        <button class="btn" id="btnSave">Save</button>
+      </div>
+      <div style="text-align:center; margin: 18px 0 6px">
+        <button class="btn secondary" id="btnDefaults">Restore defaults</button>
+      </div>
+    </div>
+
+    <div class="group" id="fwGroup">
+      <h3>Firmware and app</h3>
+      <div class="switchrow">
+        <div><div class="lbl">Update mode</div>
+          <div class="desc" id="fwText">Restarts the sight as a USB drive, like a double click on the reset button. Needs the USB cable.</div></div>
+        <button class="btn secondary" id="btnDfu">Start</button>
+      </div>
+      <div class="switchrow" id="installRow" hidden>
+        <div><div class="lbl">Install app</div>
+          <div class="desc">Adds UV-Sight to the home screen. It then starts without internet.</div></div>
+        <button class="btn secondary" id="btnInstall">Install</button>
+      </div>
+      <p class="gnote" id="versions"></p>
+    </div>
+  </section>
+
+  <dialog id="dlg">
+    <h3 id="dlgTitle"></h3>
+    <p id="dlgText"></p>
+    <div class="row">
+      <button class="btn secondary" id="dlgNo"></button>
+      <button class="btn" id="dlgYes"></button>
+    </div>
+  </dialog>
+
+  <!-- Console -->
+  <section class="view" id="view-console" hidden>
+    <div class="console" id="console" aria-live="polite"></div>
+    <form class="cmdline" id="cmdForm" autocomplete="off">
+      <input id="cmdInput" placeholder="Command, e.g. help" aria-label="Command" enterkeyhint="send" autocapitalize="off">
+      <button class="btn" type="submit">Send</button>
+    </form>
+  </section>
+</main>
+
+<nav role="tablist">
+  <button role="tab" aria-selected="true" data-view="status">Status</button>
+  <button role="tab" aria-selected="false" data-view="training">Training</button>
+  <button role="tab" aria-selected="false" data-view="history">History</button>
+  <button role="tab" aria-selected="false" data-view="settings">Settings</button>
+  <button role="tab" aria-selected="false" data-view="console">Console</button>
+</nav>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Protocol constants
+// ---------------------------------------------------------------------------
+const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
+const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
+const PROTO_EXPECTED  = 3;
+const STATUS_POLL_MS  = 5000;
+const WRITE_CHUNK     = 20;
+const CONSOLE_MAX     = 400;
+const APP_VERSION     = "1.0";
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+const state = {
+  conn: "off",        // off | connecting | connected
+  hello: null, status: null, cfg: null, session: null, level: null,
+};
+let device = null, rxChar = null, txChar = null;
+let rxBuffer = "";
+let writeQueue = Promise.resolve();
+let pollTimer = null;
+let activeView = "status";
+
+// Training: scores of the open end, entered in the app, not yet sent
+const MAX_ARROWS = 40;
+let entries = [];          // "X", "10" ... "0"
+let awaitingEnd = false;   // score line sent, waiting for end / confirm / err
+let awaitTimer = null;
+let confirmOpen = false;
+let lastEnd = null;        // last closed end, for the summary line
+
+const $ = (id) => document.getElementById(id);
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+
+// ---------------------------------------------------------------------------
+// Bluetooth
+// ---------------------------------------------------------------------------
+async function connect() {
+  if (!navigator.bluetooth) return;
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS_SERVICE] }, { namePrefix: "UV-Sight" }],
+      optionalServices: [NUS_SERVICE],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    await openGatt();
+  } catch (e) {
+    if (e.name !== "NotFoundError") toast(bleError(e), true);   // NotFoundError = chooser cancelled
+    setConn("off");
+  }
+}
+
+async function reconnect() {
+  if (!device) return connect();
+  try {
+    await openGatt();
+  } catch (e) {
+    toast("Sight not reachable. Move the bow to wake it, then try again.", true);
+    setConn("off");
+  }
+}
+
+async function openGatt() {
+  setConn("connecting");
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(NUS_SERVICE);
+  rxChar = await svc.getCharacteristic(NUS_RX);
+  txChar = await svc.getCharacteristic(NUS_TX);
+  txChar.addEventListener("characteristicvaluechanged", onData);
+  await txChar.startNotifications();
+  rxBuffer = "";
+  setConn("connected");
+  send("app on");
+  startPolling();
+}
+
+function onDisconnected() {
+  rxChar = txChar = null;
+  cfgBuf = null; cfgRetries = 0; clearTimeout(cfgRetryTimer);
+  setAwaiting(false);
+  if (confirmOpen) { $("dlg").close(); confirmOpen = false; }
+  stopPolling();
+  setConn("off");
+}
+
+function onData(ev) {
+  rxBuffer += decoder.decode(ev.target.value, { stream: true });
+  let nl;
+  while ((nl = rxBuffer.indexOf("\n")) >= 0) {
+    const line = rxBuffer.slice(0, nl).replace(/\r$/, "");
+    rxBuffer = rxBuffer.slice(nl + 1);
+    if (line.length) handleLine(line);
+  }
+}
+
+// Writes are serialized; each command is split into small chunks
+function send(cmd) {
+  logConsole("> " + cmd, "in");
+  writeQueue = writeQueue.then(async () => {
+    if (!rxChar) return;
+    const data = encoder.encode(cmd + "\n");
+    for (let i = 0; i < data.length; i += WRITE_CHUNK) {
+      const chunk = data.slice(i, i + WRITE_CHUNK);
+      if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(chunk);
+      else await rxChar.writeValue(chunk);
+    }
+  }).catch((e) => logConsole("Send failed: " + e.message, "err"));
+  return writeQueue;
+}
+
+function bleError(e) {
+  if (e.name === "SecurityError") return "Bluetooth needs https and a tap to start.";
+  if (e.name === "NetworkError")  return "Connection failed. Move the bow and try again.";
+  return e.message || String(e);
+}
+
+// ---------------------------------------------------------------------------
+// Incoming lines
+// ---------------------------------------------------------------------------
+function handleLine(line) {
+  if (line[0] !== "{") { logConsole(line, "raw"); return; }   // text before "app on"
+  let m;
+  try { m = JSON.parse(line); } catch { logConsole(line, "err"); return; }
+  logConsole(line, m.t === "err" ? "err" : "");
+
+  switch (m.t) {
+    case "hello":
+      state.hello = m;
+      checkProto();
+      break;
+    case "status":  state.status  = m; break;
+    case "cfgStart":
+      cfgBuf = { n: m.n, items: [] };
+      break;
+    case "cfgItem":
+      if (cfgBuf) cfgBuf.items.push(m);
+      break;
+    case "cfgEnd":
+      if (cfgBuf && cfgBuf.items.length === cfgBuf.n) {
+        state.cfg = { items: cfgBuf.items };
+        cfgRetries = 0;
+        clearTimeout(cfgRetryTimer);
+        if (expectDefaults) { cfgDirty = true; expectDefaults = false; }
+      } else {
+        if (!state.cfg) requestCfg();   // a line got lost: ask again
+      }
+      cfgBuf = null;
+      break;
+    case "session": state.session = m; break;
+    case "level":   state.level   = m; break;
+    case "shot":
+      if (state.session) {
+        state.session.active   = true;
+        state.session.end      = m.end;
+        state.session.endShots = m.endShots;
+        state.session.shots    = m.total;
+      }
+      break;
+    case "end":
+      lastEnd = m;
+      if (awaitingEnd) { entries = []; setAwaiting(false); }
+      if (m.valid) toast(`End ${m.n} saved: ${m.sum} points`);
+      else         toast(`End ${m.n} marked invalid`);
+      break;
+    case "confirm":
+      setAwaiting(false);
+      askMismatch(m);
+      break;
+    case "discarded":
+      setAwaiting(false);
+      toast("Not saved. Correct the scores and save again.");
+      break;
+    case "sessionEnd":
+      if (m.stored && m.slot) archiveSlot(m.epoch, m.slot);
+      entries = [];
+      lastEnd = null;
+      setAwaiting(false);
+      if (m.stored && m.slot) {
+        toast(`Session saved: ${m.slot.scored} arrows, average ${m.slot.avg.toFixed(2)}, ${m.slot.x} X`);
+      } else {
+        toast("Empty session, nothing saved.");
+      }
+      send("shots");
+      break;
+    case "logStart":
+      syncEpoch = m.epoch;
+      syncCount = 0;
+      break;
+    case "slot":
+      if (syncEpoch !== null && archiveSlot(syncEpoch, m)) syncCount++;
+      break;
+    case "logEnd":
+      toast(syncCount ? `${syncCount} new ${syncCount === 1 ? "session" : "sessions"} stored on this phone`
+                      : "Everything is already on this phone");
+      syncEpoch = null;
+      break;
+    case "ack":
+      if (m.cmd === "set" && state.cfg) {
+        const it = state.cfg.items.find((x) => x.k === m.k);
+        if (it) it.v = m.v;
+        cfgDirty = true;
+      }
+      if (m.cmd === "save") { cfgDirty = false; toast("Settings saved on the sight"); }
+      if (m.cmd === "mode" && state.status) state.status.mode = m.mode;
+      if (m.cmd === "dfu") toast("The sight restarts as a USB drive. Copy the new firmware onto it.");
+      break;
+    case "cal":
+      onCal(m);
+      break;
+    case "event":
+      if (m.e === "idle")   toast("Bow at rest. The sight went to sleep.");
+      if (m.e === "lowbat") toast("Battery empty. LED is off until you charge.", true);
+      if (m.e === "charge") toast(chargeLabel(m.state));
+      break;
+    case "err":
+      if (awaitingEnd) setAwaiting(false);
+      toast(m.text, true);
+      break;
+  }
+  render();
+}
+
+function checkProto() {
+  const w = $("protoWarn");
+  const p = state.hello && state.hello.proto;
+  if (p !== PROTO_EXPECTED) {
+    w.hidden = false;
+    w.textContent = `The sight speaks protocol ${p}, this app expects ${PROTO_EXPECTED}. ` +
+                    `Update the ${p < PROTO_EXPECTED ? "sight firmware" : "app"}.`;
+  } else {
+    w.hidden = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function setConn(s) {
+  state.conn = s;
+  $("conn").dataset.s = s;
+  $("connText").textContent = { off: "Not connected", connecting: "Connecting", connected: "Connected" }[s];
+  render();
+}
+
+function chargeLabel(c) {
+  return { charging: "Charging", full: "Charged, cable connected", "no USB": "On battery" }[c] || c;
+}
+
+function render() {
+  const hasData = !!state.status;
+  $("statusEmpty").hidden = hasData;
+  $("statusBody").hidden  = !hasData;
+  $("btnConnect").disabled = !navigator.bluetooth || state.conn === "connecting";
+  $("btnConnect").hidden   = state.conn === "connected";
+  $("emptyText").textContent = state.conn === "connected"
+    ? "Connected. Waiting for data from the sight…"
+    : "Move the bow so the sight wakes up, then connect.";
+  $("btnReconnect").hidden = state.conn !== "off";
+  $("view-status").classList.toggle("stale", hasData && state.conn !== "connected");
+  renderTraining();
+  renderSettings();
+  if (!hasData) return;
+
+  const s = state.status;
+
+  // Battery gauge
+  const pct = Math.max(0, Math.min(100, s.pct));
+  const circ = 339.3;
+  $("ringVal").setAttribute("stroke-dashoffset", String(circ * (1 - pct / 100)));
+  $("gauge").dataset.level = pct <= 15 ? "low" : "ok";
+  $("pct").textContent = pct + "%";
+  $("batSub").textContent = s.vbat.toFixed(2) + " V";
+  $("lowbat").hidden = !s.lowbat;
+
+  // Session
+  const ses = state.session;
+  let sesText;
+  if (!ses || !ses.counter)  sesText = "Shot counter off";
+  else if (!ses.active)      sesText = "No session";
+  else sesText = `End ${ses.end}, ${ses.endShots} ${ses.endShots === 1 ? "shot" : "shots"}`;
+  $("vSession").textContent = sesText;
+
+  // LED
+  const ledText = { on: "On", off: "Off", blinking: "Blinking" }[s.led] || s.led;
+  const modeText = s.mode !== "auto" ? ` <small>(test: ${s.mode})</small>` : "";
+  $("vLed").innerHTML = ledText + modeText;
+
+  // Ambient light
+  $("vLight").innerHTML = `${s.dark ? "Dark" : "Bright"} <small>${s.light}</small>`;
+
+  // Cant
+  const lv = state.level;
+  let tiltText;
+  if (s.tilt !== null && s.tilt !== undefined) tiltText = s.tilt.toFixed(1) + "°";
+  else if (!lv || !lv.on)                      tiltText = "Off";
+  else if (!lv.cal)                            tiltText = "Not calibrated";
+  else                                         tiltText = "Waits for a session";
+  $("vTilt").textContent = tiltText;
+
+  $("vCharge").textContent = chargeLabel(s.chg);
+
+  const h = state.hello;
+  $("fw").textContent = h ? `${h.name}, firmware ${h.fw}` : "";
+}
+
+// ---------------------------------------------------------------------------
+// Training
+// ---------------------------------------------------------------------------
+function ringClass(v) {
+  if (v === "X" || v === "10" || v === "9") return "r-gold";
+  if (v === "8" || v === "7") return "r-red";
+  if (v === "6" || v === "5") return "r-blue";
+  if (v === "4" || v === "3") return "r-black";
+  if (v === "2" || v === "1") return "r-white";
+  return "r-miss";
+}
+const points = (v) => (v === "X" ? 10 : Number(v));
+
+function renderTraining() {
+  const connected = state.conn === "connected";
+  const ses = state.session;
+  const off  = connected && ses && !ses.counter;
+  const idle = connected && ses && ses.counter && !ses.active;
+  const run  = !!(ses && ses.active);
+
+  $("trainNotConnected").hidden = connected || run;
+  $("trainOff").hidden  = !off;
+  $("trainIdle").hidden = !idle;
+  $("trainRun").hidden  = !run;
+  if (!run) return;
+
+  $("tEnd").textContent     = "End " + ses.end;
+  $("tCounted").textContent = ses.endShots;
+  $("tCountedLbl").textContent = ses.endShots === 1 ? "shot counted" : "shots counted";
+  $("tEnds").textContent    = ses.ends;
+  $("tArrows").textContent  = ses.scored;
+  $("tAvg").textContent     = Number(ses.avg).toFixed(2);
+  $("tX").textContent       = ses.x;
+
+  const le = $("tLast");
+  if (lastEnd) {
+    le.hidden = false;
+    le.innerHTML = lastEnd.valid
+      ? `Last end: <b>${lastEnd.sum}</b> points from ${lastEnd.arrows} arrows, average ${lastEnd.avg.toFixed(2)}, ${lastEnd.x} X`
+      : `Last end: <b>invalid</b>, ${lastEnd.arrows} arrows (${lastEnd.reason})`;
+  } else {
+    le.hidden = true;
+  }
+
+  // Entry row
+  const box = $("entry");
+  box.textContent = "";
+  if (!entries.length) {
+    const hint = document.createElement("span");
+    hint.className = "hint";
+    hint.textContent = "Tap the scores of this end";
+    box.appendChild(hint);
+  } else {
+    for (const v of entries) {
+      const c = document.createElement("span");
+      c.className = "chip " + ringClass(v);
+      c.textContent = v;
+      box.appendChild(c);
+    }
+    const sum = document.createElement("span");
+    sum.className = "sum";
+    sum.textContent = entries.reduce((a, v) => a + points(v), 0);
+    box.appendChild(sum);
+  }
+
+  const busy = awaitingEnd || !connected;
+  $("btnSend").disabled = busy || !entries.length;
+  $("btnSend").textContent = awaitingEnd ? "Saving…" : `Save end (${entries.length})`;
+  $("btnUndo").disabled = busy || !entries.length;
+  $("btnSkip").disabled = busy || ses.endShots === 0;
+  $("btnStop").disabled = busy;
+  document.querySelectorAll("#keypad [data-v]").forEach((b) => {
+    b.disabled = busy || entries.length >= MAX_ARROWS;
+  });
+}
+
+function setAwaiting(on) {
+  awaitingEnd = on;
+  clearTimeout(awaitTimer);
+  if (on) {
+    awaitTimer = setTimeout(() => {
+      awaitingEnd = false;
+      toast("No answer from the sight. Scores kept, try again.", true);
+      render();
+    }, 6000);
+  }
+}
+
+function sendEnd() {
+  if (!entries.length || awaitingEnd) return;
+  const tokens = entries.map((v) => (v === "X" ? "x" : v));
+  setAwaiting(true);
+  send("score " + tokens.join(" "));
+  render();
+}
+
+function askMismatch(m) {
+  confirmOpen = true;
+  dialog({
+    title: `End ${m.end}: counts differ`,
+    text: `The sight counted ${m.counted} ${m.counted === 1 ? "shot" : "shots"}, ` +
+          `you entered ${m.entered} ${m.entered === 1 ? "score" : "scores"}. ` +
+          `Save with your ${m.entered} scores?`,
+    yes: "Save anyway",
+    no: "Edit scores",
+  }).then((ok) => {
+    confirmOpen = false;
+    if (ok) setAwaiting(true);
+    send(ok ? "yes" : "no");      // "no": sight discards, scores stay here for editing
+    render();
+  });
+}
+
+// Small promise-based dialog
+function dialog({ title, text, yes, no, danger }) {
+  return new Promise((resolve) => {
+    const d = $("dlg");
+    $("dlgTitle").textContent = title;
+    $("dlgText").textContent  = text;
+    $("dlgYes").textContent   = yes;
+    $("dlgNo").textContent    = no;
+    $("dlgYes").classList.toggle("danger", !!danger);
+    const done = (v) => { d.close(); resolve(v); };
+    $("dlgYes").onclick = () => done(true);
+    $("dlgNo").onclick  = () => done(false);
+    d.oncancel = (e) => { e.preventDefault(); done(false); };
+    d.showModal();
+  });
+}
+
+$("keypad").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-v]");
+  if (!b || b.disabled) return;
+  if (entries.length >= MAX_ARROWS) return;
+  entries.push(b.dataset.v);
+  if (navigator.vibrate) navigator.vibrate(12);
+  render();
+});
+$("btnUndo").addEventListener("click", () => { entries.pop(); render(); });
+$("btnSend").addEventListener("click", sendEnd);
+
+$("btnSkip").addEventListener("click", async () => {
+  const n = state.session ? state.session.endShots : 0;
+  const ok = await dialog({
+    title: "Skip this end?",
+    text: `The ${n} counted ${n === 1 ? "arrow is" : "arrows are"} stored as invalid with 0 points ` +
+          `and left out of the average.`,
+    yes: "Skip end", no: "Cancel", danger: true,
+  });
+  if (!ok) return;
+  entries = [];
+  send("score skip");
+  render();
+});
+
+$("btnStop").addEventListener("click", async () => {
+  const s = state.session || {};
+  let text = "The session is saved to the sight's log.";
+  if (entries.length) text += " Scores you haven't saved yet are lost.";
+  if (s.endShots > 1) text += ` The ${s.endShots} shots of the open end are stored as invalid.`;
+  const ok = await dialog({ title: "End session?", text, yes: "End session", no: "Cancel", danger: true });
+  if (ok) send("shots stop");
+});
+
+$("btnCounterOn").addEventListener("click", () => send("shots on"));
+$("btnStart").addEventListener("click", () => send("shots start"));
+
+// ---------------------------------------------------------------------------
+// Status polling (only while the status view is visible)
+// ---------------------------------------------------------------------------
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(() => {
+    if (state.conn === "connected" && (activeView === "status" || activeView === "settings") && !confirmOpen &&
+        document.visibilityState === "visible") {
+      send("status");
+    }
+  }, STATUS_POLL_MS);
+}
+function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
+
+// ---------------------------------------------------------------------------
+// History: archive on this phone (localStorage)
+// ---------------------------------------------------------------------------
+const ARCHIVE_KEY = "uvsight.archive.v1";
+let syncEpoch = null, syncCount = 0;
+
+function loadArchive() {
+  try { return JSON.parse(localStorage.getItem(ARCHIVE_KEY)) || []; } catch { return []; }
+}
+function saveArchive(a) {
+  try { localStorage.setItem(ARCHIVE_KEY, JSON.stringify(a)); }
+  catch { toast("Could not store on this phone (storage full?)", true); }
+}
+
+// Returns true if the session was new
+function archiveSlot(epoch, sl) {
+  const a = loadArchive();
+  const key = `${epoch}-${sl.id}`;
+  const endedAt = (sl.ago !== null && sl.ago !== undefined) ? Date.now() - sl.ago * 60000 : null;
+  const found = a.find((r) => r.key === key);
+  if (found) {
+    if (found.endedAt === null && endedAt !== null) { found.endedAt = endedAt; saveArchive(a); renderHistory(); }
+    return false;
+  }
+  a.push({
+    key, epoch, id: sl.id, endedAt, importedAt: Date.now(),
+    ends: sl.ends, shots: sl.shots, scored: sl.scored, avg: sl.avg, x: sl.x, min: sl.min,
+    invalidEnds: sl.invalidEnds, invalidArrows: sl.invalidArrows, mismatch: sl.mismatch, manual: sl.manual,
+  });
+  saveArchive(a);
+  renderHistory();
+  return true;
+}
+
+const sortTime = (r) => r.endedAt ?? r.importedAt;
+function sortedArchive() {
+  return loadArchive().sort((x, y) => sortTime(y) - sortTime(x) || y.id - x.id);
+}
+
+function fmtDate(r) {
+  if (r.endedAt === null) return "Date unknown";
+  const d = new Date(r.endedAt - r.min * 60000);   // show the start of the session
+  return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }) + ", " +
+         d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderHistory() {
+  const list = sortedArchive();
+  const ul = $("sessionList");
+  ul.textContent = "";
+  $("historyEmpty").hidden = list.length > 0;
+  $("btnExport").disabled = list.length === 0;
+
+  for (const r of list) {
+    const li = document.createElement("li");
+    const b = document.createElement("button");
+    b.innerHTML =
+      `<span class="date"></span><span class="avg"></span><span class="meta"></span>` +
+      (r.invalidEnds || r.mismatch ? `<span class="flag"></span>` : "");
+    b.querySelector(".date").textContent = fmtDate(r);
+    b.querySelector(".avg").textContent  = Number(r.avg).toFixed(2);
+    b.querySelector(".meta").textContent =
+      `${r.ends} ${r.ends === 1 ? "end" : "ends"}, ${r.scored} arrows, ${r.x} X, ${r.min} min`;
+    const f = b.querySelector(".flag");
+    if (f) {
+      const parts = [];
+      if (r.invalidEnds) parts.push(`${r.invalidEnds} invalid ${r.invalidEnds === 1 ? "end" : "ends"} (${r.invalidArrows} arrows)`);
+      if (r.mismatch && !r.invalidEnds) parts.push("counts corrected by hand");
+      f.textContent = parts.join(", ");
+    }
+    b.addEventListener("click", () => showSession(r));
+    li.appendChild(b);
+    ul.appendChild(li);
+  }
+  renderChart(list);
+}
+
+function renderChart(list) {
+  const pts = list.filter((r) => r.scored > 0).slice(0, 20).reverse();
+  $("chart").hidden = pts.length < 2;
+  if (pts.length < 2) return;
+  const W = 320, H = 150, L = 30, R = 8, T = 10, B = 18;
+  const vals = pts.map((r) => Number(r.avg));
+  let lo = Math.floor(Math.min(...vals) - 0.3), hi = Math.ceil(Math.max(...vals) + 0.3);
+  lo = Math.max(0, lo); hi = Math.min(10, hi); if (hi - lo < 1) hi = lo + 1;
+  const x = (i) => L + (i * (W - L - R)) / (pts.length - 1);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  let svg = `<line class="axis" x1="${L}" y1="${y(lo)}" x2="${W - R}" y2="${y(lo)}"/>` +
+            `<line class="axis" x1="${L}" y1="${y(hi)}" x2="${W - R}" y2="${y(hi)}"/>` +
+            `<text x="2" y="${y(hi) + 4}">${hi}</text><text x="2" y="${y(lo) + 4}">${lo}</text>`;
+  svg += `<polyline class="lineAvg" points="${vals.map((v, i) => `${x(i)},${y(v)}`).join(" ")}"/>`;
+  svg += vals.map((v, i) => `<circle class="pt" cx="${x(i)}" cy="${y(v)}" r="3.5"/>`).join("");
+  svg += `<text x="${L}" y="${H - 3}">older</text><text x="${W - R}" y="${H - 3}" text-anchor="end">newest</text>`;
+  $("chartSvg").innerHTML = svg;
+}
+
+async function showSession(r) {
+  const lines = [
+    `${r.ends} ends, ${r.shots} shots counted, ${r.scored} arrows scored.`,
+    `Average ${Number(r.avg).toFixed(2)}, ${r.x} X, ${r.min} minutes.`,
+  ];
+  if (r.invalidEnds) lines.push(`${r.invalidEnds} invalid ends with ${r.invalidArrows} arrows (0 points, not in the average).`);
+  if (r.mismatch)    lines.push("Shot counts were corrected by hand in this session.");
+  lines.push(r.manual ? "Ended by hand." : "Ended automatically after 1 h without a shot.");
+  const del = await dialog({ title: fmtDate(r), text: lines.join(" "), yes: "Remove from phone", no: "Close", danger: true });
+  if (!del) return;
+  saveArchive(loadArchive().filter((x) => x.key !== r.key));
+  renderHistory();
+  toast("Removed from this phone. The sight's own log is unchanged.");
+}
+
+function exportCsv() {
+  const list = sortedArchive();
+  const head = "start,ends,shots,scored,average,x,minutes,invalid_ends,invalid_arrows,corrected,ended_by_hand";
+  const rows = list.map((r) => [
+    r.endedAt === null ? "" : new Date(r.endedAt - r.min * 60000).toISOString(),
+    r.ends, r.shots, r.scored, Number(r.avg).toFixed(2), r.x, r.min,
+    r.invalidEnds, r.invalidArrows, r.mismatch ? 1 : 0, r.manual ? 1 : 0,
+  ].join(","));
+  const blob = new Blob([head + "\n" + rows.join("\n") + "\n"], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `uv-sight-sessions-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+$("btnSync").addEventListener("click", () => {
+  if (state.conn !== "connected") { toast("Connect to the sight first.", true); return; }
+  send("log");
+});
+$("btnExport").addEventListener("click", exportCsv);
+
+// ---------------------------------------------------------------------------
+// Settings and calibration
+// ---------------------------------------------------------------------------
+let cfgDirty = false, expectDefaults = false;
+let cfgBuf = null, cfgRetries = 0, cfgRetryTimer = null;
+const CFG_MAX_RETRIES = 3;
+
+// Ask for the settings; if they don't arrive complete within 3 s, ask again
+function requestCfg() {
+  clearTimeout(cfgRetryTimer);
+  if (cfgRetries >= CFG_MAX_RETRIES) { render(); return; }
+  if (state.conn !== "connected" || confirmOpen || awaitingEnd) return;
+  cfgRetries++;
+  send("get");
+  cfgRetryTimer = setTimeout(() => { if (!state.cfg) requestCfg(); }, 3000);
+}
+let calStep = 0;          // 0 off, 1 = step 1, 2 = step 2, 3 = done
+let calBusy = false, calError = "";
+
+const GROUPS = [
+  { title: "Light sensor", keys: ["dark_on", "dark_off", "confirm"], light: true },
+  { title: "UV light",     keys: ["ma", "tilt_ma", "vf"] },
+  { title: "Cant",         keys: ["level_tol"], cal: true },
+  { title: "Shot detection", keys: ["tap_ths", "lockout"] },
+  { title: "Battery",      keys: ["cutoff"] },
+  { title: "Power and Bluetooth", keys: ["ths", "timeout", "report"] },
+];
+const DESCS = {
+  dark_on: "The light turns on below this reading.",
+  dark_off: "The light turns off above this reading. Keep it higher than Dark below.",
+  confirm: "Readings in a row (one every 2 s) before switching. Higher is calmer, lower reacts faster.",
+  ma: "More is brighter but drains the battery faster.",
+  tilt_ma: "Brightness of the cant blinking.",
+  vf: "Only change this if you swap the LED.",
+  level_tol: "A cant up to this angle counts as level.",
+  tap_ths: "Lower counts softer impacts. Raise it if carrying the bow counts as a shot.",
+  lockout: "After a shot, further impacts are ignored and the cant indicator pauses.",
+  cutoff: "Below this voltage the light switches off to protect the battery. This is 0 %.",
+  ths: "Lower wakes the sight with smaller movements.",
+  timeout: "The sight sleeps after this time without movement.",
+  report: "Automatic status message while connected.",
+};
+const LABELS = {
+  dark_on: "Dark below", dark_off: "Bright above", confirm: "Readings before switching",
+  ma: "Brightness", tilt_ma: "Cant blink brightness", vf: "LED forward voltage",
+  level_tol: "Tolerance", tap_ths: "Shot threshold", lockout: "Pause after a shot",
+  cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Status report every",
+};
+
+function shownValue(it, v) {
+  v = Number(v);
+  if (it.k === "tap_ths") return (v * 0.25).toFixed(2) + " g";
+  if (it.k === "ths")     return (v * 125) + " mg";
+  if (it.zero && v === 0) return "off";
+  const u = it.unit === "deg" ? "°" : (it.unit ? " " + it.unit : "");
+  return v.toFixed(it.dec) + u;
+}
+
+function sendSet(k, v) {
+  if (confirmOpen || awaitingEnd) { toast("Finish the open end first.", true); return; }
+  send(`set ${k} ${v}`);
+}
+
+function settingRow(it) {
+  const div = document.createElement("div");
+  div.className = "setting";
+  const step = it.dec ? Math.pow(10, -it.dec) : 1;
+  const off = it.zero && Number(it.v) === 0;
+  div.innerHTML = `
+    <div class="top"><span class="lbl"></span><span class="val"></span></div>
+    <div class="desc"></div>
+    <div class="ctl">
+      <input type="range" min="${it.min}" max="${it.max}" step="${step}">
+      <input type="number" min="${it.min}" max="${it.max}" step="${step}" inputmode="decimal">
+      ${it.zero ? '<label class="off"><input type="checkbox"> Off</label>' : ""}
+    </div>`;
+  div.querySelector(".lbl").textContent  = LABELS[it.k] || it.k;
+  div.querySelector(".desc").textContent =
+    `${DESCS[it.k] || it.d + "."} Default ${shownValue(it, it.def)}, range ${shownValue(it, it.min)} to ${shownValue(it, it.max)}.`;
+  const val = div.querySelector(".val"), rng = div.querySelector("input[type=range]"), num = div.querySelector("input[type=number]");
+  const chk = div.querySelector("input[type=checkbox]");
+  val.textContent = shownValue(it, it.v);
+  rng.value = off ? it.min : it.v;
+  num.value = off ? it.min : it.v;
+  rng.disabled = num.disabled = off;
+  if (chk) chk.checked = off;
+
+  const clamp = (v) => Math.min(it.max, Math.max(it.min, v));
+  rng.addEventListener("input", () => { num.value = rng.value; val.textContent = shownValue(it, rng.value); });
+  rng.addEventListener("change", () => sendSet(it.k, rng.value));
+  num.addEventListener("change", () => {
+    const v = clamp(Number(num.value));
+    if (Number.isNaN(v)) return;
+    num.value = rng.value = v;
+    sendSet(it.k, v);
+  });
+  if (chk) chk.addEventListener("change", () => sendSet(it.k, chk.checked ? 0 : it.def));
+  return div;
+}
+
+function switchRow(label, desc, checked, onChange) {
+  const row = document.createElement("div");
+  row.className = "switchrow";
+  row.innerHTML = `<div><div class="lbl"></div><div class="desc"></div></div>
+                   <label class="switch"><input type="checkbox"><span></span></label>`;
+  row.querySelector(".lbl").textContent = label;
+  row.querySelector(".desc").textContent = desc;
+  const cb = row.querySelector("input");
+  cb.checked = checked;
+  cb.setAttribute("aria-label", label);
+  cb.addEventListener("change", () => onChange(cb.checked, cb));
+  return row;
+}
+
+function renderSettings() {
+  const connected = state.conn === "connected";
+  const gaveUp = cfgRetries >= CFG_MAX_RETRIES && !state.cfg;
+  $("setNotConnected").hidden = connected;
+  $("setLoading").hidden = !connected || !!state.cfg;
+  $("setLoadingText").textContent = gaveUp
+    ? "The settings didn't arrive completely. Move closer to the sight and try again."
+    : "Loading settings…";
+  $("btnCfgRetry").hidden = !gaveUp;
+  $("setBody").hidden = !(connected && state.cfg);
+  $("btnDfu").disabled = !connected;
+  const h = state.hello;
+  $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}, protocol ${h.proto}` : "");
+  $("saveBar").hidden = !cfgDirty;
+  if (!connected || !state.cfg || activeView !== "settings") return;
+  // Don't rebuild while the user is dragging a slider or typing
+  if (document.activeElement && document.activeElement.closest && document.activeElement.closest("#view-settings input[type=range], #view-settings input[type=number]")) {
+    updateLiveBits();
+    return;
+  }
+
+  // Switches
+  const sw = $("setSwitches");
+  sw.textContent = "";
+  const ses = state.session || {}, lv = state.level || {};
+  sw.appendChild(switchRow("Shot counter", "Counts shots and records sessions.", !!ses.counter, (on, cb) => {
+    if (!on && ses.active) { cb.checked = true; toast("End the running session first.", true); return; }
+    send(on ? "shots on" : "shots off");
+  }));
+  sw.appendChild(switchRow("Cant indicator", "Blinks the LED when the bow is canted, during a session.", !!lv.on,
+    (on) => send(on ? "level on" : "level off")));
+  const modeRow = document.createElement("div");
+  modeRow.className = "switchrow";
+  modeRow.innerHTML = `<div><div class="lbl">LED test</div><div class="desc">Force the light on or off. Back to Auto on restart.</div></div>
+    <div class="seg" role="group" aria-label="LED mode">
+      <button data-m="auto">Auto</button><button data-m="on">On</button><button data-m="off">Off</button></div>`;
+  const cur = (state.status && state.status.mode) || "auto";
+  modeRow.querySelectorAll("[data-m]").forEach((b) => {
+    b.setAttribute("aria-pressed", String(b.dataset.m === cur));
+    b.addEventListener("click", () => send("mode " + b.dataset.m));
+  });
+  sw.appendChild(modeRow);
+
+  // Groups
+  const host = $("setGroups");
+  host.textContent = "";
+  const used = new Set();
+  const byKey = Object.fromEntries(state.cfg.items.map((it) => [it.k, it]));
+  const addGroup = (g, items) => {
+    const box = document.createElement("div");
+    box.className = "group";
+    const h = document.createElement("h3"); h.textContent = g.title; box.appendChild(h);
+    if (g.light) {
+      const n = document.createElement("p"); n.className = "gnote"; n.id = "liveLight"; box.appendChild(n);
+    }
+    if (g.cal) box.appendChild(calCard());
+    items.forEach((it) => box.appendChild(settingRow(it)));
+    host.appendChild(box);
+  };
+  for (const g of GROUPS) {
+    const items = g.keys.map((k) => byKey[k]).filter(Boolean);
+    items.forEach((it) => used.add(it.k));
+    if (items.length || g.cal) addGroup(g, items);
+  }
+  const rest = state.cfg.items.filter((it) => !used.has(it.k));   // settings added in newer firmware
+  if (rest.length) addGroup({ title: "Other" }, rest);
+  updateLiveBits();
+}
+
+function updateLiveBits() {
+  const el = $("liveLight");
+  if (el && state.status) {
+    el.textContent = `Current reading: ${state.status.light} (${state.status.dark ? "dark" : "bright"}). Lower means darker.`;
+  }
+}
+
+function calCard() {
+  const box = document.createElement("div");
+  const lv = state.level || {};
+  if (calStep === 0) {
+    box.className = "switchrow";
+    box.innerHTML = `<div><div class="lbl">Calibration</div><div class="desc"></div></div>
+                     <button class="btn secondary">Calibrate</button>`;
+    box.querySelector(".desc").textContent = lv.cal ? "Calibrated." : "Not calibrated yet. Needed for the cant indicator.";
+    box.querySelector("button").addEventListener("click", () => { calStep = 1; calError = ""; render(); });
+    return box;
+  }
+  box.className = "wizard";
+  let text, btn = "Measure", cmd = calStep === 1 ? "level cal" : "level cal2";
+  if (calStep === 1) text = "Step 1 of 2: Put the bow in a stand, level it with the bubble and aim horizontally. Then tap Measure and keep the bow still.";
+  if (calStep === 2) text = "Step 2 of 2: Keep the bow level, but aim clearly up or down, at least 20 degrees. Then tap Measure and keep it still.";
+  if (calStep === 3) { text = "Calibration saved. Check the cant reading in a session: it should stay near 0° with the bubble centred."; btn = null; }
+  if (calBusy) text = "Measuring. Keep the bow still…";
+  box.innerHTML = `<p></p>${calError ? '<p class="errtext"></p>' : ""}<div class="row"></div>`;
+  box.querySelector("p").textContent = text;
+  if (calError) box.querySelector(".errtext").textContent = calError;
+  const row = box.querySelector(".row");
+  if (btn && !calBusy) {
+    const m = document.createElement("button"); m.className = "btn"; m.textContent = btn;
+    m.addEventListener("click", () => {
+      if (confirmOpen || awaitingEnd) { toast("Finish the open end first.", true); return; }
+      calBusy = true; calError = ""; send(cmd); render();
+    });
+    row.appendChild(m);
+  }
+  if (!calBusy) {
+    const c = document.createElement("button"); c.className = "btn secondary";
+    c.textContent = calStep === 3 ? "Done" : "Cancel";
+    c.addEventListener("click", () => { calStep = 0; calError = ""; render(); });
+    row.appendChild(c);
+  }
+  return box;
+}
+
+function onCal(m) {
+  if (m.state === "countdown") { calBusy = true; return; }
+  calBusy = false;
+  if (m.state === "error") { calError = m.text; return; }
+  calError = "";
+  if (m.step === 1) calStep = 2;
+  if (m.step === 2) calStep = 3;
+}
+
+$("btnSave").addEventListener("click", () => send("save"));
+
+$("btnDfu").addEventListener("click", async () => {
+  const ok = await dialog({
+    title: "Start update mode?",
+    text: "Connect the USB cable to your computer first. The sight restarts as a drive and stays there " +
+          "until you copy new firmware onto it or press reset. The connection to this app ends.",
+    yes: "Start update mode", no: "Cancel", danger: true,
+  });
+  if (ok) send("dfu");
+});
+
+// Install prompt (Chrome offers it once the app is installable)
+let installEvent = null;
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  installEvent = e;
+  $("installRow").hidden = false;
+});
+window.addEventListener("appinstalled", () => {
+  installEvent = null;
+  $("installRow").hidden = true;
+  toast("Installed. Start UV-Sight from the home screen.");
+});
+$("btnInstall").addEventListener("click", async () => {
+  if (!installEvent) return;
+  installEvent.prompt();
+  await installEvent.userChoice;
+  installEvent = null;
+  $("installRow").hidden = true;
+});
+$("btnCfgRetry").addEventListener("click", () => { cfgRetries = 0; requestCfg(); render(); });
+$("btnDefaults").addEventListener("click", async () => {
+  const ok = await dialog({ title: "Restore defaults?", text: "All settings go back to their defaults. Tap Save afterwards to keep them.", yes: "Restore", no: "Cancel", danger: true });
+  if (!ok) return;
+  expectDefaults = true;
+  send("defaults");
+});
+
+// ---------------------------------------------------------------------------
+// Console
+// ---------------------------------------------------------------------------
+function logConsole(text, cls) {
+  const el = $("console");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.appendChild(line);
+  while (el.childNodes.length > CONSOLE_MAX) el.removeChild(el.firstChild);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+$("cmdForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const cmd = $("cmdInput").value.trim();
+  if (!cmd) return;
+  if (state.conn !== "connected") { toast("Not connected.", true); return; }
+  send(cmd);
+  $("cmdInput").value = "";
+});
+
+// ---------------------------------------------------------------------------
+// Tabs, toast, start
+// ---------------------------------------------------------------------------
+document.querySelectorAll("nav button").forEach((b) => {
+  b.addEventListener("click", () => {
+    activeView = b.dataset.view;
+    document.querySelectorAll("nav button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+    document.querySelectorAll(".view").forEach((v) => { v.hidden = v.id !== "view-" + activeView; });
+    if (activeView === "console") $("console").scrollTop = $("console").scrollHeight;
+    if (activeView === "status" && state.conn === "connected" && !confirmOpen) send("status");
+    const idle = state.conn === "connected" && !confirmOpen && !awaitingEnd;
+    if (activeView === "training" && idle) send("shots");
+    if (activeView === "history"  && idle) send("log");
+    if (activeView === "settings" && idle) {
+      send("level");
+      if (state.cfg) send("get");
+      else { cfgRetries = 0; requestCfg(); }
+    }
+    render();
+  });
+});
+
+let toastTimer = null;
+function toast(text, isErr) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.toggle("err", !!isErr);
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 3500);
+}
+
+$("btnConnect").addEventListener("click", connect);
+$("btnReconnect").addEventListener("click", reconnect);
+
+if (!navigator.bluetooth) {
+  $("unsupported").hidden = false;
+  $("btnConnect").disabled = true;
+}
+render();
+renderHistory();
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch((e) => logConsole("Offline mode unavailable: " + e.message, "err"));
+}
+</script>
+</body>
+</html>

@@ -331,11 +331,14 @@
         <li><span class="k">Ambient light</span><span class="v" id="vLight">–</span></li>
         <li><span class="k">Cant</span><span class="v" id="vTilt">–</span></li>
         <li><span class="k">Charging</span><span class="v" id="vCharge">–</span></li>
+        <li><span class="k">Runtime with light</span><span class="v" id="vRunLight">–</span></li>
+        <li><span class="k">Runtime resting</span><span class="v" id="vRunIdle">–</span></li>
       </ul>
  
       <div style="text-align:center; margin-top:18px">
         <button class="btn secondary" id="btnReconnect" hidden>Reconnect</button>
       </div>
+      <p class="fw" id="runNote">Runtimes are rough estimates from the battery level and your settings.</p>
       <p class="fw" id="fw"></p>
     </div>
   </section>
@@ -441,6 +444,12 @@
           <div class="desc" id="fwText">Restarts the sight as a USB drive, like a double click on the reset button. Needs the USB cable.</div></div>
         <button class="btn secondary" id="btnDfu">Start</button>
       </div>
+      <div class="switchrow">
+        <div><div class="lbl">Battery capacity</div>
+          <div class="desc">Used for the runtime estimate on the Status tab. Stored on this phone.</div></div>
+        <input type="number" id="batCap" min="10" max="5000" step="1" inputmode="numeric"
+               style="width:96px;min-height:40px;border-radius:10px;border:2px solid var(--line);background:var(--paper);color:var(--ink);padding:0 8px;font:inherit;text-align:right" aria-label="Battery capacity in mAh">
+      </div>
       <div class="switchrow" id="installRow" hidden>
         <div><div class="lbl">Install app</div>
           <div class="desc">Adds UV-Sight to the home screen. It then starts without internet.</div></div>
@@ -492,7 +501,7 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.7";
+const APP_VERSION     = "1.8";
  
 // ---------------------------------------------------------------------------
 // State
@@ -789,8 +798,10 @@ function render() {
   // LED
   let ledText = { on: "On", off: "Off", blinking: "Blinking" }[s.led] || s.led;
   if (s.led === "on" && typeof s.bright === "number") ledText += `, ${s.bright} %`;
-  const modeText = s.mode !== "auto" ? ` <small>(test: ${s.mode})</small>` : "";
-  $("vLed").innerHTML = ledText + modeText;
+  const bm = cfgValue("bright_mode");
+  const bmText = bm === null ? "" : (bm === 1 ? "auto" : "fixed");
+  const modeText = s.mode !== "auto" ? `test: ${s.mode}` : bmText;
+  $("vLed").innerHTML = ledText + (modeText ? ` <small>${modeText}</small>` : "");
  
   // Ambient light
   $("vLight").innerHTML = `${s.dark ? "Dark" : "Bright"} <small>${s.light}</small>`;
@@ -803,12 +814,65 @@ function render() {
   else if (!lv.cal)                            tiltText = "Not calibrated";
   else if (lv.mode === "auto")                 tiltText = "Waits for a session";
   else                                         tiltText = "Waiting for a reading";
-  $("vTilt").textContent = tiltText;
+  const lvDetail = lv && lv.mode !== "off" ? `${lv.mode}, ${lv.style || "normal"}` : "";
+  $("vTilt").innerHTML = tiltText + (lvDetail && tiltText !== "Off" ? ` <small>${lvDetail}</small>` : "");
  
   $("vCharge").textContent = chargeLabel(s.chg);
  
+  // Runtime estimates
+  const rt = runtimeEstimates(s);
+  $("vRunLight").innerHTML = rt ? rt.light : "–";
+  $("vRunIdle").innerHTML  = rt ? rt.idle  : "–";
+ 
   const h = state.hello;
   $("fw").textContent = h ? `${h.name}, firmware ${h.fw}` : "";
+}
+ 
+// ---------------------------------------------------------------------------
+// Runtime estimate (rough, from battery level, capacity and settings)
+// ---------------------------------------------------------------------------
+const BATCAP_KEY      = "uvsight.batcap";
+const BATCAP_DEFAULT  = 85;     // mAh
+const IDLE_MA         = 0.06;   // board asleep, IMU in low-power mode
+const ACTIVE_BASE_MA  = 0.6;    // board awake, Bluetooth advertising or connected
+const SHOT_MODE_MA    = 0.2;    // IMU at 416 Hz for shot detection
+const CANT_LOOP_MA    = 0.2;    // faster loop for the cant indicator
+const LED_MAX_MA      = 15;     // must match BRIGHT_MAX_MA in the firmware
+const LED_GAMMA       = 2.2;    // must match BRIGHT_GAMMA in the firmware
+ 
+function batteryCapacity() {
+  const v = Number(localStorage.getItem(BATCAP_KEY));
+  return v > 0 ? v : BATCAP_DEFAULT;
+}
+function cfgValue(k) {
+  const it = state.cfg && state.cfg.items.find((x) => x.k === k);
+  return it ? Number(it.v) : null;
+}
+const pctToMa = (p) => LED_MAX_MA * Math.pow(Math.max(0, Math.min(100, p)) / 100, LED_GAMMA);
+ 
+function fmtDuration(hours) {
+  if (!isFinite(hours) || hours <= 0) return "–";
+  if (hours < 1)      return `about ${Math.max(1, Math.round(hours * 60))} min`;
+  if (hours < 48)     return `about ${Math.round(hours)} h`;
+  if (hours < 24 * 21) return `about ${Math.round(hours / 24)} days`;
+  return `about ${Math.round(hours / 24 / 7)} weeks`;
+}
+ 
+function runtimeEstimates(s) {
+  if (s.chg === "charging") return { light: "Charging", idle: "Charging" };
+  const remaining = batteryCapacity() * Math.max(0, s.pct) / 100;   // 0 % = cutoff
+  const bright = cfgValue("bright");
+  if (bright === null) return null;
+  const ses = state.session || {}, lv = state.level || {};
+  let active = ACTIVE_BASE_MA;
+  if (ses.counter)                     active += SHOT_MODE_MA;
+  if (lv.mode && lv.mode !== "off")    active += CANT_LOOP_MA;
+  const withLight = active + pctToMa(bright);       // full brightness, worst case in auto mode
+  const auto = cfgValue("bright_mode") === 1;
+  return {
+    light: `${fmtDuration(remaining / withLight)} <small>at ${Math.round(bright)} %${auto ? ", fully dark" : ""}</small>`,
+    idle:  fmtDuration(remaining / IDLE_MA),
+  };
 }
  
 // ---------------------------------------------------------------------------
@@ -1528,6 +1592,14 @@ function onCal(m) {
 }
  
 $("btnSave").addEventListener("click", () => send("save"));
+ 
+$("batCap").value = batteryCapacity();
+$("batCap").addEventListener("change", () => {
+  const v = Math.round(Number($("batCap").value));
+  if (v >= 10 && v <= 5000) { localStorage.setItem(BATCAP_KEY, String(v)); toast(`Battery capacity set to ${v} mAh`); }
+  $("batCap").value = batteryCapacity();
+  render();
+});
  
 $("btnDfu").addEventListener("click", async () => {
   const ok = await dialog({

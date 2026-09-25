@@ -330,6 +330,7 @@
         <li><span class="k">UV light</span><span class="v" id="vLed">–</span></li>
         <li><span class="k">Ambient light</span><span class="v" id="vLight">–</span></li>
         <li><span class="k">Cant</span><span class="v" id="vTilt">–</span></li>
+        <li><span class="k">Last shot</span><span class="v" id="vShotG">–</span></li>
         <li><span class="k">Charging</span><span class="v" id="vCharge">–</span></li>
         <li><span class="k">Runtime with light</span><span class="v" id="vRunLight">–</span></li>
         <li><span class="k">Runtime resting</span><span class="v" id="vRunIdle">–</span></li>
@@ -338,7 +339,7 @@
       <div style="text-align:center; margin-top:18px">
         <button class="btn secondary" id="btnReconnect" hidden>Reconnect</button>
       </div>
-      <p class="fw" id="runNote">Runtimes are rough estimates from the battery level and your settings.</p>
+      <p class="fw" id="runNote">Runtimes are rough estimates from the current battery level, the battery capacity and the LED brightness.</p>
       <p class="fw" id="fw"></p>
     </div>
   </section>
@@ -501,7 +502,7 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.8";
+const APP_VERSION     = "2.0";
  
 // ---------------------------------------------------------------------------
 // State
@@ -663,6 +664,10 @@ function handleLine(line) {
       break;
     case "level":   state.level   = m; break;
     case "shot":
+      if (state.status && typeof m.g === "number") {
+        state.status.lastShotG = m.g;
+        state.status.lastShotClip = !!m.clip;
+      }
       if (state.session) {
         state.session.active   = true;
         state.session.end      = m.end;
@@ -819,6 +824,15 @@ function render() {
  
   $("vCharge").textContent = chargeLabel(s.chg);
  
+  // Strength of the last shot, with the threshold for comparison
+  const tap = cfgValue("tap_ths");
+  const thr = tap === null ? "" : ` <small>threshold ${(Math.ceil(tap / 2) * 0.5).toFixed(1)} g</small>`;
+  if (typeof s.lastShotG === "number") {
+    $("vShotG").innerHTML = (s.lastShotClip ? "≥ 16 g" : `${s.lastShotG.toFixed(1)} g`) + thr;
+  } else {
+    $("vShotG").innerHTML = "No shot yet" + thr;
+  }
+ 
   // Runtime estimates
   const rt = runtimeEstimates(s);
   $("vRunLight").innerHTML = rt ? rt.light : "–";
@@ -870,8 +884,8 @@ function runtimeEstimates(s) {
   const withLight = active + pctToMa(bright);       // full brightness, worst case in auto mode
   const auto = cfgValue("bright_mode") === 1;
   return {
-    light: `${fmtDuration(remaining / withLight)} <small>at ${Math.round(bright)} %${auto ? ", fully dark" : ""}</small>`,
-    idle:  fmtDuration(remaining / IDLE_MA),
+    light: `${fmtDuration(remaining / withLight)} <small>LED ${Math.round(bright)} %${auto ? " (fully dark)" : ""}</small>`,
+    idle:  `${fmtDuration(remaining / IDLE_MA)} <small>bow lying still</small>`,
   };
 }
  
@@ -1355,7 +1369,7 @@ const DESCS = {
   session_end: "A session ends automatically after this long without a shot.",
   vf: "Only change this if you swap the LED.",
   level_tol: "A cant up to this angle counts as level.",
-  tap_ths: "Lower counts softer impacts. Raise it if carrying the bow counts as a shot.",
+  tap_ths: "Lower counts softer impacts, raise it if carrying the bow counts as a shot. Compare with the last shot on the Status tab. Applied in 0.5 g steps.",
   lockout: "After a shot, further impacts are ignored and the cant indicator pauses.",
   cutoff: "Below this voltage the light switches off to protect the battery. This is 0 %.",
   ths: "Lower wakes the sight with smaller movements.",

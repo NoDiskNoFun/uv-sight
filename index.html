@@ -492,7 +492,7 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.6";
+const APP_VERSION     = "1.7";
  
 // ---------------------------------------------------------------------------
 // State
@@ -1216,7 +1216,7 @@ async function showSession(r) {
   ];
   if (r.invalidEnds) lines.push(`${r.invalidEnds} invalid ends with ${r.invalidArrows} arrows (0 points, not in the average).`);
   if (r.mismatch)    lines.push("Shot counts were corrected by hand in this session.");
-  lines.push(r.manual ? "Ended by hand." : "Ended automatically after 1 h without a shot.");
+  lines.push(r.manual ? "Ended by hand." : "Ended automatically after a while without a shot.");
   const del = await dialog({ title: fmtDate(r), text: lines.join(" "), yes: "Remove from phone", no: "Close", danger: true });
   if (!del) return;
   markDeleted(r.key);
@@ -1270,9 +1270,9 @@ let calBusy = false, calError = "";
  
 const GROUPS = [
   { title: "Light sensor", keys: ["dark_on", "dark_off", "confirm"], light: true },
-  { title: "UV light",     keys: ["bright_mode", "bright", "bright_min", "vf"] },
-  { title: "Cant",         keys: ["level_tol", "tilt_offset"], cal: true },
-  { title: "Shot detection", keys: ["tap_ths", "lockout"] },
+  { title: "UV light",     keys: ["bright_mode", "bright", "bright_min", "fade", "vf"] },
+  { title: "Cant",         keys: ["level_tol", "tilt_offset", "tilt_full", "blink_min", "blink_max", "tilt_smooth"], cal: true },
+  { title: "Shot detection and sessions", keys: ["tap_ths", "lockout", "session_end"] },
   { title: "Battery",      keys: ["cutoff"] },
   { title: "Power and Bluetooth", keys: ["ths", "timeout", "report", "tx_power"] },
 ];
@@ -1283,6 +1283,12 @@ const DESCS = {
   bright: "Fixed: brightness of the light. Auto: brightness at Dark below and darker. More drains the battery faster.",
   bright_min: "Auto: brightness at Bright above, where the light starts. It rises to Brightness as it gets darker.",
   tilt_offset: "The cant blinking is this many points darker than Brightness. 0 = equally bright.",
+  fade: "Auto: how long the light takes to follow a change in darkness. 0 = instantly.",
+  tilt_full: "Cant at which the blink rate reaches its end value. Lower makes small cant differences easier to tell apart.",
+  blink_min: "Normal style: rate just outside the tolerance. Inverted style: rate from the full-rate angle on.",
+  blink_max: "Normal style: rate from the full-rate angle on. Inverted style: rate just outside the tolerance. Above about 10 Hz it looks like steady light.",
+  tilt_smooth: "Higher is calmer against hand tremor, lower reacts faster.",
+  session_end: "A session ends automatically after this long without a shot.",
   vf: "Only change this if you swap the LED.",
   level_tol: "A cant up to this angle counts as level.",
   tap_ths: "Lower counts softer impacts. Raise it if carrying the bow counts as a shot.",
@@ -1296,6 +1302,8 @@ const DESCS = {
 const LABELS = {
   dark_on: "Dark below", dark_off: "Bright above", confirm: "Readings before switching",
   bright: "Brightness", bright_min: "Start brightness", tilt_offset: "Blink dimming", vf: "LED forward voltage",
+  fade: "Fade time", tilt_full: "Full-rate angle", blink_min: "Slow blink rate", blink_max: "Fast blink rate",
+  tilt_smooth: "Smoothing", session_end: "End session after",
   level_tol: "Tolerance", tap_ths: "Shot threshold", lockout: "Pause after a shot",
   cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Status report every",
   tx_power: "Radio power",
@@ -1450,7 +1458,7 @@ function renderSettings() {
           autoMode ? "auto" : "fixed", ["fixed", "auto"], (m) => sendSet("bright_mode", m === "auto" ? 1 : 0)));
         return;
       }
-      if (it.k === "bright_min" && !autoMode) return;
+      if ((it.k === "bright_min" || it.k === "fade") && !autoMode) return;
       box.appendChild(settingRow(it));
     });
     host.appendChild(box);

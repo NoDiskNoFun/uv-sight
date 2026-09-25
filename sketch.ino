@@ -153,7 +153,7 @@ const uint32_t SESSION_IDLE_MS = 60UL * 60UL * 1000UL; // 1 h without a shot = e
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "1.6";
+const char*    FW_VERSION        = "1.7";
 const uint8_t  PROTO_VERSION     = 4;
 
 // Bluetooth
@@ -1043,7 +1043,10 @@ String sessionJson() {
   String j = "{\"t\":\"session\",\"counter\":" + jbool(shotLog.shotsOn) +
              ",\"active\":" + jbool(sessionActive);
   if (sessionActive) {
-    j += ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
+    // epoch + nextId = the key this session will get in the log, so the app
+    // can remember its start time even if the board restarts before import
+    j += ",\"epoch\":" + String(shotLog.epoch) + ",\"nextId\":" + String(shotLog.seq + 1) +
+         ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
          ",\"ends\":" + String(endCount) + ",\"invalidEnds\":" + String(invalidEnds) +
          ",\"shots\":" + String(shotCount) + ",\"scored\":" + String(scoreCount) +
          ",\"sum\":" + String(scoreSum) + ",\"x\":" + String(xCount) +
@@ -1055,6 +1058,7 @@ String sessionJson() {
 }
 
 void startSession(uint32_t now) {
+  ensureLogEpoch();                 // the session's future log key must be known now
   sessionActive     = true;
   sessionStartMs    = now;
   sessionLastShotMs = now;

@@ -492,7 +492,7 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.4";
+const APP_VERSION     = "1.5";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1059,6 +1059,16 @@ function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = nu
 // ---------------------------------------------------------------------------
 const ARCHIVE_KEY = "uvsight.archive.v1";
 const STARTS_KEY  = "uvsight.starts.v1";     // log key -> start time of sessions seen running
+const DELETED_KEY = "uvsight.deleted.v1";    // log keys removed by hand, never re-imported
+const DELETED_MAX = 1000;
+
+function loadDeleted() {
+  try { return new Set(JSON.parse(localStorage.getItem(DELETED_KEY)) || []); } catch { return new Set(); }
+}
+function markDeleted(key) {
+  const list = [...loadDeleted().add(key)].slice(-DELETED_MAX);   // keep the newest entries
+  try { localStorage.setItem(DELETED_KEY, JSON.stringify(list)); } catch {}
+}
 const STARTS_KEEP_MS = 90 * 24 * 3600 * 1000;
 
 function loadStarts() {
@@ -1105,6 +1115,7 @@ function saveArchive(a) {
 function archiveSlot(epoch, sl) {
   const a = loadArchive();
   const key = `${epoch}-${sl.id}`;
+  if (loadDeleted().has(key)) return false;     // removed by hand before
   let endedAt = (sl.ago !== null && sl.ago !== undefined) ? Date.now() - sl.ago * 60000 : null;
   if (endedAt === null) {
     const started = loadStarts()[key];
@@ -1207,9 +1218,10 @@ async function showSession(r) {
   lines.push(r.manual ? "Ended by hand." : "Ended automatically after 1 h without a shot.");
   const del = await dialog({ title: fmtDate(r), text: lines.join(" "), yes: "Remove from phone", no: "Close", danger: true });
   if (!del) return;
+  markDeleted(r.key);
   saveArchive(loadArchive().filter((x) => x.key !== r.key));
   renderHistory();
-  toast("Removed from this phone. The sight's own log is unchanged.");
+  toast("Removed from this phone. It won't come back when you fetch sessions again.");
 }
 
 function exportCsv() {

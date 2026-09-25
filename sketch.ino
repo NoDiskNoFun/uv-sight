@@ -9,7 +9,14 @@
   - Motion detection via the built-in IMU (accelerometer only).
   - If the bow lies still (timeout), everything is off: LED, light sensor, radio.
   - If the bow is moved and it is dark, the UV LED turns on.
-  - Brightness is adjusted to the battery voltage via PWM.
+  - Brightness is set in percent (perceptual scale).
+    Mode "fixed": the LED switches on below dark_on with one brightness and
+    off above dark_off.
+    Mode "auto": the LED comes on at dark_off with bright_min and gets
+    brighter as it gets darker, reaching "bright" at dark_on and staying
+    there below. Getting brighter it dims the same way and goes off above
+    dark_off.
+  - Brightness is held steady over the battery discharge via PWM.
   - Battery level is shown via Bluetooth only ("status").
   - Below the cutoff voltage the LED turns off to protect the battery.
     The percentage display is tied to it: 0 % = cutoff voltage.
@@ -40,7 +47,8 @@
   Tilt indicator (cant)
   ---------------------
   - If the bow is canted sideways, the LED blinks at reduced brightness,
-    regardless of bright/dark. The more tilted, the faster.
+    regardless of bright/dark. Style "normal": the more tilted, the faster.
+    Style "inverted": the closer to level, the faster.
         bright + level = off        dark + level = on
         bright + tilted = blinks    dark + tilted = blinks
   - Only sideways cant counts, not aiming up or down.
@@ -138,6 +146,13 @@ const float ADC_MV_PER_LSB = 3600.0 / 4096.0;  // 12 bit, 3.6 V reference
 // Battery protection
 const float VBAT_RECOVER_OFFSET = 0.25;
 
+// Brightness: percent -> LED current on a perceptual curve
+const float    BRIGHT_MAX_MA   = 15.0;  // current at 100 %
+const float    BRIGHT_GAMMA    = 2.2;   // 50 % looks about half as bright
+const float    BRIGHT_SMOOTH   = 0.35;  // auto mode: share of the change per reading (every 2 s)
+const uint8_t  PWM_BITS        = 12;    // fine steps at low brightness
+const uint16_t PWM_MAX         = (1u << PWM_BITS) - 1;
+
 // Tilt indicator (adjustable here in the sketch)
 const float    TILT_BLINK_MIN_HZ = 1.0;   // blink rate just outside the tolerance
 const float    TILT_BLINK_MAX_HZ = 8.0;   // blink rate at strong tilt (max ~10)
@@ -153,7 +168,7 @@ const uint32_t SESSION_IDLE_MS = 60UL * 60UL * 1000UL; // 1 h without a shot = e
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "1.7";
+const char*    FW_VERSION        = "1.8";
 const uint8_t  PROTO_VERSION     = 4;
 
 // Bluetooth
@@ -177,15 +192,19 @@ struct Config {
   uint8_t  darkConfirm;  // consecutive readings needed to switch
   uint8_t  wakeThs;      // motion threshold, 1 LSB = 125 mg (1..63)
   uint8_t  tapThs;       // shot threshold,   1 LSB = 250 mg (1..31)
-  float    targetMa;     // average LED current in mA
+  float    targetMa;     // legacy (firmware < 1.8), only read for migration
   float    vf;           // forward voltage of the UV LED
   float    cutoff;       // battery cutoff voltage
   uint32_t timeoutS;     // s without movement until idle
   uint32_t reportS;      // s between status reports (when connected), 0 = off
-  float    tiltMa;       // LED current while tilt-blinking in mA
+  float    tiltMa;       // legacy (firmware < 1.8), only read for migration
   float    levelTol;     // tilt tolerance in degrees
   uint32_t lockoutMs;    // after a shot: ignore impacts + pause tilt indicator, ms
   int8_t   txPower;      // Bluetooth transmit power in dBm
+  uint8_t  brightMode;   // 0 = fixed, 1 = auto (follows the light sensor)
+  float    brightMax;    // % : fixed brightness, or brightness at dark_on and darker (auto)
+  float    brightMin;    // % : auto: brightness at dark_off, where the light starts
+  float    tiltOffset;   // %-points below brightMax while tilt-blinking
                          // (new fields are appended at the end so older stored
                          //  settings stay valid and get the default for them)
 };
@@ -210,7 +229,11 @@ const Config DEFAULTS = {
   1.0f,    // tiltMa
   1.0f,    // levelTol (degrees)
   1500,    // lockoutMs
-  0        // txPower (dBm, about 10 m)
+  0,       // txPower (dBm, about 10 m)
+  0,       // brightMode (fixed)
+  61.0f,   // brightMax (= 5 mA, the former default)
+  25.0f,   // brightMin
+  32.0f    // tiltOffset (tilt blink at about 1 mA, the former default)
 };
 
 Config cfg = DEFAULTS;
@@ -232,8 +255,10 @@ const SettingDef SETTINGS[] = {
   {"dark_on",   S_U16, offsetof(Config, darkOn),      0,    4095, 0, false, "",       "light below = dark"},
   {"dark_off",  S_U16, offsetof(Config, darkOff),     0,    4095, 0, false, "",       "light above = bright"},
   {"confirm",   S_U8,  offsetof(Config, darkConfirm), 1,    10,   0, false, "",       "consecutive readings"},
-  {"ma",        S_F,   offsetof(Config, targetMa),    0.5,  15,   1, false, "mA",     "LED current"},
-  {"tilt_ma",   S_F,   offsetof(Config, tiltMa),      0.2,  15,   1, false, "mA",     "LED current while tilt-blinking"},
+  {"bright_mode", S_U8, offsetof(Config, brightMode), 0,    1,    0, false, "",       "0 = fixed, 1 = auto (follows the light sensor)"},
+  {"bright",    S_F,   offsetof(Config, brightMax),   1,    100,  0, false, "%",      "brightness (fixed), or at dark_on and darker (auto)"},
+  {"bright_min", S_F,  offsetof(Config, brightMin),   1,    100,  0, false, "%",      "auto: brightness at dark_off, where the light starts"},
+  {"tilt_offset", S_F, offsetof(Config, tiltOffset),  0,    99,   0, false, "%",      "tilt blinking: points below the brightest level"},
   {"vf",        S_F,   offsetof(Config, vf),          2.5,  3.6,  2, false, "V",      "LED forward voltage"},
   {"cutoff",    S_F,   offsetof(Config, cutoff),      3.0,  3.7,  2, false, "V",      "battery cutoff"},
   {"level_tol", S_F,   offsetof(Config, levelTol),    0.2,  10,   1, false, "deg",    "tilt tolerance"},
@@ -299,7 +324,8 @@ struct LevelState {
   uint32_t magic;
   uint8_t  on;        // LEVEL_OFF / LEVEL_AUTO / LEVEL_ON
   uint8_t  calibrated;
-  uint8_t  pad[2];
+  uint8_t  style;     // 0 = normal (faster when more tilted), 1 = inverted
+  uint8_t  pad;
   float    L[3];   // lateral axis (aiming up/down rotates around this axis)
   float    D[3];   // gravity direction with the bow level and horizontal
 };
@@ -371,7 +397,7 @@ enum LedState { LS_OFF, LS_ON, LS_BLINK };
 bool     imuOk             = false;
 bool     imuFast           = false;
 bool     uvPwmActive       = false;
-uint8_t  curDuty           = 0;
+uint16_t curDuty           = 0;
 LedState ledState          = LS_OFF;
 uint32_t blinkCycleStart   = 0;   // start of the current blink cycle
 uint32_t blinkPeriodMs     = 0;   // length of the current blink cycle
@@ -387,8 +413,9 @@ uint8_t  brightCount       = 0;
 uint16_t lastLdr           = 0;
 float    lastVbat          = 0;
 float    lastPct           = 0;
-uint8_t  dutyFull          = 0;
-uint8_t  dutyTilt          = 0;
+uint16_t dutyFull          = 0;
+uint16_t dutyTilt          = 0;
+float    brightNow         = -1;  // current steady brightness in %, smoothed (-1 = not set)
 uint32_t lastMotionMs      = 0;
 uint32_t lastSensorMs      = 0;
 uint32_t lastReportMs      = 0;
@@ -530,6 +557,18 @@ void say(const String& human, const String& json) {
 // ============================================================================
 // Flash: settings and log
 // ============================================================================
+// Perceptual brightness: percent <-> average LED current
+float percentToMa(float p) {
+  if (p < 0)   p = 0;
+  if (p > 100) p = 100;
+  return BRIGHT_MAX_MA * powf(p / 100.0f, BRIGHT_GAMMA);
+}
+float maToPercent(float ma) {
+  if (ma <= 0) return 1;
+  float p = 100.0f * powf(ma / BRIGHT_MAX_MA, 1.0f / BRIGHT_GAMMA);
+  return p < 1 ? 1 : (p > 100 ? 100 : roundf(p));
+}
+
 void cfgLoad() {
   cfg = DEFAULTS;
   File f(InternalFS);
@@ -538,6 +577,12 @@ void cfgLoad() {
     Config tmp = DEFAULTS;
     const int n = f.read(&tmp, sizeof(tmp));
     if (tmp.magic == CFG_MAGIC && n >= (int)offsetof(Config, lockoutMs)) {
+      // Settings from before firmware 1.8: convert the mA values to percent
+      if (n <= (int)offsetof(Config, brightMode)) {
+        tmp.brightMax  = maToPercent(tmp.targetMa);
+        tmp.tiltOffset = tmp.brightMax - maToPercent(tmp.tiltMa);
+        if (tmp.tiltOffset < 0) tmp.tiltOffset = 0;
+      }
       cfg = tmp;
     }
     f.close();
@@ -797,16 +842,46 @@ float vbatToPercent(float v) {
 // ============================================================================
 // UV LED
 // ============================================================================
-uint8_t dutyForVbat(float vbat, float targetMa) {
+uint16_t dutyForVbat(float vbat, float targetMa) {
   float peakMa = (vbat - cfg.vf - V_CE_SAT) / R_LED_OHM * 1000.0f;
-  if (peakMa <= targetMa) return 255;
-  float duty = targetMa / peakMa * 255.0f;
+  if (peakMa <= targetMa) return PWM_MAX;
+  float duty = targetMa / peakMa * PWM_MAX;
   if (duty < 1) duty = 1;
-  return (uint8_t)duty;
+  return (uint16_t)duty;
+}
+
+// Target brightness for the steady light.
+// Auto: bright_min at dark_off, rising to "bright" at dark_on and staying there
+// below. The sensor responds roughly logarithmically, so the blend is too.
+float brightTarget() {
+  if (cfg.brightMode == 0) return cfg.brightMax;
+  const float full  = (float)(cfg.darkOn  > 0 ? cfg.darkOn  : 1);   // full brightness from here down
+  const float start = (float)(cfg.darkOff > 0 ? cfg.darkOff : 1);   // light starts here
+  if (start <= full) return cfg.brightMax;
+  const float x = (float)(lastLdr > 0 ? lastLdr : 1);
+  float t = (logf(start) - logf(x)) / (logf(start) - logf(full));   // 0 at dark_off, 1 at dark_on
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  return cfg.brightMin + t * (cfg.brightMax - cfg.brightMin);
+}
+
+// Light-sensor thresholds for switching on / off.
+// Fixed: on below dark_on, off above dark_off (the gap prevents flicker).
+// Auto: the light already starts at dark_off; a small gap 10 % into the
+// range keeps it from flickering there.
+uint16_t lightOnThreshold() {
+  if (cfg.brightMode == 0 || cfg.darkOff <= cfg.darkOn) return cfg.darkOn;
+  return cfg.darkOff - (cfg.darkOff - cfg.darkOn) / 10;
+}
+
+// Tilt blinking: fixed offset below the brightest level in darkness
+float tiltBrightness() {
+  float p = cfg.brightMax - cfg.tiltOffset;
+  return p < 1 ? 1 : p;
 }
 
 // Set the PWM value (0 = dark, but PWM stays active -> used for blinking)
-void uvWrite(uint8_t duty) {
+void uvWrite(uint16_t duty) {
   if (uvPwmActive && duty == curDuty) return;
   analogWrite(PIN_UV, duty);
   uvPwmActive = true;
@@ -883,6 +958,7 @@ float blinkHz() {
   float f = (span <= 0) ? 1.0f : (tiltDeg - cfg.levelTol) / span;
   if (f < 0) f = 0;
   if (f > 1) f = 1;
+  if (lvl.style == 1) f = 1.0f - f;   // inverted: fastest just outside the tolerance
   return TILT_BLINK_MIN_HZ + f * (TILT_BLINK_MAX_HZ - TILT_BLINK_MIN_HZ);
 }
 
@@ -902,6 +978,7 @@ bool sampleGravity(float g[3]) {
 
 String levelJson() {
   return String("{\"t\":\"level\",\"mode\":\"") + levelModeText() + "\",\"on\":" + jbool(lvl.on != LEVEL_OFF) +
+         ",\"style\":\"" + String(lvl.style == 1 ? "inverted" : "normal") + "\"" +
          ",\"cal\":" + jbool(lvl.calibrated) +
          ",\"tol\":" + String(cfg.levelTol, 1) + ",\"active\":" + jbool(levelActive()) +
          ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) + "}";
@@ -982,7 +1059,8 @@ void handleLevel(const String& arg) {
     if (appMode) { sendLine(levelJson()); return; }
     String m = lvl.on == LEVEL_ON   ? "on (always)" :
                lvl.on == LEVEL_AUTO ? "auto (during sessions)" : "off";
-    out("Tilt indicator: " + m + (lvl.calibrated ? ", calibrated" : ", NOT calibrated") +
+    out("Tilt indicator: " + m + (lvl.style ? ", inverted" : ", normal") +
+        (lvl.calibrated ? ", calibrated" : ", NOT calibrated") +
         ", tolerance " + String(cfg.levelTol, 1) + " degrees" +
         (levelActive() ? ", active now" : ", inactive now"));
     if (levelActive() && tiltFilterOk) out("Current tilt: " + String(tiltDeg, 1) + " degrees");
@@ -990,9 +1068,15 @@ void handleLevel(const String& arg) {
   else if (arg == "on")   setLevelMode(LEVEL_ON,   "Tilt indicator on (always).");
   else if (arg == "auto") setLevelMode(LEVEL_AUTO, "Tilt indicator auto (during sessions).");
   else if (arg == "off")  setLevelMode(LEVEL_OFF,  "Tilt indicator off.");
+  else if (arg == "style normal" || arg == "style inverted") {
+    lvl.style = (arg == "style inverted") ? 1 : 0;
+    if (!levelSave()) { err("ERROR while saving!"); return; }
+    say(String("Tilt blinking: ") + (lvl.style ? "inverted (faster when closer to level)."
+                                               : "normal (faster when more tilted)."), levelJson());
+  }
   else if (arg == "cal")  levelCal1();
   else if (arg == "cal2") levelCal2();
-  else err("Unknown. Possible: level, level on|auto|off|cal|cal2");
+  else err("Unknown. Possible: level, level on|auto|off|cal|cal2, level style normal|inverted");
 }
 
 // ============================================================================
@@ -1329,7 +1413,7 @@ String statusLine() {
   s += " | Battery=" + String(lastVbat, 2) + "V " + String((int)(lastPct + 0.5f)) + "%";
   s += " (" + String(chargeText(lastCharge)) + ")";
   s += " | LED=" + String(ledState == LS_ON ? "on" : (ledState == LS_BLINK ? "blinking" : "off"));
-  s += " Duty=" + String(dutyFull);
+  s += " Bright=" + String((int)(brightNow < 0 ? brightTarget() : brightNow)) + "%";
   if (levelActive() && tiltFilterOk) s += " | Tilt=" + String(tiltDeg, 1) + "deg";
   if (ledMode == MODE_ON)  s += " | Mode=on";
   if (ledMode == MODE_OFF) s += " | Mode=off";
@@ -1344,7 +1428,8 @@ String statusJson() {
   String j = "{\"t\":\"status\",\"light\":" + String(lastLdr) + ",\"dark\":" + jbool(isDark) +
              ",\"vbat\":" + String(lastVbat, 2) + ",\"pct\":" + String((int)(lastPct + 0.5f)) +
              ",\"chg\":\"" + chargeText(lastCharge) + "\",\"led\":\"" + led + "\"" +
-             ",\"duty\":" + String(dutyFull) + ",\"mode\":\"" + mode + "\"" +
+             ",\"duty\":" + String(dutyFull) + ",\"bright\":" + String((int)(brightNow < 0 ? brightTarget() : brightNow)) +
+             ",\"mode\":\"" + mode + "\"" +
              ",\"lowbat\":" + jbool(lowBatLock) +
              ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) +
              ",\"session\":" + jbool(sessionActive);
@@ -1401,6 +1486,7 @@ void printHelp() {
   out("log               stored sessions");
   out("level             tilt indicator status");
   out("level on|auto|off tilt indicator always / in sessions / off");
+  out("level style normal|inverted  blink faster when tilted / when level");
   out("level cal         calibration step 1");
   out("level cal2        calibration step 2");
   out("app on|off        JSON output for the app");
@@ -1616,10 +1702,11 @@ void evaluate() {
   // Darkness with hysteresis and debouncing
   const bool wasDark = isDark;
   if (wasInactive) {
-    isDark = lastLdr < cfg.darkOn;   // decide immediately after picking up the bow
+    brightNow = -1;                  // no gliding right after picking up the bow
+    isDark = lastLdr < lightOnThreshold();   // decide immediately after picking up the bow
     darkCount = brightCount = 0;
   } else if (!isDark) {
-    if (lastLdr < cfg.darkOn) {
+    if (lastLdr < lightOnThreshold()) {
       if (++darkCount >= cfg.darkConfirm) { isDark = true; darkCount = 0; }
     } else darkCount = 0;
   } else {
@@ -1634,8 +1721,12 @@ void evaluate() {
   wasInactive = false;
 
   // Adjust brightness to the battery voltage
-  dutyFull = dutyForVbat(lastVbat, cfg.targetMa);
-  dutyTilt = dutyForVbat(lastVbat, cfg.tiltMa);
+  // Steady brightness: jump after wake-up or in fixed mode, glide in auto mode
+  const float target = brightTarget();
+  if (brightNow < 0 || cfg.brightMode == 0) brightNow = target;
+  else brightNow += BRIGHT_SMOOTH * (target - brightNow);
+  dutyFull = dutyForVbat(lastVbat, percentToMa(brightNow));
+  dutyTilt = dutyForVbat(lastVbat, percentToMa(tiltBrightness()));
 }
 
 // ============================================================================
@@ -1663,7 +1754,7 @@ void setup() {
       (GPIO_PIN_CNF_PULL_Disabled    << GPIO_PIN_CNF_PULL_Pos);
 
   analogReadResolution(12);
-  analogWriteResolution(8);
+  analogWriteResolution(PWM_BITS);
   // The internal battery divider (1M/510k) has a very high impedance. With the
   // default 3 us acquisition time the ADC reads too low; Nordic recommends
   // 40 us for source impedances up to 800 kOhm.

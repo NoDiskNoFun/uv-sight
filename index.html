@@ -54,7 +54,7 @@
   }
   button { font: inherit; color: inherit; }
   :focus-visible { outline: 3px solid var(--blue); outline-offset: 2px; }
- 
+
   /* Header */
   header {
     display: flex; align-items: center; gap: 12px;
@@ -74,10 +74,10 @@
   }
   .btn.secondary { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line); }
   .btn:disabled { opacity: .5; }
- 
+
   main { flex: 1; overflow-y: auto; padding: 4px 18px 24px; }
   .view[hidden] { display: none; }
- 
+
   /* Banner */
   .banner {
     border-radius: var(--radius-s); padding: 12px 14px; margin: 6px 0 14px;
@@ -88,7 +88,7 @@
     background: color-mix(in srgb, var(--blue) 12%, var(--surface));
     border-left-color: var(--blue);
   }
- 
+
   /* Target gauge: the one bold element */
   .gauge {
     display: grid; place-items: center; margin: 8px auto 18px; position: relative;
@@ -103,7 +103,7 @@
   .gauge-text { position: absolute; text-align: center; }
   .gauge-pct { font-size: clamp(3rem, 16vw, 4.6rem); font-weight: 780; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.03em; }
   .gauge-sub { color: var(--muted); font-size: .95rem; margin-top: 6px; }
- 
+
   /* Readings */
   .readings { list-style: none; margin: 0; padding: 0; background: var(--surface); border-radius: var(--radius-l); }
   .readings li {
@@ -115,11 +115,11 @@
   .readings .v { font-weight: 650; font-variant-numeric: tabular-nums; text-align: right; }
   .readings .v small { font-weight: 400; color: var(--muted); }
   .stale .gauge, .stale .readings { opacity: .45; }
- 
+
   .empty { text-align: center; padding: 36px 8px; color: var(--muted); }
   .empty .btn { margin-top: 16px; }
   .fw { color: var(--muted); font-size: .85rem; text-align: center; margin-top: 16px; }
- 
+
   /* Console */
   .console {
     background: var(--surface); border-radius: var(--radius-l); padding: 10px 12px;
@@ -135,7 +135,7 @@
     flex: 1; min-width: 0; min-height: 44px; border-radius: 999px; border: 2px solid var(--line);
     background: var(--surface); color: var(--ink); padding: 0 16px; font: inherit;
   }
- 
+
   /* Tabs */
   nav {
     display: flex; border-top: 1px solid var(--line); background: var(--surface);
@@ -150,7 +150,7 @@
     content: ""; position: absolute; top: 0; left: 30%; right: 30%; height: 3px;
     background: var(--gold); border-radius: 0 0 3px 3px;
   }
- 
+
   /* Toast */
   .toast {
     position: fixed; left: 50%; bottom: calc(80px + env(safe-area-inset-bottom, 0px));
@@ -160,7 +160,7 @@
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   .toast.err  { background: var(--red); color: #fff; }
- 
+
   /* Training */
   .card { background: var(--surface); border-radius: var(--radius-l); padding: 16px; }
   .training-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
@@ -173,7 +173,7 @@
   .stats span { color: var(--muted); font-size: .8rem; }
   .last-end { color: var(--muted); font-size: .92rem; margin-top: 10px; }
   .last-end b { color: var(--ink); }
- 
+
   .entry {
     display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     min-height: 58px; margin: 14px 0 10px; padding: 8px 10px;
@@ -185,7 +185,7 @@
     width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center;
     font-weight: 750; font-size: .95rem; font-variant-numeric: tabular-nums;
   }
- 
+
   /* Target ring colours: constant in both themes */
   .r-gold  { background: #F2C230; color: #1B1B1B; }
   .r-red   { background: #D6402F; color: #fff; }
@@ -193,7 +193,7 @@
   .r-black { background: #232323; color: #fff; box-shadow: inset 0 0 0 1.5px #555; }
   .r-white { background: #FAFAF7; color: #1B1B1B; box-shadow: inset 0 0 0 1.5px #BFC5BD; }
   .r-miss  { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line); }
- 
+
   .keypad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .keypad button {
     border: 0; border-radius: var(--radius-s); min-height: 60px;
@@ -207,7 +207,7 @@
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
   .actions .send { grid-column: 1 / -1; min-height: 54px; font-size: 1.05rem; }
   .actions .btn { border-radius: var(--radius-s); }
- 
+
   dialog {
     border: 0; border-radius: var(--radius-l); padding: 22px 20px 16px; max-width: 360px;
     background: var(--surface); color: var(--ink);
@@ -217,7 +217,7 @@
   dialog p { margin: 0 0 18px; color: var(--muted); }
   dialog .row { display: flex; gap: 10px; justify-content: flex-end; }
   dialog .danger { background: var(--red); color: #fff; }
- 
+
   /* History */
   .toolbar { display: flex; gap: 10px; margin-bottom: 14px; }
   .toolbar .btn { flex: 1; border-radius: var(--radius-s); }
@@ -239,7 +239,7 @@
   .sessions .avg  { font-size: 1.35rem; font-weight: 780; font-variant-numeric: tabular-nums; grid-row: span 2; align-self: center; }
   .sessions .meta { color: var(--muted); font-size: .9rem; }
   .sessions .flag { color: var(--red); font-size: .85rem; grid-column: 1 / -1; }
- 
+
   /* Settings */
   .group { background: var(--surface); border-radius: var(--radius-l); padding: 4px 16px; margin-bottom: 14px; }
   .group h3 { margin: 14px 0 4px; font-size: 1.05rem; }
@@ -279,7 +279,7 @@
   .wizard .row { display: flex; gap: 10px; flex-wrap: wrap; }
   .wizard .errtext { color: var(--red); }
   .muted { color: var(--muted); }
- 
+
   @media (prefers-reduced-motion: reduce) {
     .switch span, .switch span::after { transition: none; }
     .keypad button:active { transform: none; }
@@ -288,12 +288,12 @@
 </style>
 </head>
 <body>
- 
+
 <header>
   <h1>UV-Sight</h1>
   <span class="conn" id="conn" data-s="off"><span class="dot"></span><span id="connText">Not connected</span></span>
 </header>
- 
+
 <main>
   <!-- Status -->
   <section class="view" id="view-status">
@@ -301,15 +301,15 @@
       This browser can't use Bluetooth. Open the app in Chrome on Android, loaded over https.
     </div>
     <div id="protoWarn" class="banner" hidden></div>
- 
+
     <div id="statusEmpty" class="empty">
       <p id="emptyText">Move the bow so the sight wakes up, then connect.</p>
       <button class="btn" id="btnConnect">Connect</button>
     </div>
- 
+
     <div id="statusBody" hidden>
       <div id="lowbat" class="banner" hidden>Battery empty. The LED is off until you charge.</div>
- 
+
       <div class="gauge" id="gauge" aria-label="Battery">
         <svg viewBox="0 0 120 120" aria-hidden="true">
           <circle class="face" cx="60" cy="60" r="52"/>
@@ -324,7 +324,7 @@
           <div class="gauge-sub" id="batSub">battery</div>
         </div>
       </div>
- 
+
       <ul class="readings">
         <li><span class="k">Session</span><span class="v" id="vSession">–</span></li>
         <li><span class="k">UV light</span><span class="v" id="vLed">–</span></li>
@@ -332,30 +332,30 @@
         <li><span class="k">Cant</span><span class="v" id="vTilt">–</span></li>
         <li><span class="k">Charging</span><span class="v" id="vCharge">–</span></li>
       </ul>
- 
+
       <div style="text-align:center; margin-top:18px">
         <button class="btn secondary" id="btnReconnect" hidden>Reconnect</button>
       </div>
       <p class="fw" id="fw"></p>
     </div>
   </section>
- 
+
   <!-- Training -->
   <section class="view" id="view-training" hidden>
     <div id="trainNotConnected" class="empty">
       <p>Connect to the sight on the Status tab first.</p>
     </div>
- 
+
     <div id="trainOff" class="empty" hidden>
       <p>The shot counter is off.</p>
       <button class="btn" id="btnCounterOn">Turn shot counter on</button>
     </div>
- 
+
     <div id="trainIdle" class="empty" hidden>
       <p>No session running. The first shot starts one automatically.</p>
       <button class="btn secondary" id="btnStart">Start session now</button>
     </div>
- 
+
     <div id="trainRun" hidden>
       <div class="card">
         <div class="training-head">
@@ -371,9 +371,9 @@
         <div class="last-end" id="tLast" hidden></div>
         <div class="last-end" id="tOffline" hidden>Not connected. Keep scoring: the app reconnects when you tap Save.</div>
       </div>
- 
+
       <div class="entry" id="entry" aria-live="polite"></div>
- 
+
       <div class="keypad" id="keypad">
         <button class="r-white" data-v="1">1</button>
         <button class="r-white" data-v="2">2</button>
@@ -389,7 +389,7 @@
         <button class="r-miss"  data-v="M" aria-label="Miss">M</button>
         <button class="undo" id="btnUndo">↶ Undo</button>
       </div>
- 
+
       <div class="actions">
         <button class="btn send" id="btnSend">Save end</button>
         <button class="btn secondary" id="btnSkip">Skip end</button>
@@ -397,7 +397,7 @@
       </div>
     </div>
   </section>
- 
+
   <!-- History -->
   <section class="view" id="view-history" hidden>
     <div class="toolbar">
@@ -414,7 +414,7 @@
       <p>No sessions on this phone yet. Finished sessions are stored here automatically while the app is connected, or fetched with the button above.</p>
     </div>
   </section>
- 
+
   <!-- Settings -->
   <section class="view" id="view-settings" hidden>
     <div class="empty" id="setNotConnected"><p>Connect to the sight on the Status tab to change settings.</p></div>
@@ -433,7 +433,7 @@
         <button class="btn secondary" id="btnDefaults">Restore defaults</button>
       </div>
     </div>
- 
+
     <div class="group" id="fwGroup">
       <h3>Firmware and app</h3>
       <div class="switchrow">
@@ -449,7 +449,7 @@
       <p class="gnote" id="versions"></p>
     </div>
   </section>
- 
+
   <dialog id="dlg">
     <h3 id="dlgTitle"></h3>
     <p id="dlgText"></p>
@@ -458,7 +458,7 @@
       <button class="btn" id="dlgYes"></button>
     </div>
   </dialog>
- 
+
   <!-- Console -->
   <section class="view" id="view-console" hidden>
     <div class="console" id="console" aria-live="polite"></div>
@@ -468,7 +468,7 @@
     </form>
   </section>
 </main>
- 
+
 <nav role="tablist">
   <button role="tab" aria-selected="true" data-view="status">Status</button>
   <button role="tab" aria-selected="false" data-view="training">Training</button>
@@ -476,12 +476,12 @@
   <button role="tab" aria-selected="false" data-view="settings">Settings</button>
   <button role="tab" aria-selected="false" data-view="console">Console</button>
 </nav>
- 
+
 <div class="toast" id="toast" role="status"></div>
- 
+
 <script>
 "use strict";
- 
+
 // ---------------------------------------------------------------------------
 // Protocol constants
 // ---------------------------------------------------------------------------
@@ -492,8 +492,8 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "1.5";
- 
+const APP_VERSION     = "1.6";
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -506,7 +506,7 @@ let rxBuffer = "";
 let writeQueue = Promise.resolve();
 let pollTimer = null;
 let activeView = "status";
- 
+
 // Training: scores of the open end, entered in the app, not yet sent
 const MAX_ARROWS = 40;
 let entries = [];          // "X", "10" ... "0"
@@ -517,7 +517,7 @@ let lastEnd = null;        // last closed end, for the summary line
 let reconnecting = false;  // Save/Skip/End is re-establishing the connection
 const TRAIN_KEY = "uvsight.training.v1";
 const RECONNECT_TIMEOUT_MS = 10000;
- 
+
 // Entries and the last known session survive app restarts and lost connections
 function saveTraining() {
   try { localStorage.setItem(TRAIN_KEY, JSON.stringify({ entries, session: state.session })); } catch {}
@@ -529,11 +529,11 @@ function loadTraining() {
     if (t && t.session && t.session.active) state.session = t.session;
   } catch {}
 }
- 
+
 const $ = (id) => document.getElementById(id);
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
- 
+
 // ---------------------------------------------------------------------------
 // Bluetooth
 // ---------------------------------------------------------------------------
@@ -551,7 +551,7 @@ async function connect() {
     setConn("off");
   }
 }
- 
+
 async function reconnect() {
   if (!device) return connect();
   try {
@@ -561,7 +561,7 @@ async function reconnect() {
     setConn("off");
   }
 }
- 
+
 async function openGatt() {
   setConn("connecting");
   const server = await device.gatt.connect();
@@ -575,7 +575,7 @@ async function openGatt() {
   send("app on");
   startPolling();
 }
- 
+
 function onDisconnected() {
   rxChar = txChar = null;
   cfgBuf = null; cfgRetries = 0; clearTimeout(cfgRetryTimer);
@@ -584,7 +584,7 @@ function onDisconnected() {
   stopPolling();
   setConn("off");
 }
- 
+
 function onData(ev) {
   rxBuffer += decoder.decode(ev.target.value, { stream: true });
   let nl;
@@ -594,7 +594,7 @@ function onData(ev) {
     if (line.length) handleLine(line);
   }
 }
- 
+
 // Writes are serialized; each command is split into small chunks
 function send(cmd) {
   logConsole("> " + cmd, "in");
@@ -609,13 +609,13 @@ function send(cmd) {
   }).catch((e) => logConsole("Send failed: " + e.message, "err"));
   return writeQueue;
 }
- 
+
 function bleError(e) {
   if (e.name === "SecurityError") return "Bluetooth needs https and a tap to start.";
   if (e.name === "NetworkError")  return "Connection failed. Move the bow and try again.";
   return e.message || String(e);
 }
- 
+
 // ---------------------------------------------------------------------------
 // Incoming lines
 // ---------------------------------------------------------------------------
@@ -624,7 +624,7 @@ function handleLine(line) {
   let m;
   try { m = JSON.parse(line); } catch { logConsole(line, "err"); return; }
   logConsole(line, m.t === "err" ? "err" : "");
- 
+
   switch (m.t) {
     case "hello":
       state.hello = m;
@@ -725,7 +725,7 @@ function handleLine(line) {
   if (m.t === "session" || m.t === "end" || m.t === "sessionEnd" || m.t === "shot") saveTraining();
   render();
 }
- 
+
 function checkProto() {
   const w = $("protoWarn");
   const p = state.hello && state.hello.proto;
@@ -737,7 +737,7 @@ function checkProto() {
     w.hidden = true;
   }
 }
- 
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -747,11 +747,11 @@ function setConn(s) {
   $("connText").textContent = { off: "Not connected", connecting: "Connecting", connected: "Connected" }[s];
   render();
 }
- 
+
 function chargeLabel(c) {
   return { charging: "Charging", full: "Charged, cable connected", "no USB": "On battery" }[c] || c;
 }
- 
+
 function render() {
   const hasData = !!state.status;
   $("statusEmpty").hidden = hasData;
@@ -766,9 +766,9 @@ function render() {
   renderTraining();
   renderSettings();
   if (!hasData) return;
- 
+
   const s = state.status;
- 
+
   // Battery gauge
   const pct = Math.max(0, Math.min(100, s.pct));
   const circ = 339.3;
@@ -777,7 +777,7 @@ function render() {
   $("pct").textContent = pct + "%";
   $("batSub").textContent = s.vbat.toFixed(2) + " V";
   $("lowbat").hidden = !s.lowbat;
- 
+
   // Session
   const ses = state.session;
   let sesText;
@@ -785,15 +785,16 @@ function render() {
   else if (!ses.active)      sesText = "No session";
   else sesText = `End ${ses.end}, ${ses.endShots} ${ses.endShots === 1 ? "shot" : "shots"}`;
   $("vSession").textContent = sesText;
- 
+
   // LED
-  const ledText = { on: "On", off: "Off", blinking: "Blinking" }[s.led] || s.led;
+  let ledText = { on: "On", off: "Off", blinking: "Blinking" }[s.led] || s.led;
+  if (s.led === "on" && typeof s.bright === "number") ledText += `, ${s.bright} %`;
   const modeText = s.mode !== "auto" ? ` <small>(test: ${s.mode})</small>` : "";
   $("vLed").innerHTML = ledText + modeText;
- 
+
   // Ambient light
   $("vLight").innerHTML = `${s.dark ? "Dark" : "Bright"} <small>${s.light}</small>`;
- 
+
   // Cant
   const lv = state.level;
   let tiltText;
@@ -803,13 +804,13 @@ function render() {
   else if (lv.mode === "auto")                 tiltText = "Waits for a session";
   else                                         tiltText = "Waiting for a reading";
   $("vTilt").textContent = tiltText;
- 
+
   $("vCharge").textContent = chargeLabel(s.chg);
- 
+
   const h = state.hello;
   $("fw").textContent = h ? `${h.name}, firmware ${h.fw}` : "";
 }
- 
+
 // ---------------------------------------------------------------------------
 // Training
 // ---------------------------------------------------------------------------
@@ -822,7 +823,7 @@ function ringClass(v) {
   return "r-miss";
 }
 const points = (v) => (v === "X" ? 10 : v === "M" ? 0 : Number(v));
- 
+
 function renderTraining() {
   const connected = state.conn === "connected";
   const ses = state.session;
@@ -830,14 +831,14 @@ function renderTraining() {
   const off  = connected && ses && !ses.counter;
   const idle = connected && ses && ses.counter && !ses.active;
   const run  = known || !connected;             // scoring works without a connection
- 
+
   $("trainNotConnected").hidden = true;
   $("trainOff").hidden  = !off;
   $("trainIdle").hidden = !idle;
   $("trainRun").hidden  = !run;
   $("tOffline").hidden  = connected;
   if (!run) return;
- 
+
   const dash = "–";
   $("tEnd").textContent     = known ? "End " + ses.end : "Scoring";
   $("tCounted").textContent = known ? ses.endShots : dash;
@@ -846,7 +847,7 @@ function renderTraining() {
   $("tArrows").textContent  = known ? ses.scored : dash;
   $("tAvg").textContent     = known ? Number(ses.avg).toFixed(2) : dash;
   $("tX").textContent       = known ? ses.x : dash;
- 
+
   const le = $("tLast");
   if (lastEnd) {
     le.hidden = false;
@@ -856,7 +857,7 @@ function renderTraining() {
   } else {
     le.hidden = true;
   }
- 
+
   // Entry row
   const box = $("entry");
   box.textContent = "";
@@ -877,7 +878,7 @@ function renderTraining() {
     sum.textContent = entries.reduce((a, v) => a + points(v), 0);
     box.appendChild(sum);
   }
- 
+
   const busy = awaitingEnd || reconnecting;
   $("btnSend").disabled = busy || !entries.length;
   $("btnSend").textContent = reconnecting ? "Connecting…" : awaitingEnd ? "Saving…" : `Save end (${entries.length})`;
@@ -888,7 +889,7 @@ function renderTraining() {
     b.disabled = busy || entries.length >= MAX_ARROWS;
   });
 }
- 
+
 function setAwaiting(on) {
   awaitingEnd = on;
   clearTimeout(awaitTimer);
@@ -900,14 +901,14 @@ function setAwaiting(on) {
     }, 6000);
   }
 }
- 
+
 function withTimeout(promise, ms) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("timeout")), ms);
     promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
   });
 }
- 
+
 // Reconnect if needed. Returns true when the sight is connected.
 let connectPromise = null;
 function ensureConnected() {
@@ -937,7 +938,7 @@ function ensureConnected() {
   })();
   return connectPromise;
 }
- 
+
 // Runs an action that needs the sight; reconnects first if necessary
 async function withConnection(action) {
   if (state.conn !== "connected") {
@@ -954,7 +955,7 @@ async function withConnection(action) {
   action();
   return true;
 }
- 
+
 function sendEnd() {
   if (!entries.length || awaitingEnd || reconnecting) return;
   withConnection(() => {
@@ -964,7 +965,7 @@ function sendEnd() {
     render();
   });
 }
- 
+
 function askMismatch(m) {
   confirmOpen = true;
   dialog({
@@ -981,7 +982,7 @@ function askMismatch(m) {
     render();
   });
 }
- 
+
 // Small promise-based dialog
 function dialog({ title, text, yes, no, danger }) {
   return new Promise((resolve) => {
@@ -998,7 +999,7 @@ function dialog({ title, text, yes, no, danger }) {
     d.showModal();
   });
 }
- 
+
 $("keypad").addEventListener("click", (e) => {
   const b = e.target.closest("[data-v]");
   if (!b || b.disabled) return;
@@ -1010,7 +1011,7 @@ $("keypad").addEventListener("click", (e) => {
 });
 $("btnUndo").addEventListener("click", () => { entries.pop(); saveTraining(); render(); });
 $("btnSend").addEventListener("click", sendEnd);
- 
+
 $("btnSkip").addEventListener("click", async () => {
   const n = state.session ? state.session.endShots : 0;
   const ok = await dialog({
@@ -1027,7 +1028,7 @@ $("btnSkip").addEventListener("click", async () => {
     render();
   });
 });
- 
+
 $("btnStop").addEventListener("click", async () => {
   const s = state.session || {};
   let text = "The session is saved to the sight's log.";
@@ -1036,10 +1037,10 @@ $("btnStop").addEventListener("click", async () => {
   const ok = await dialog({ title: "End session?", text, yes: "End session", no: "Cancel", danger: true });
   if (ok) withConnection(() => send("shots stop"));
 });
- 
+
 $("btnCounterOn").addEventListener("click", () => send("shots on"));
 $("btnStart").addEventListener("click", () => send("shots start"));
- 
+
 // ---------------------------------------------------------------------------
 // Status polling (only while the status view is visible)
 // ---------------------------------------------------------------------------
@@ -1053,7 +1054,7 @@ function startPolling() {
   }, STATUS_POLL_MS);
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
- 
+
 // ---------------------------------------------------------------------------
 // History: archive on this phone (localStorage)
 // ---------------------------------------------------------------------------
@@ -1061,7 +1062,7 @@ const ARCHIVE_KEY = "uvsight.archive.v1";
 const STARTS_KEY  = "uvsight.starts.v1";     // log key -> start time of sessions seen running
 const DELETED_KEY = "uvsight.deleted.v1";    // log keys removed by hand, never re-imported
 const DELETED_MAX = 1000;
- 
+
 function loadDeleted() {
   try { return new Set(JSON.parse(localStorage.getItem(DELETED_KEY)) || []); } catch { return new Set(); }
 }
@@ -1070,11 +1071,11 @@ function markDeleted(key) {
   try { localStorage.setItem(DELETED_KEY, JSON.stringify(list)); } catch {}
 }
 const STARTS_KEEP_MS = 90 * 24 * 3600 * 1000;
- 
+
 function loadStarts() {
   try { return JSON.parse(localStorage.getItem(STARTS_KEY)) || {}; } catch { return {}; }
 }
- 
+
 // A running session reports the key it will get in the log (epoch + nextId).
 // Its start time is remembered, so the date is known even if the sight
 // restarts before the session is fetched.
@@ -1088,7 +1089,7 @@ function rememberStart(m) {
   for (const k of Object.keys(starts)) if (starts[k] < cutoff) delete starts[k];
   try { localStorage.setItem(STARTS_KEY, JSON.stringify(starts)); } catch {}
 }
- 
+
 // Fill missing dates from remembered start times; returns true if something changed
 function resolveDates(a) {
   const starts = loadStarts();
@@ -1102,7 +1103,7 @@ function resolveDates(a) {
   return changed;
 }
 let syncEpoch = null, syncCount = 0;
- 
+
 function loadArchive() {
   try { return JSON.parse(localStorage.getItem(ARCHIVE_KEY)) || []; } catch { return []; }
 }
@@ -1110,7 +1111,7 @@ function saveArchive(a) {
   try { localStorage.setItem(ARCHIVE_KEY, JSON.stringify(a)); }
   catch { toast("Could not store on this phone (storage full?)", true); }
 }
- 
+
 // Returns true if the session was new
 function archiveSlot(epoch, sl) {
   const a = loadArchive();
@@ -1135,12 +1136,12 @@ function archiveSlot(epoch, sl) {
   renderHistory();
   return true;
 }
- 
+
 const sortTime = (r) => r.endedAt ?? r.importedAt;
 function sortedArchive() {
   return loadArchive().sort((x, y) => sortTime(y) - sortTime(x) || y.id - x.id);
 }
- 
+
 function fmtStamp(ms) {
   const d = new Date(ms);
   return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }) + ", " +
@@ -1150,7 +1151,7 @@ function fmtDate(r) {
   if (r.endedAt === null) return "Before " + fmtStamp(r.importedAt);   // fetched then, so it was earlier
   return fmtStamp(r.endedAt - r.min * 60000);                          // start of the session
 }
- 
+
 function renderHistory() {
   const all = loadArchive();
   if (resolveDates(all)) saveArchive(all);
@@ -1159,7 +1160,7 @@ function renderHistory() {
   ul.textContent = "";
   $("historyEmpty").hidden = list.length > 0;
   $("btnExport").disabled = list.length === 0;
- 
+
   for (const r of list) {
     const li = document.createElement("li");
     const b = document.createElement("button");
@@ -1183,7 +1184,7 @@ function renderHistory() {
   }
   renderChart(list);
 }
- 
+
 function renderChart(list) {
   const pts = list.filter((r) => r.scored > 0).slice(0, 20).reverse();
   const enough = pts.length >= 2;
@@ -1207,7 +1208,7 @@ function renderChart(list) {
   svg += `<text x="${L}" y="${H - 3}">older</text><text x="${W - R}" y="${H - 3}" text-anchor="end">newest</text>`;
   $("chartSvg").innerHTML = svg;
 }
- 
+
 async function showSession(r) {
   const lines = [
     `${r.ends} ends, ${r.shots} shots counted, ${r.scored} arrows scored.`,
@@ -1223,7 +1224,7 @@ async function showSession(r) {
   renderHistory();
   toast("Removed from this phone. It won't come back when you fetch sessions again.");
 }
- 
+
 function exportCsv() {
   const list = sortedArchive();
   const head = "start,start_known,fetched,ends,shots,scored,average,x,minutes,invalid_ends,invalid_arrows,corrected,ended_by_hand";
@@ -1241,20 +1242,20 @@ function exportCsv() {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
- 
+
 $("btnSync").addEventListener("click", () => {
   if (state.conn !== "connected") { toast("Connect to the sight first.", true); return; }
   send("log");
 });
 $("btnExport").addEventListener("click", exportCsv);
- 
+
 // ---------------------------------------------------------------------------
 // Settings and calibration
 // ---------------------------------------------------------------------------
 let cfgDirty = false, expectDefaults = false;
 let cfgBuf = null, cfgRetries = 0, cfgRetryTimer = null;
 const CFG_MAX_RETRIES = 3;
- 
+
 // Ask for the settings; if they don't arrive complete within 3 s, ask again
 function requestCfg() {
   clearTimeout(cfgRetryTimer);
@@ -1266,21 +1267,22 @@ function requestCfg() {
 }
 let calStep = 0;          // 0 off, 1 = step 1, 2 = step 2, 3 = done
 let calBusy = false, calError = "";
- 
+
 const GROUPS = [
   { title: "Light sensor", keys: ["dark_on", "dark_off", "confirm"], light: true },
-  { title: "UV light",     keys: ["ma", "tilt_ma", "vf"] },
-  { title: "Cant",         keys: ["level_tol"], cal: true },
+  { title: "UV light",     keys: ["bright_mode", "bright", "bright_min", "vf"] },
+  { title: "Cant",         keys: ["level_tol", "tilt_offset"], cal: true },
   { title: "Shot detection", keys: ["tap_ths", "lockout"] },
   { title: "Battery",      keys: ["cutoff"] },
   { title: "Power and Bluetooth", keys: ["ths", "timeout", "report", "tx_power"] },
 ];
 const DESCS = {
-  dark_on: "The light turns on below this reading.",
-  dark_off: "The light turns off above this reading. Keep it higher than Dark below.",
+  dark_on: "Fixed: the light turns on below this reading. Auto: full brightness from here down.",
+  dark_off: "Fixed: the light turns off above this reading. Auto: the light starts dimly here. Keep it higher than Dark below.",
   confirm: "Readings in a row (one every 2 s) before switching. Higher is calmer, lower reacts faster.",
-  ma: "More is brighter but drains the battery faster.",
-  tilt_ma: "Brightness of the cant blinking.",
+  bright: "Fixed: brightness of the light. Auto: brightness at Dark below and darker. More drains the battery faster.",
+  bright_min: "Auto: brightness at Bright above, where the light starts. It rises to Brightness as it gets darker.",
+  tilt_offset: "The cant blinking is this many points darker than Brightness. 0 = equally bright.",
   vf: "Only change this if you swap the LED.",
   level_tol: "A cant up to this angle counts as level.",
   tap_ths: "Lower counts softer impacts. Raise it if carrying the bow counts as a shot.",
@@ -1293,12 +1295,12 @@ const DESCS = {
 };
 const LABELS = {
   dark_on: "Dark below", dark_off: "Bright above", confirm: "Readings before switching",
-  ma: "Brightness", tilt_ma: "Cant blink brightness", vf: "LED forward voltage",
+  bright: "Brightness", bright_min: "Start brightness", tilt_offset: "Blink dimming", vf: "LED forward voltage",
   level_tol: "Tolerance", tap_ths: "Shot threshold", lockout: "Pause after a shot",
   cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Status report every",
   tx_power: "Radio power",
 };
- 
+
 function shownValue(it, v) {
   v = Number(v);
   if (it.k === "tap_ths") return (v * 0.25).toFixed(2) + " g";
@@ -1307,12 +1309,12 @@ function shownValue(it, v) {
   const u = it.unit === "deg" ? "°" : (it.unit ? " " + it.unit : "");
   return v.toFixed(it.dec) + u;
 }
- 
+
 function sendSet(k, v) {
   if (confirmOpen || awaitingEnd) { toast("Finish the open end first.", true); return; }
   send(`set ${k} ${v}`);
 }
- 
+
 function settingRow(it) {
   const div = document.createElement("div");
   div.className = "setting";
@@ -1336,7 +1338,7 @@ function settingRow(it) {
   num.value = off ? it.min : it.v;
   rng.disabled = num.disabled = off;
   if (chk) chk.checked = off;
- 
+
   const clamp = (v) => Math.min(it.max, Math.max(it.min, v));
   rng.addEventListener("input", () => { num.value = rng.value; val.textContent = shownValue(it, rng.value); });
   rng.addEventListener("change", () => sendSet(it.k, rng.value));
@@ -1349,7 +1351,7 @@ function settingRow(it) {
   if (chk) chk.addEventListener("change", () => sendSet(it.k, chk.checked ? 0 : it.def));
   return div;
 }
- 
+
 // Row with a segmented control, e.g. Off / Auto / On
 function segRow(label, desc, current, modes, onPick) {
   const row = document.createElement("div");
@@ -1368,7 +1370,7 @@ function segRow(label, desc, current, modes, onPick) {
   }
   return row;
 }
- 
+
 function switchRow(label, desc, checked, onChange) {
   const row = document.createElement("div");
   row.className = "switchrow";
@@ -1382,7 +1384,7 @@ function switchRow(label, desc, checked, onChange) {
   cb.addEventListener("change", () => onChange(cb.checked, cb));
   return row;
 }
- 
+
 function renderSettings() {
   const connected = state.conn === "connected";
   const gaveUp = cfgRetries >= CFG_MAX_RETRIES && !state.cfg;
@@ -1403,7 +1405,7 @@ function renderSettings() {
     updateLiveBits();
     return;
   }
- 
+
   // Switches
   const sw = $("setSwitches");
   sw.textContent = "";
@@ -1417,14 +1419,21 @@ function renderSettings() {
     lvMode === "auto" ? "Blinks only during a session."
     : lvMode === "on" ? "Blinks whenever the bow is in use."
     : "No blinking.", lvMode, ["off", "auto", "on"], (m) => send("level " + m)));
+  if (lvMode !== "off") {
+    const st = lv.style || "normal";
+    sw.appendChild(segRow("Cant blinking",
+      st === "inverted" ? "Faster the closer you get to level." : "Faster the more the bow is canted.",
+      st, ["normal", "inverted"], (m) => send("level style " + m)));
+  }
   sw.appendChild(segRow("LED test", "Back to Auto on restart.",
     (state.status && state.status.mode) || "auto", ["off", "auto", "on"], (m) => send("mode " + m)));
- 
+
   // Groups
   const host = $("setGroups");
   host.textContent = "";
   const used = new Set();
   const byKey = Object.fromEntries(state.cfg.items.map((it) => [it.k, it]));
+  const autoMode = byKey.bright_mode && Number(byKey.bright_mode.v) === 1;
   const addGroup = (g, items) => {
     const box = document.createElement("div");
     box.className = "group";
@@ -1433,7 +1442,17 @@ function renderSettings() {
       const n = document.createElement("p"); n.className = "gnote"; n.id = "liveLight"; box.appendChild(n);
     }
     if (g.cal) box.appendChild(calCard());
-    items.forEach((it) => box.appendChild(settingRow(it)));
+    items.forEach((it) => {
+      if (it.k === "bright_mode") {
+        box.appendChild(segRow("Brightness mode",
+          autoMode ? "Auto: fades in from Bright above and reaches full brightness at Dark below."
+                   : "Fixed: one brightness, switched at Dark below / Bright above.",
+          autoMode ? "auto" : "fixed", ["fixed", "auto"], (m) => sendSet("bright_mode", m === "auto" ? 1 : 0)));
+        return;
+      }
+      if (it.k === "bright_min" && !autoMode) return;
+      box.appendChild(settingRow(it));
+    });
     host.appendChild(box);
   };
   for (const g of GROUPS) {
@@ -1445,14 +1464,14 @@ function renderSettings() {
   if (rest.length) addGroup({ title: "Other" }, rest);
   updateLiveBits();
 }
- 
+
 function updateLiveBits() {
   const el = $("liveLight");
   if (el && state.status) {
     el.textContent = `Current reading: ${state.status.light} (${state.status.dark ? "dark" : "bright"}). Lower means darker.`;
   }
 }
- 
+
 function calCard() {
   const box = document.createElement("div");
   const lv = state.level || {};
@@ -1490,7 +1509,7 @@ function calCard() {
   }
   return box;
 }
- 
+
 function onCal(m) {
   if (m.state === "countdown") { calBusy = true; return; }
   calBusy = false;
@@ -1499,9 +1518,9 @@ function onCal(m) {
   if (m.step === 1) calStep = 2;
   if (m.step === 2) calStep = 3;
 }
- 
+
 $("btnSave").addEventListener("click", () => send("save"));
- 
+
 $("btnDfu").addEventListener("click", async () => {
   const ok = await dialog({
     title: "Start update mode?",
@@ -1511,7 +1530,7 @@ $("btnDfu").addEventListener("click", async () => {
   });
   if (ok) send("dfu");
 });
- 
+
 // Install prompt (Chrome offers it once the app is installable)
 let installEvent = null;
 window.addEventListener("beforeinstallprompt", (e) => {
@@ -1538,7 +1557,7 @@ $("btnDefaults").addEventListener("click", async () => {
   expectDefaults = true;
   send("defaults");
 });
- 
+
 // ---------------------------------------------------------------------------
 // Console
 // ---------------------------------------------------------------------------
@@ -1552,7 +1571,7 @@ function logConsole(text, cls) {
   while (el.childNodes.length > CONSOLE_MAX) el.removeChild(el.firstChild);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
- 
+
 $("cmdForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const cmd = $("cmdInput").value.trim();
@@ -1561,7 +1580,7 @@ $("cmdForm").addEventListener("submit", (e) => {
   send(cmd);
   $("cmdInput").value = "";
 });
- 
+
 // ---------------------------------------------------------------------------
 // Tabs, toast, start
 // ---------------------------------------------------------------------------
@@ -1583,7 +1602,7 @@ document.querySelectorAll("nav button").forEach((b) => {
     render();
   });
 });
- 
+
 let toastTimer = null;
 function toast(text, isErr) {
   const t = $("toast");
@@ -1593,10 +1612,10 @@ function toast(text, isErr) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove("show"), 3500);
 }
- 
+
 $("btnConnect").addEventListener("click", connect);
 $("btnReconnect").addEventListener("click", reconnect);
- 
+
 if (!navigator.bluetooth) {
   $("unsupported").hidden = false;
   $("btnConnect").disabled = true;
@@ -1604,11 +1623,10 @@ if (!navigator.bluetooth) {
 loadTraining();
 render();
 renderHistory();
- 
+
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch((e) => logConsole("Offline mode unavailable: " + e.message, "err"));
 }
 </script>
 </body>
 </html>
- 

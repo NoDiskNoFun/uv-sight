@@ -29,6 +29,10 @@
     is only enabled while the shot counter is on and the bow is active.
     After a shot there is a lockout ("lockout", default 1.5 s): further
     impacts are ignored (vibration) and the tilt indicator pauses.
+  - Shot strength: in shot mode the IMU fills its FIFO at 416 Hz (+-16 g).
+    After a shot the peak of the total acceleration is read from it and
+    reported in g. It is a comparison value for setting tap_ths, not an
+    exact physical peak (416 Hz sampling misses the sharpest part).
   - A training session starts with the first shot or with "shots start".
   - A session ends after "session_end" minutes (default 60) without a
     detected shot, or with "shots stop".
@@ -163,7 +167,7 @@ const uint8_t  SLOT_COUNT      = 32;
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "1.9";
+const char*    FW_VERSION        = "2.0";
 const uint8_t  PROTO_VERSION     = 4;
 
 // Bluetooth
@@ -186,7 +190,7 @@ struct Config {
   uint16_t darkOff;      // LDR value: above = bright again
   uint8_t  darkConfirm;  // consecutive readings needed to switch
   uint8_t  wakeThs;      // motion threshold, 1 LSB = 125 mg (1..63)
-  uint8_t  tapThs;       // shot threshold,   1 LSB = 250 mg (1..31)
+  uint8_t  tapThs;       // shot threshold,   1 LSB = 250 mg (1..62)
   float    targetMa;     // legacy (firmware < 1.8), only read for migration
   float    vf;           // forward voltage of the UV LED
   float    cutoff;       // battery cutoff voltage
@@ -275,7 +279,7 @@ const SettingDef SETTINGS[] = {
   {"vf",        S_F,   offsetof(Config, vf),          2.5,  3.6,  2, false, "V",      "LED forward voltage"},
   {"cutoff",    S_F,   offsetof(Config, cutoff),      3.0,  3.7,  2, false, "V",      "battery cutoff"},
   {"level_tol", S_F,   offsetof(Config, levelTol),    0.2,  10,   1, false, "deg",    "tilt tolerance"},
-  {"tap_ths",   S_U8,  offsetof(Config, tapThs),      1,    31,   0, false, "x250mg", "shot threshold"},
+  {"tap_ths",   S_U8,  offsetof(Config, tapThs),      1,    62,   0, false, "x250mg", "shot threshold (applied in 0.5 g steps)"},
   {"ths",       S_U8,  offsetof(Config, wakeThs),     1,    63,   0, false, "x125mg", "motion threshold"},
   {"lockout",   S_U32, offsetof(Config, lockoutMs),   200,  5000, 0, false, "ms",     "after a shot: no counting, no tilt"},
   {"timeout",   S_U32, offsetof(Config, timeoutS),    10,   3600, 0, false, "s",      "without movement until idle"},
@@ -392,8 +396,19 @@ uint8_t  pendingX          = 0;
 #define REG_MD1_CFG     0x5E
 
 // CTRL1_XL: ODR | full scale +-8 g (0x0C)
-#define XL_26HZ_8G      0x2C
-#define XL_416HZ_8G     0x6C
+#define REG_FIFO_CTRL3  0x08
+#define REG_FIFO_CTRL5  0x0A
+#define REG_FIFO_STAT1  0x3A
+#define REG_FIFO_DATA   0x3E
+
+#define XL_26HZ_8G      0x2C    // idle: 26 Hz, +-8 g, low power
+#define XL_416HZ_16G    0x64    // shot mode: 416 Hz, +-16 g
+#define FIFO_XL_ONLY    0x01    // FIFO_CTRL3: accelerometer, no decimation
+#define FIFO_416_CONT   0x36    // FIFO_CTRL5: 416 Hz, continuous mode
+#define FIFO_BYPASS     0x00
+#define G_PER_LSB_16G   0.000488f
+#define FIFO_KEEP_WORDS 360     // restart the FIFO beyond ~0.3 s of data
+#define FIFO_READ_MAX   1500    // never read more words than this after a shot
 // TAP_CFG: interrupts on (0x80), HP filter (0x10), latched (0x01), tap XYZ (0x0E)
 #define TAP_CFG_MOTION  0x91
 #define TAP_CFG_SHOTS   0x9F
@@ -433,6 +448,8 @@ uint32_t lastMotionMs      = 0;
 uint32_t lastSensorMs      = 0;
 uint32_t lastReportMs      = 0;
 uint32_t ignoreMotionUntil = 0;
+float    lastShotG         = -1;      // peak of the last counted shot in g (-1 = none yet)
+bool     lastShotClip      = false;   // the peak hit the +-16 g limit
 volatile bool     tapFlag  = false;   // set by the INT1 interrupt
 volatile uint32_t tapMs    = 0;       // time of the first tap since the last check
 String   rxBuf;
@@ -671,8 +688,60 @@ bool levelSave() {
 // ============================================================================
 // IMU
 // ============================================================================
-void imuSetThs(uint8_t ths)    { if (imuOk) imu.writeRegister(REG_WAKE_UP_THS, ths & 0x3F); }
-void imuSetTapThs(uint8_t ths) { if (imuOk) imu.writeRegister(REG_TAP_THS_6D,  ths & 0x1F); }
+// Write the thresholds for the current range. Settings stay in their units:
+// ths in 125 mg, tap_ths in 250 mg. In shot mode (+-16 g) one register step
+// is twice as large, so the values are halved (rounded up).
+void applyImuThresholds() {
+  if (!imuOk) return;
+  uint8_t wake = imuFast ? (uint8_t)((cfg.wakeThs + 1) / 2) : cfg.wakeThs;
+  uint8_t tap  = (uint8_t)((cfg.tapThs + 1) / 2);   // tap only runs in shot mode
+  if (wake < 1) wake = 1;
+  if (tap  < 1) tap  = 1;
+  if (tap  > 31) tap = 31;
+  imu.writeRegister(REG_WAKE_UP_THS, wake & 0x3F);   // bit7=0: single tap only
+  imu.writeRegister(REG_TAP_THS_6D,  tap  & 0x1F);
+}
+
+void fifoRestart() {
+  imu.writeRegister(REG_FIFO_CTRL5, FIFO_BYPASS);    // clears the FIFO
+  imu.writeRegister(REG_FIFO_CTRL5, FIFO_416_CONT);
+}
+
+uint16_t fifoWords() {
+  uint8_t b[2] = {0, 0};
+  if (imu.readRegisterRegion(b, REG_FIFO_STAT1, 2) != IMU_SUCCESS) return 0;
+  return b[0] | ((b[1] & 0x07) << 8);
+}
+
+// Peak of the total acceleration in the FIFO, in g. Restarts the FIFO.
+float readShotPeakG(bool* clipped) {
+  *clipped = false;
+  uint8_t st[4] = {0, 0, 0, 0};
+  if (imu.readRegisterRegion(st, REG_FIFO_STAT1, 4) != IMU_SUCCESS) return -1;
+  uint16_t n   = st[0] | ((st[1] & 0x07) << 8);
+  uint16_t pat = (st[2] | ((st[3] & 0x03) << 8)) % 3;   // axis of the next word: 0 x, 1 y, 2 z
+  if (n > FIFO_READ_MAX) n = FIFO_READ_MAX;
+
+  int16_t v[3] = {0, 0, 0};
+  uint8_t have = 0;
+  float peak2 = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    uint8_t b[2];
+    if (imu.readRegisterRegion(b, REG_FIFO_DATA, 2) != IMU_SUCCESS) break;
+    const int16_t w = (int16_t)(b[0] | (b[1] << 8));
+    if (w == 32767 || w == -32768) *clipped = true;
+    v[pat] = w;
+    have |= (1 << pat);
+    if (pat == 2 && have == 0x07) {
+      const float x = v[0], y = v[1], z = v[2];
+      const float m2 = x * x + y * y + z * z;
+      if (m2 > peak2) peak2 = m2;
+    }
+    pat = (pat + 1) % 3;
+  }
+  fifoRestart();
+  return sqrtf(peak2) * G_PER_LSB_16G;
+}
 
 bool imuInit() {
 #ifdef PIN_LSM6DS3TR_C_POWER
@@ -689,9 +758,9 @@ bool imuInit() {
   imu.writeRegister(REG_CTRL1_XL,    XL_26HZ_8G);         // 26 Hz, +-8 g
   imu.writeRegister(REG_CTRL6_C,     0x10);               // low-power mode
   imu.writeRegister(REG_WAKE_UP_DUR, 0x00);
-  imu.writeRegister(REG_WAKE_UP_THS, cfg.wakeThs & 0x3F); // bit7=0: single tap only
-  imu.writeRegister(REG_TAP_THS_6D,  cfg.tapThs & 0x1F);
   imu.writeRegister(REG_INT_DUR2,    0x07);               // max shock window, short quiet
+  imu.writeRegister(REG_FIFO_CTRL3,  FIFO_XL_ONLY);       // FIFO only used in shot mode
+  imu.writeRegister(REG_FIFO_CTRL5,  FIFO_BYPASS);
   imu.writeRegister(REG_TAP_CFG,     TAP_CFG_MOTION);     // tap off for now
   imu.writeRegister(REG_MD1_CFG,     0x40);               // only single tap on INT1 (motion is polled)
 
@@ -699,6 +768,8 @@ bool imuInit() {
   imu.readRegister(&dummy, REG_WAKE_UP_SRC);
   imu.readRegister(&dummy, REG_TAP_SRC);
   imuFast = false;
+  imuOk = true;                   // needed by applyImuThresholds()
+  applyImuThresholds();
   return true;
 }
 
@@ -718,14 +789,17 @@ void imuSetFast(bool fast) {
 
   if (fast) {
     imu.writeRegister(REG_CTRL6_C,  0x00);                // high performance
-    imu.writeRegister(REG_CTRL1_XL, XL_416HZ_8G);
+    imu.writeRegister(REG_CTRL1_XL, XL_416HZ_16G);
     imu.writeRegister(REG_TAP_CFG,  TAP_CFG_SHOTS);
   } else {
+    imu.writeRegister(REG_FIFO_CTRL5, FIFO_BYPASS);
     imu.writeRegister(REG_TAP_CFG,  TAP_CFG_MOTION);
     imu.writeRegister(REG_CTRL1_XL, XL_26HZ_8G);
     imu.writeRegister(REG_CTRL6_C,  0x10);
   }
   imuFast = fast;
+  applyImuThresholds();
+  if (fast) fifoRestart();
 
   // Let the filters settle, discard false triggers
   const uint32_t now = millis();
@@ -1167,11 +1241,22 @@ void startSession(uint32_t now) {
   pendingScore = false;
 }
 
-void registerShot(uint32_t now) {
-  if (!shotLog.shotsOn) return;
+// True if an impact at this time would be counted (outside the lockout)
+bool shotAllowed(uint32_t now) {
   // Signed compare: an interrupt timestamp can be slightly older than lastShotMs
-  if ((int32_t)(now - lastShotMs) < (int32_t)cfg.lockoutMs) return;  // ignore vibration
-  lastShotMs = now;
+  return shotLog.shotsOn && (int32_t)(now - lastShotMs) >= (int32_t)cfg.lockoutMs;
+}
+
+String shotGText() {
+  if (lastShotG < 0) return "";
+  return lastShotClip ? String(">= 16 g") : String(lastShotG, 1) + " g";
+}
+
+void registerShot(uint32_t now, float g, bool clipped) {
+  if (!shotAllowed(now)) return;   // ignore vibration
+  lastShotMs   = now;
+  lastShotG    = g;
+  lastShotClip = clipped;
   if (!sessionActive) {
     startSession(now);
     say("Session started automatically.", sessionJson());
@@ -1179,9 +1264,11 @@ void registerShot(uint32_t now) {
   shotCount++;
   endShots++;
   sessionLastShotMs = now;
-  say("Shot detected (end " + String(endCount + 1) + ": " + String(endShots) + ")",
+  say("Shot detected (end " + String(endCount + 1) + ": " + String(endShots) + ")" +
+      (g >= 0 ? ", " + shotGText() : String("")),
       "{\"t\":\"shot\",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
-      ",\"total\":" + String(shotCount) + "}");
+      ",\"total\":" + String(shotCount) +
+      ",\"g\":" + (g >= 0 ? String(g, 1) : String("null")) + ",\"clip\":" + jbool(clipped) + "}");
 }
 
 // Close an end with scores
@@ -1433,6 +1520,7 @@ String statusLine() {
   if (ledMode == MODE_OFF) s += " | Mode=off";
   if (lowBatLock)          s += " | BATTERY EMPTY";
   if (sessionActive)       s += " | End " + String(endCount + 1) + ": " + String(endShots) + " shots";
+  if (lastShotG >= 0)      s += " | Last shot " + shotGText();
   return s;
 }
 
@@ -1446,7 +1534,9 @@ String statusJson() {
              ",\"mode\":\"" + mode + "\"" +
              ",\"lowbat\":" + jbool(lowBatLock) +
              ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) +
-             ",\"session\":" + jbool(sessionActive);
+             ",\"session\":" + jbool(sessionActive) +
+             ",\"lastShotG\":" + (lastShotG >= 0 ? String(lastShotG, 1) : String("null")) +
+             ",\"lastShotClip\":" + jbool(lastShotClip);
   if (sessionActive) j += ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots);
   return j + "}";
 }
@@ -1525,8 +1615,7 @@ void handleSet(const String& args) {
   }
 
   setSetting(cfg, *d, v);
-  imuSetThs(cfg.wakeThs);        // apply IMU thresholds right away
-  imuSetTapThs(cfg.tapThs);
+  applyImuThresholds();          // apply IMU thresholds right away
   if (key == "tx_power") applyTxPower();
 
   const String shown = fmtSetting(*d, getSetting(cfg, *d));
@@ -1591,8 +1680,7 @@ void handleCommand(String line) {
   }
   else if (line == "defaults") {
     cfg = DEFAULTS;
-    imuSetThs(cfg.wakeThs);
-    imuSetTapThs(cfg.tapThs);
+    applyImuThresholds();
     applyTxPower();
     if (appMode) sendCfg();
     else         out("Default values loaded (permanent with 'save').");
@@ -1818,7 +1906,13 @@ void loop() {
   if (imuTapSinceLastCheck()) shot = true;   // also re-arms INT1
   if (shot) {
     lastMotionMs = now;
-    registerShot(shotAt);
+    if (shotAllowed(shotAt)) {
+      bool clip = false;
+      const float g = readShotPeakG(&clip);   // strength from the FIFO
+      registerShot(shotAt, g, clip);
+    }
+  } else if (imuFast && fifoWords() > FIFO_KEEP_WORDS) {
+    fifoRestart();                            // keep only the recent data
   }
 
   const bool active = (now - lastMotionMs) < cfg.timeoutS * 1000UL;

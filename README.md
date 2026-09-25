@@ -14,9 +14,9 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, browser tests of the app with simulated data. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 1.5, protocol 4, app 1.1 |
+> | Firmware / protocol / app | Firmware 1.6, protocol 4, app 1.2 |
 >
-> Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. **LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.**
+> Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
 ---
 
@@ -316,7 +316,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
 | `dfu` | Reboot into update mode (USB needed) | – |
 
-Anyone within radio range (about 10 m) can connect; there is no PIN.
+Range is about 10 m at the default `tx_power` of 0 dBm; +8 dBm roughly doubles it. A cheap USB adapter without antenna, a metal PC case or a nearby USB 3 port can reduce the range a lot. Anyone within range can connect; there is no PIN.
 
 ---
 
@@ -339,6 +339,7 @@ Change with `set <name> <value>`, keep with `save`. Out-of-range values are reje
 | `lockout` | After a shot: no counting, cant indicator paused | ms | 1500 | 200 | 5000 |
 | `timeout` | Time without movement until idle | s | 300 | 10 | 3600 |
 | `report` | Automatic status while connected, 0 = off | s | 10 | 0 or 2 | 600 |
+| `tx_power` | Bluetooth transmit power, rounded to −20, −16, −12, −8, −4, 0, 2…8 | dBm | 0 | −20 | 8 |
 
 **Calibrating the light thresholds:** at dusk send `live on`, watch the `Light=` value, set `dark_on` where the fibre no longer glows by itself and `dark_off` about 300 higher. Then `live off` and `save`.
 
@@ -364,7 +365,6 @@ These are set at the top of the sketch and need a rebuild.
 | `CAL_COUNTDOWN_MS` | 3000 ms | Wait before a calibration measurement |
 | `SENSOR_INTERVAL_MS` | 2000 ms | Light and battery reading interval |
 | `ACTIVE_POLL_MS` / `LEVEL_LOOP_MS` / `IDLE_POLL_MS` | 250 / 30 / 500 ms | Loop interval active / with cant indicator / idle |
-| `BLE_TX_POWER` | 0 dBm | Radio power (about 10 m) |
 | `ADV_FAST_INTERVAL` / `ADV_SLOW_INTERVAL` | 100 ms / ~1 s | Advertising for the first 10 s / afterwards |
 | `CONN_INT_MIN` / `CONN_INT_MAX` | 200 / 400 ms | Requested connection interval |
 | `BLE_NAME` | `UV-Sight` | Bluetooth name |
@@ -453,6 +453,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | Problem | Cause and fix |
 |---|---|
 | App or terminal does not find `UV-Sight` | The board is idle. Move the bow, then search within 10 s. |
+| PC finds the sight only briefly or not at all | Weak adapter: use a USB extension cable, avoid USB 3 ports, or raise `tx_power`. On Linux connect directly with `ble-serial -d <MAC> -t 15`; pairing is not needed. |
 | Connection drops | After `timeout` without movement the board disconnects on purpose. Move the bow or raise `timeout`. |
 | Settings tab says "Loading settings…" for long | Lines got lost. The app retries three times; move closer and tap *Try again*. |
 | Protocol warning in the app | Firmware and app versions do not match. Update both. |

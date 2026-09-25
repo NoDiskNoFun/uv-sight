@@ -10,15 +10,13 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > |---|---|
 > | Model | Claude Opus 5.5 (Anthropic) |
 > | Interface | claude.ai, chat with code execution and web search |
-> | Period | September 2026, finished on 25 September 2026 |
-> | Language of the conversation | German; code, app and README in English |
-> | Token usage | Not available. The assistant has no access to token counts or cost data of the conversation. |
+> | Period | 23 September 2026, finished on 25 September 2026 |
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, browser tests of the app with simulated data. The AI never ran the code on real hardware. |
 > | Firmware / protocol / app | Firmware 1.5, protocol 4, app 1.1 |
 >
-> Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
+> Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. **LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.**
 
 ---
 
@@ -392,8 +390,9 @@ The main file must be named exactly `index.html`.
 
 ### Hosting and installing
 
-Web Bluetooth only works in **Chrome on Android** and only on pages loaded via **https** or **localhost**. Opening the file directly from storage does not work.
+Web Bluetooth only works in **Chrome** and only on pages loaded via **https** or **localhost**. Opening the file directly from storage does not work.
 
+- **Online Version**: [https://nodisknofun.github.io/uv-sight/](https://nodisknofun.github.io/uv-sight/)
 - **Local server on the phone:** serve the folder with a local web server app and open `http://localhost:8080/`.
 - **GitHub Pages:** create a repository, upload the six files, enable *Settings → Pages* for the `main` branch. The app is then at `https://<user>.github.io/<repo>/`.
 - **Own server:** any static https web server.

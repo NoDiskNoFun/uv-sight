@@ -585,11 +585,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 7;
+const PROTO_EXPECTED  = 8;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.6";
+const APP_VERSION     = "3.7";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1854,6 +1854,7 @@ async function copyToSight() {
   if (!ok) return;
   copyState = { phase: "keys", keys: new Set(), queue: [], done: 0, added: 0, exists: 0, timer: null };
   setCopyProgress("Reading what the sight already has…");
+  send("awake 300");                 // don't fall asleep while choosing and copying
   send("log since 0");
 }
 
@@ -1942,6 +1943,7 @@ function copyOnAck(m) {
 
 function finishCopy(text, isErr) {
   if (copyState) clearTimeout(copyState.timer);
+  if (copyState && state.conn === "connected") send("awake 0");   // release the hold
   copyState = null;
   setCopyProgress("");
   toast(text, !!isErr);

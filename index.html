@@ -502,7 +502,7 @@ const PROTO_EXPECTED  = 4;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "2.1";
+const APP_VERSION     = "2.2";
 
 // ---------------------------------------------------------------------------
 // State
@@ -592,8 +592,62 @@ function onDisconnected() {
   setAwaiting(false);
   if (confirmOpen) { $("dlg").close(); confirmOpen = false; }
   stopPolling();
+  const wasConnected = state.conn === "connected";
   setConn("off");
+  if (wasConnected && !sightAsleep) startAutoReconnect();
 }
+
+// ---------------------------------------------------------------------------
+// Automatic reconnect after an unexpected loss (not when the sight sleeps)
+// ---------------------------------------------------------------------------
+let sightAsleep   = false;   // the sight announced it goes to sleep
+let autoReconnect = false;
+let autoStart = 0, autoTimer = null;
+const AUTO_FAST_MS    = 5000;               // retry interval in the first minutes
+const AUTO_SLOW_MS    = 20000;              // retry interval afterwards
+const AUTO_FAST_FOR   = 2 * 60 * 1000;
+const AUTO_GIVE_UP    = 30 * 60 * 1000;
+
+function startAutoReconnect() {
+  if (!device) return;
+  autoReconnect = true;
+  autoStart = Date.now();
+  updateConnText();
+  scheduleAutoReconnect(AUTO_FAST_MS);
+}
+
+function stopAutoReconnect() {
+  autoReconnect = false;
+  clearTimeout(autoTimer);
+  autoTimer = null;
+}
+
+function scheduleAutoReconnect(ms) {
+  clearTimeout(autoTimer);
+  autoTimer = setTimeout(autoReconnectTry, ms);
+}
+
+async function autoReconnectTry() {
+  if (!autoReconnect || state.conn === "connected") return;
+  const elapsed = Date.now() - autoStart;
+  if (elapsed > AUTO_GIVE_UP) {
+    stopAutoReconnect();
+    updateConnText();
+    toast("Could not reach the sight for 30 min. Tap Reconnect when it is near.");
+    return;
+  }
+  // Chrome throttles hidden pages; try again as soon as the app is visible
+  if (document.visibilityState === "visible" && !reconnecting) {
+    await ensureConnected();
+    if (state.conn === "connected") return;
+    updateConnText();
+  }
+  scheduleAutoReconnect(elapsed < AUTO_FAST_FOR ? AUTO_FAST_MS : AUTO_SLOW_MS);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && autoReconnect) scheduleAutoReconnect(0);
+});
 
 function onData(ev) {
   rxBuffer += decoder.decode(ev.target.value, { stream: true });
@@ -727,7 +781,7 @@ function handleLine(line) {
       onCal(m);
       break;
     case "event":
-      if (m.e === "idle")   toast("Bow at rest. The sight went to sleep.");
+      if (m.e === "idle")   { sightAsleep = true; toast("Bow at rest. The sight went to sleep."); }
       if (m.e === "lowbat") toast("Battery empty. LED is off until you charge.", true);
       if (m.e === "charge") toast(chargeLabel(m.state));
       break;
@@ -757,9 +811,18 @@ function checkProto() {
 // ---------------------------------------------------------------------------
 function setConn(s) {
   state.conn = s;
-  $("conn").dataset.s = s;
-  $("connText").textContent = { off: "Not connected", connecting: "Connecting", connected: "Connected" }[s];
+  if (s === "connected") { sightAsleep = false; stopAutoReconnect(); }
+  updateConnText();
   render();
+}
+
+function updateConnText() {
+  const s = state.conn;
+  let text = { off: "Not connected", connecting: "Connecting", connected: "Connected" }[s];
+  if (s === "off" && sightAsleep)   text = "Sight asleep";
+  if (s === "off" && autoReconnect) text = "Reconnecting…";
+  $("conn").dataset.s = (s === "off" && autoReconnect) ? "connecting" : s;
+  $("connText").textContent = text;
 }
 
 function chargeLabel(c) {
@@ -1712,7 +1775,7 @@ function toast(text, isErr) {
 }
 
 $("btnConnect").addEventListener("click", connect);
-$("btnReconnect").addEventListener("click", reconnect);
+$("btnReconnect").addEventListener("click", () => { stopAutoReconnect(); reconnect(); });
 
 if (!navigator.bluetooth) {
   $("unsupported").hidden = false;

@@ -167,7 +167,7 @@ const uint8_t  SLOT_COUNT      = 32;
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "2.0";
+const char*    FW_VERSION        = "2.1";
 const uint8_t  PROTO_VERSION     = 4;
 
 // Bluetooth
@@ -1174,12 +1174,15 @@ void updateLed(uint32_t now) {
   // After a shot the arrow is gone: pause the tilt indicator for the lockout time
   const bool tiltPause = (int32_t)(now - lastShotMs) < (int32_t)cfg.lockoutMs;
 
+  // The cant indicator works in every LED mode; the mode only decides
+  // what the LED does while the bow is level (or the indicator is off).
   LedState st;
-  if (lowBatLock || ledMode == MODE_OFF)          st = LS_OFF;
-  else if (ledMode == MODE_ON)                    st = LS_ON;
+  if (lowBatLock)                                 st = LS_OFF;
   else if (levelActive() && tilted && !tiltPause) st = LS_BLINK;
-  else if (isDark)                        st = LS_ON;
-  else                                    st = LS_OFF;
+  else if (ledMode == MODE_ON)                    st = LS_ON;
+  else if (ledMode == MODE_OFF)                   st = LS_OFF;
+  else if (isDark)                                st = LS_ON;    // auto: light sensor
+  else                                            st = LS_OFF;
 
   switch (st) {
     case LS_OFF:
@@ -1581,7 +1584,7 @@ void printHelp() {
   out("save              save settings");
   out("defaults          load default values");
   out("live on|off       readings every 2 s");
-  out("mode auto|on|off  LED mode (test)");
+  out("mode auto|on|off  LED: light sensor / always on / off (cant blinking works in all)");
   out("shots             counter status + running session");
   out("shots on|off      shot counter on/off");
   out("shots start|stop  start/end a session manually");
@@ -1690,9 +1693,9 @@ void handleCommand(String line) {
   else if (line == "app off")   { appMode = false; out("App mode off, human-readable output."); }
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
   else if (line == "live off")  { liveMode = false; say("Live output off.", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":false}"); }
-  else if (line == "mode auto") { ledMode = MODE_AUTO; say("LED mode: automatic", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
-  else if (line == "mode on")   { ledMode = MODE_ON;   say("LED mode: always on (test)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
-  else if (line == "mode off")  { ledMode = MODE_OFF;  say("LED mode: always off", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
+  else if (line == "mode auto") { ledMode = MODE_AUTO; say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
+  else if (line == "mode on")   { ledMode = MODE_ON;   say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
+  else if (line == "mode off")  { ledMode = MODE_OFF;  say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
   else if (line == "shots")               handleShots("");
   else if (line.startsWith("shots "))     { String a = line.substring(6); a.trim(); handleShots(a); }
   else if (line == "score")               handleScore("");

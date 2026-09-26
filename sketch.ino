@@ -177,8 +177,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "3.2";
-const uint8_t  PROTO_VERSION     = 6;
+const char*    FW_VERSION        = "3.4";
+const uint8_t  PROTO_VERSION     = 7;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -347,6 +347,9 @@ uint32_t logCount    = 0;            // valid records on the chip
 String   logError;                   // reason of the last failed flash access
 uint8_t  qfStatus1 = 0, qfStatus2 = 0; // status registers read at boot
 bool     qfUnprotected = false;      // write protection was found and cleared
+uint32_t qspiInitErr   = 0;          // last error code of nrfx_qspi_init (0 = none)
+uint16_t qspiRecoveries = 0;         // times the chip had to be reset by hand
+uint32_t qfBbJedec     = 0;          // JEDEC id read by hand during the last reset
 
 // RAM only: when recent sessions were saved (age for the app, lost on reboot)
 const uint8_t RECENT_SAVES = 16;
@@ -361,6 +364,7 @@ struct ShotState {
   uint8_t  pad[3];
   uint32_t epoch;     // log key part 1 for new sessions
   uint32_t lastId;    // last session number handed out
+  uint32_t clearedSeq; // "log clear": records up to this seq count as deleted
 };
 const uint32_t STATE_MAGIC = 0x53545331;   // "1STS"
 const char*    STATE_FILE  = "/shotstate.bin";
@@ -703,7 +707,9 @@ bool stateLoad() {
   File f(InternalFS);
   if (!f.open(STATE_FILE, FILE_O_READ)) return false;
   ShotState tmp;
-  const bool ok = f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == STATE_MAGIC;
+  memset(&tmp, 0, sizeof(tmp));                       // fields missing in older files stay 0
+  const int n = f.read(&tmp, sizeof(tmp));
+  const bool ok = n >= (int)offsetof(ShotState, clearedSeq) && tmp.magic == STATE_MAGIC;
   f.close();
   if (ok) shotState = tmp;
   return ok;
@@ -796,6 +802,68 @@ bool qspiWaitReady(uint32_t timeoutMs) {
   return true;
 }
 
+// ----------------------------------------------------------------------------
+// Talking to the flash by hand (plain GPIO, no QSPI peripheral). Works even when
+// the QSPI peripheral cannot start because the chip sleeps or hangs:
+// wake it from deep power-down (0xAB) and, if needed, reset it (0x66, 0x99),
+// which acts like switching the chip off and on.
+// ----------------------------------------------------------------------------
+void bbPinsOn() {
+  nrf_gpio_cfg_output(qspiPin(PIN_QSPI_CS));   nrf_gpio_pin_set(qspiPin(PIN_QSPI_CS));
+  nrf_gpio_cfg_output(qspiPin(PIN_QSPI_SCK));  nrf_gpio_pin_clear(qspiPin(PIN_QSPI_SCK));
+  nrf_gpio_cfg_output(qspiPin(PIN_QSPI_IO0));  nrf_gpio_pin_clear(qspiPin(PIN_QSPI_IO0));
+  nrf_gpio_cfg_input(qspiPin(PIN_QSPI_IO1), NRF_GPIO_PIN_NOPULL);
+  nrf_gpio_cfg_output(qspiPin(PIN_QSPI_IO2));  nrf_gpio_pin_set(qspiPin(PIN_QSPI_IO2));   // WP# inactive
+  nrf_gpio_cfg_output(qspiPin(PIN_QSPI_IO3));  nrf_gpio_pin_set(qspiPin(PIN_QSPI_IO3));   // HOLD# inactive
+}
+
+void bbPinsOff() {                               // hand the pins back, keep the chip deselected
+  nrf_gpio_cfg_default(qspiPin(PIN_QSPI_SCK));
+  nrf_gpio_cfg_default(qspiPin(PIN_QSPI_IO0));
+  nrf_gpio_cfg_default(qspiPin(PIN_QSPI_IO1));
+  nrf_gpio_cfg_default(qspiPin(PIN_QSPI_IO2));
+  nrf_gpio_cfg_default(qspiPin(PIN_QSPI_IO3));
+}
+
+uint8_t bbByte(uint8_t out) {                    // SPI mode 0, MSB first, ~250 kHz
+  uint8_t in = 0;
+  for (int8_t b = 7; b >= 0; b--) {
+    nrf_gpio_pin_write(qspiPin(PIN_QSPI_IO0), (out >> b) & 1);
+    delayMicroseconds(2);
+    nrf_gpio_pin_set(qspiPin(PIN_QSPI_SCK));
+    delayMicroseconds(2);
+    in = (in << 1) | (nrf_gpio_pin_read(qspiPin(PIN_QSPI_IO1)) & 1);
+    nrf_gpio_pin_clear(qspiPin(PIN_QSPI_SCK));
+  }
+  return in;
+}
+
+void bbCommand(uint8_t op) {
+  nrf_gpio_pin_clear(qspiPin(PIN_QSPI_CS));
+  bbByte(op);
+  nrf_gpio_pin_set(qspiPin(PIN_QSPI_CS));
+  delayMicroseconds(5);
+}
+
+// Wake the chip; with fullReset also reset it. Returns the JEDEC id read by hand.
+uint32_t qspiHandWake(bool fullReset) {
+  bbPinsOn();
+  bbCommand(0xFF);                 // leave a possible continuous-read mode
+  bbCommand(0xAB);                 // release from deep power-down
+  delayMicroseconds(50);
+  if (fullReset) {
+    bbCommand(0x66);               // reset enable
+    bbCommand(0x99);               // reset (aborts a hanging program/erase)
+    delay(1);
+  }
+  nrf_gpio_pin_clear(qspiPin(PIN_QSPI_CS));
+  bbByte(0x9F);
+  const uint32_t id = ((uint32_t)bbByte(0) << 16) | ((uint32_t)bbByte(0) << 8) | bbByte(0);
+  nrf_gpio_pin_set(qspiPin(PIN_QSPI_CS));
+  bbPinsOff();
+  return id;
+}
+
 bool qspiOpen() {
   if (qspiOn) return true;
   nrfx_qspi_config_t c;
@@ -816,7 +884,22 @@ bool qspiOpen() {
   c.phy_if.spi_mode   = NRF_QSPI_MODE_0;
   c.phy_if.sck_freq   = NRF_QSPI_FREQ_32MDIV4;      // 8 MHz, plenty for 64-byte records
   c.irq_priority      = 7;
-  if (nrfx_qspi_init(&c, NULL, NULL) != NRFX_SUCCESS) return false;
+
+  // The QSPI start-up already talks to the chip, so it must be awake first
+  qspiHandWake(false);
+  nrfx_err_t e = nrfx_qspi_init(&c, NULL, NULL);
+  if (e != NRFX_SUCCESS) {
+    qspiInitErr = (uint32_t)e;
+    nrfx_qspi_uninit();                         // reset the driver's state
+    qfBbJedec = qspiHandWake(true);             // reset the chip by hand, then try again
+    qspiRecoveries++;
+    e = nrfx_qspi_init(&c, NULL, NULL);
+    if (e != NRFX_SUCCESS) {
+      qspiInitErr = (uint32_t)e;
+      nrfx_qspi_uninit();
+      return false;
+    }
+  }
   qspiOn = true;
   nrf_qspi_cinstr_conf_t wake = qspiInstr(0xAB, NRF_QSPI_CINSTR_LEN_1B);  // release deep power-down
   nrfx_qspi_cinstr_xfer(&wake, NULL, NULL);
@@ -889,6 +972,13 @@ bool recValid(const LogRec& r) {
   return r.magic == REC_MAGIC && r.seq != 0 && r.crc == crc32(&r, 60);
 }
 
+// A deleted record: its CRC word was programmed to 0 (flash can clear bits
+// without an erase). It keeps its place, so the seq numbers stay gapless.
+bool recDeleted(const LogRec& r) {
+  return r.magic == REC_MAGIC && r.seq != 0 && r.crc == 0;
+}
+bool recUsed(const LogRec& r) { return recValid(r) || recDeleted(r); }
+
 bool recBlank(const LogRec& r) {
   const uint32_t* w = (const uint32_t*)&r;
   for (uint8_t i = 0; i < sizeof(LogRec) / 4; i++) if (w[i] != 0xFFFFFFFF) return false;
@@ -916,7 +1006,7 @@ void logScan() {
   uint32_t best = 0;
   LogRec r;
   for (uint16_t s = 0; s < QF_SECTORS; s++) {
-    if (qfRead((uint32_t)s * QF_SECTOR, r) && recValid(r)) {
+    if (qfRead((uint32_t)s * QF_SECTOR, r) && recUsed(r)) {
       sectorFirstSeq[s] = r.seq;
       if (r.seq > best) { best = r.seq; head = s; }
     }
@@ -924,7 +1014,7 @@ void logScan() {
   if (head < 0) return;                     // empty log
   uint16_t i = 0;
   for (; i < RECS_PER_SECTOR; i++) {
-    if (!qfRead((uint32_t)head * QF_SECTOR + i * sizeof(LogRec), r) || !recValid(r)) break;
+    if (!qfRead((uint32_t)head * QF_SECTOR + i * sizeof(LogRec), r) || !recUsed(r)) break;
     logLastSeq = r.seq;
   }
   logHeadAddr = (i < RECS_PER_SECTOR) ? (uint32_t)head * QF_SECTOR + i * sizeof(LogRec)
@@ -983,7 +1073,10 @@ bool logAppend(LogRec& r, bool justSaved) {
 }
 
 // Call fn for every record with seq > since, oldest first. Stops when fn returns false.
+uint32_t logVisitAddr = 0;   // flash address of the record passed to the visitor
+
 void logForEach(uint32_t since, LogVisitor fn) {
+  if (since < shotState.clearedSeq) since = shotState.clearedSeq;   // "log clear"
   if (!qfOk || logCount == 0 || !qspiOpen()) return;
   const uint16_t headSec = (logHeadAddr / QF_SECTOR + QF_SECTORS - (logHeadAddr % QF_SECTOR == 0 ? 1 : 0)) % QF_SECTORS;
   LogRec r;
@@ -994,11 +1087,71 @@ void logForEach(uint32_t since, LogVisitor fn) {
     if (!first || first + RECS_PER_SECTOR - 1 <= since) continue;
     uint16_t i = (since >= first) ? (uint16_t)(since - first + 1) : 0;
     for (; i < RECS_PER_SECTOR && go; i++) {
-      if (!qfRead((uint32_t)s * QF_SECTOR + i * sizeof(LogRec), r) || !recValid(r)) break;
-      if (r.seq > since) go = fn(r);
+      const uint32_t addr = (uint32_t)s * QF_SECTOR + i * sizeof(LogRec);
+      if (!qfRead(addr, r) || !recUsed(r)) break;
+      if (recDeleted(r) || r.seq <= since) continue;
+      logVisitAddr = addr;
+      go = fn(r);
     }
   }
   qspiClose();
+}
+
+// Sessions the app and the terminal can see (without deleted and cleared ones)
+static uint32_t visibleN;
+uint32_t logVisibleCount() {
+  visibleN = 0;
+  logForEach(0, [](const LogRec&) { visibleN++; return true; });
+  return visibleN;
+}
+
+// "log del <epoch> <id>": mark one session as deleted
+static uint32_t delEpoch, delId, delAddr;
+void logDelete(String args) {
+  args.trim();
+  const int sp = args.indexOf(' ');
+  delEpoch = (uint32_t)strtoul((sp < 0 ? args : args.substring(0, sp)).c_str(), nullptr, 10);
+  delId    = sp < 0 ? 0 : (uint32_t)strtoul(args.substring(sp + 1).c_str(), nullptr, 10);
+  const String key = "{\"t\":\"ack\",\"cmd\":\"del\",\"epoch\":" + String(delEpoch) +
+                     ",\"id\":" + String(delId) + ",\"result\":";
+  if (!delEpoch || !delId) { say("Format: log del <epoch> <id>", key + "\"error\"}"); return; }
+  if (!qfOk) { say("Log flash not available.", key + "\"error\"}"); return; }
+  delAddr = 0;
+  logForEach(0, [](const LogRec& r) {
+    if (r.epoch == delEpoch && r.id == delId) { delAddr = logVisitAddr; return false; }
+    return true;
+  });
+  if (!delAddr) {
+    say("Session " + String(delEpoch) + "-" + String(delId) + " is not on the sight.", key + "\"notfound\"}");
+    return;
+  }
+  bool ok = false;
+  if (qspiOpen()) {
+    LogRec r;
+    r.crc = 0;                                         // only the last word is written
+    ok = qspiWaitReady(400) &&
+         nrfx_qspi_write(&r.crc, 4, delAddr + offsetof(LogRec, crc)) == NRFX_SUCCESS &&
+         qspiWaitReady(50) && qfRead(delAddr, r) && recDeleted(r);
+    qspiClose();
+  }
+  say(ok ? "Session " + String(delEpoch) + "-" + String(delId) + " deleted from the sight."
+         : String("ERROR: could not delete the session."),
+      key + (ok ? "\"deleted\"}" : "\"error\"}"));
+}
+
+// "log clear confirm": everything stored so far counts as deleted (instant;
+// the records are physically overwritten later as the ring moves on)
+void logClear(String args) {
+  args.trim();
+  if (args != "confirm") {
+    out("This deletes ALL sessions on the sight. Send 'log clear confirm' to do it.");
+    return;
+  }
+  const uint32_t n = logVisibleCount();
+  shotState.clearedSeq = logLastSeq;
+  const bool ok = stateSave();
+  say(ok ? "Log on the sight cleared (" + String(n) + (n == 1 ? " session)." : " sessions).") : String("ERROR while saving!"),
+      "{\"t\":\"ack\",\"cmd\":\"clear\",\"ok\":" + jbool(ok) + ",\"count\":" + String(n) + "}");
 }
 
 // Step-by-step check of the external flash, uses its last sector only
@@ -1009,9 +1162,17 @@ void logTest() {
   };
   logError = "";
   const uint32_t t0 = millis();
-  if (!qspiOpen()) { step("QSPI init", false, ""); return; }
-  step("QSPI init", true, "");
-  char buf[40];
+  char buf[64];
+  if (qspiOn) qspiClose();
+  const uint32_t hj = qspiHandWake(true);
+  snprintf(buf, sizeof(buf), "JEDEC %06lX without QSPI", (unsigned long)hj);
+  step("wake + reset by hand", hj == 0x856015, buf);
+  const uint16_t r0 = qspiRecoveries;
+  const bool opened = qspiOpen();
+  snprintf(buf, sizeof(buf), "error 0x%08lX%s", (unsigned long)qspiInitErr,
+           qspiRecoveries != r0 ? ", needed a second try" : "");
+  step("QSPI init", opened, opened && qspiRecoveries == r0 ? String("") : String(buf));
+  if (!opened) return;
   const uint32_t jed = qspiReadJedec();
   snprintf(buf, sizeof(buf), "%06lX, expected 856015", (unsigned long)jed);
   step("JEDEC id", jed != 0 && jed != 0xFFFFFF, buf);
@@ -1841,9 +2002,10 @@ String logInfoJson() {
   char jed[8];
   snprintf(jed, sizeof(jed), "%06lX", (unsigned long)qfJedec);
   return "{\"t\":\"loginfo\",\"ok\":" + jbool(qfOk) + ",\"jedec\":\"" + String(jed) + "\"" +
-         ",\"count\":" + String(logCount) + ",\"capacity\":" + String((uint32_t)(QF_SECTORS - 1) * RECS_PER_SECTOR) +
+         ",\"count\":" + String(logVisibleCount()) + ",\"capacity\":" + String((uint32_t)(QF_SECTORS - 1) * RECS_PER_SECTOR) +
          ",\"last\":" + String(logLastSeq) + ",\"clock\":" + jbool(clockValid) +
-         ",\"migrated\":" + String(migratedCount) + ",\"error\":" + jstr(logError) + "}";
+         ",\"migrated\":" + String(migratedCount) + ",\"error\":" + jstr(logError) +
+         ",\"initErr\":" + String(qspiInitErr) + ",\"resets\":" + String(qspiRecoveries) + "}";
 }
 
 void printLogInfo() {
@@ -1855,7 +2017,13 @@ void printLogInfo() {
   out(String("Log flash: ") + (qfOk ? "OK" : "NOT AVAILABLE") + " (JEDEC " + jed + ", " + sr +
       (qfUnprotected ? ", write protection cleared" : "") + ")");
   if (logError.length()) out("Last flash error: " + logError);
-  out("Sessions stored: " + String(logCount) + " of about " +
+  if (qspiInitErr || qspiRecoveries) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "QSPI start: last error 0x%08lX, chip reset by hand %u times, JEDEC by hand %06lX",
+             (unsigned long)qspiInitErr, qspiRecoveries, (unsigned long)qfBbJedec);
+    out(buf);
+  }
+  out("Sessions stored: " + String(logVisibleCount()) + " of about " +
       String((uint32_t)(QF_SECTORS - 1) * RECS_PER_SECTOR) + ", newest #" + String(logLastSeq));
   out(String("Clock: ") + (clockValid ? fmtUnix(unixAt(millis())) : "not set (connect the app)"));
   if (migratedCount) out("Taken over from the old log at this start: " + String(migratedCount) + " sessions");
@@ -1865,13 +2033,13 @@ void printLogInfo() {
 void printLog(uint32_t since, bool all) {
   if (appMode) {
     sendLine("{\"t\":\"logStart\",\"since\":" + String(since) + ",\"last\":" + String(logLastSeq) +
-             ",\"total\":" + String(logCount) + ",\"epoch\":" + String(shotState.epoch) + "}");
+             ",\"total\":" + String(logVisibleCount()) + ",\"epoch\":" + String(shotState.epoch) + "}");
     logForEach(since, [](const LogRec& r) { sendLine(slotJson(r)); return true; });
     sendLine("{\"t\":\"logEnd\",\"last\":" + String(logLastSeq) + "}");
     return;
   }
   if (!qfOk) { err("Log flash not available."); return; }
-  if (logCount == 0) { out("No sessions stored yet."); return; }
+  if (logVisibleCount() == 0) { out("No sessions stored."); return; }
   if (all) {
     out("--- Sessions (oldest first) ---");
     logForEach(since, [](const LogRec& r) { out(slotLine(r)); return true; });
@@ -1883,7 +2051,7 @@ void printLog(uint32_t since, bool all) {
   n = 0;
   const uint32_t from = logLastSeq > LOG_PRINT_LAST ? logLastSeq - LOG_PRINT_LAST : 0;
   logForEach(from, [](const LogRec& r) { if (n < LOG_PRINT_LAST) buf[n++] = r; return true; });
-  out("--- Newest " + String(n) + " of " + String(logCount) + " sessions ('log all' for all) ---");
+  out("--- Newest " + String(n) + " of " + String(logVisibleCount()) + " sessions ('log all' for all) ---");
   for (int8_t i = n - 1; i >= 0; i--) out(slotLine(buf[i]));
 }
 
@@ -2069,6 +2237,8 @@ void printHelp() {
   out("log info          log flash, number of sessions, clock");
   out("log put ...       write a session from a backup (used by the app)");
   out("log test          check the log flash step by step");
+  out("log del <e> <id>  delete one session on the sight");
+  out("log clear         delete all sessions on the sight (asks first)");
   out("level             tilt indicator status");
   out("level on|auto|off tilt indicator always / in sessions / off");
   out("level style normal|inverted  blink faster when tilted / when level");
@@ -2236,6 +2406,8 @@ void handleCommand(String line) {
   else if (line == "log all")             printLog(0, true);
   else if (line == "log info")            printLogInfo();
   else if (line == "log test")            logTest();
+  else if (line.startsWith("log del "))   logDelete(line.substring(8));
+  else if (line == "log clear" || line.startsWith("log clear ")) logClear(line.substring(9));
   else if (line.startsWith("log since ")) printLog((uint32_t)line.substring(10).toInt(), true);
   else if (line.startsWith("time "))      setClock(line.substring(5));
   else if (line.startsWith("log put "))   logPut(line.substring(8));

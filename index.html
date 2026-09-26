@@ -235,6 +235,19 @@
   .dist .bar { height: 12px; border-radius: 6px; }
   .sessions li.hidden-entry button { opacity: .55; }
   .sessions .hid { color: var(--muted); font-size: .85rem; grid-column: 1 / -1; font-style: italic; }
+  #cpDlg { width: min(94vw, 440px); max-width: 440px; }
+  .cp-tools { display: flex; justify-content: space-between; align-items: center; margin: 4px 0 8px; font-size: .9rem; }
+  .cp-tools button { border: 0; background: none; color: var(--blue); font-weight: 600; padding: 6px 4px; cursor: pointer; }
+  .cp-list { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow-y: auto;
+             border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .cp-list li { border-top: 1px solid var(--line); }
+  .cp-list li:first-child { border-top: 0; }
+  .cp-list label { display: grid; grid-template-columns: 28px 1fr auto; gap: 2px 10px; align-items: center;
+                   padding: 10px 4px; cursor: pointer; }
+  .cp-list input { width: 20px; height: 20px; accent-color: var(--gold); grid-row: span 2; }
+  .cp-list .d { font-weight: 650; }
+  .cp-list .a { font-weight: 750; font-variant-numeric: tabular-nums; grid-row: span 2; }
+  .cp-list .m { color: var(--muted); font-size: .85rem; }
   .rm-choices { display: grid; gap: 10px; margin-top: 4px; }
   .rm-choices .btn { border-radius: var(--radius-s); min-height: 52px; text-align: left; padding: 10px 16px; }
   .rm-choices .btn small { display: block; font-weight: 400; opacity: .8; font-size: .82rem; margin-top: 2px; }
@@ -510,6 +523,20 @@
     </div>
   </dialog>
 
+  <dialog id="cpDlg">
+    <h3>Copy to the sight</h3>
+    <p class="muted" id="cpText"></p>
+    <div class="cp-tools">
+      <span id="cpCount"></span>
+      <span><button id="cpAll">All</button> <button id="cpNone">None</button></span>
+    </div>
+    <ul class="cp-list" id="cpList"></ul>
+    <div class="row" style="display:flex; gap:10px; justify-content:flex-end; margin-top:14px">
+      <button class="btn secondary" id="cpCancel">Cancel</button>
+      <button class="btn" id="cpGo">Copy</button>
+    </div>
+  </dialog>
+
   <dialog id="rmDlg">
     <h3>Remove this session?</h3>
     <p class="muted" id="rmText"></p>
@@ -562,7 +589,7 @@ const PROTO_EXPECTED  = 7;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.5";
+const APP_VERSION     = "3.6";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1838,9 +1865,50 @@ function copyOnLogEnd() {
   if (!copyState || copyState.phase !== "keys") return;
   copyState.queue = loadArchive().filter((r) =>
     Number(r.epoch) > 0 && Number(r.id) > 0 && !copyState.keys.has(`${r.epoch}-${r.id}`));
-  copyState.phase = "put";
+  copyState.phase = "choose";
   if (!copyState.queue.length) { finishCopy("The sight already has every session from this phone."); return; }
-  copyNext();
+  setCopyProgress("");
+  $("btnToSight").disabled = true;
+  chooseCopies(copyState.queue);
+}
+
+// List of the sessions the sight doesn't have, all selected; only checked ones are copied
+function chooseCopies(candidates) {
+  const d = $("cpDlg"), ul = $("cpList");
+  const list = candidates.slice().sort((x, y) => sortTime(y) - sortTime(x));
+  ul.textContent = "";
+  for (const r of list) {
+    const li = document.createElement("li");
+    li.innerHTML = `<label><input type="checkbox" checked><span class="d"></span><span class="a"></span><span class="m"></span></label>`;
+    li.querySelector("input").dataset.key = r.key;
+    li.querySelector(".d").textContent = fmtDate(r);
+    li.querySelector(".a").textContent = Number(r.avg).toFixed(2);
+    li.querySelector(".m").textContent = `${r.ends} ends, ${r.scored} arrows` + (r.hidden ? ", hidden" : "");
+    ul.appendChild(li);
+  }
+  const boxes = () => [...ul.querySelectorAll("input")];
+  const update = () => {
+    const n = boxes().filter((b) => b.checked).length;
+    $("cpCount").textContent = `${n} of ${list.length} selected`;
+    $("cpGo").textContent = n ? `Copy ${n}` : "Copy";
+    $("cpGo").disabled = n === 0;
+  };
+  $("cpText").textContent = `${list.length} ${list.length === 1 ? "session is" : "sessions are"} on this phone but not on the sight. Untick the ones you don't want to copy.`;
+  ul.onchange = update;
+  $("cpAll").onclick  = () => { boxes().forEach((b) => (b.checked = true));  update(); };
+  $("cpNone").onclick = () => { boxes().forEach((b) => (b.checked = false)); update(); };
+  $("cpCancel").onclick = () => { d.close(); finishCopy("Nothing copied."); };
+  d.oncancel = (e) => { e.preventDefault(); d.close(); finishCopy("Nothing copied."); };
+  $("cpGo").onclick = () => {
+    const keys = new Set(boxes().filter((b) => b.checked).map((b) => b.dataset.key));
+    d.close();
+    if (!copyState) return;
+    copyState.queue = list.filter((r) => keys.has(r.key));
+    copyState.phase = "put";
+    copyNext();
+  };
+  update();
+  d.showModal();
 }
 
 function copyNext() {

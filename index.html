@@ -498,11 +498,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 4;
+const PROTO_EXPECTED  = 5;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "2.2";
+const APP_VERSION     = "3.0";
 
 // ---------------------------------------------------------------------------
 // State
@@ -583,6 +583,8 @@ async function openGatt() {
   rxBuffer = "";
   setConn("connected");
   send("app on");
+  // The sight has no clock: give it the phone's time (and UTC offset for its own printouts)
+  send(`time ${Math.floor(Date.now() / 1000)} ${-new Date().getTimezoneOffset()}`);
   startPolling();
 }
 
@@ -744,7 +746,10 @@ function handleLine(line) {
       toast("Not saved. Correct the scores and save again.");
       break;
     case "sessionEnd":
-      if (m.stored && m.slot) archiveSlot(m.epoch, m.slot);
+      if (m.stored && m.slot) {
+        archiveSlot(m.slot.epoch ?? m.epoch, m.slot);
+        if (m.slot.seq === loadLogSeq() + 1) saveLogSeq(m.slot.seq);   // only if nothing was skipped
+      }
       entries = [];
       lastEnd = null;
       setAwaiting(false);
@@ -758,14 +763,27 @@ function handleLine(line) {
     case "logStart":
       syncEpoch = m.epoch;
       syncCount = 0;
+      // The sight's log is behind what we fetched: its flash was replaced or cleared
+      syncResync = typeof m.last === "number" && m.last < loadLogSeq();
       break;
     case "slot":
-      if (syncEpoch !== null && archiveSlot(syncEpoch, m)) syncCount++;
+      if (syncEpoch !== null && archiveSlot(m.epoch ?? syncEpoch, m)) syncCount++;
+      if (typeof m.seq === "number" && m.seq > loadLogSeq() && !syncResync) saveLogSeq(m.seq);
       break;
     case "logEnd":
+      syncEpoch = null;
+      if (syncResync) {                     // start over from the beginning of the sight's log
+        syncResync = false;
+        saveLogSeq(0);
+        requestLog();
+        break;
+      }
+      if (typeof m.last === "number" && m.last >= loadLogSeq()) saveLogSeq(m.last);
       toast(syncCount ? `${syncCount} new ${syncCount === 1 ? "session" : "sessions"} stored on this phone`
                       : "Everything is already on this phone");
-      syncEpoch = null;
+      break;
+    case "loginfo":
+      state.loginfo = m;
       break;
     case "ack":
       if (m.cmd === "set" && state.cfg) {
@@ -1243,7 +1261,11 @@ function resolveDates(a) {
   }
   return changed;
 }
-let syncEpoch = null, syncCount = 0;
+let syncEpoch = null, syncCount = 0, syncResync = false;
+const LOGSEQ_KEY = "uvsight.logseq.v1";   // newest log record already fetched from the sight
+const loadLogSeq = () => Number(localStorage.getItem(LOGSEQ_KEY)) || 0;
+const saveLogSeq = (n) => { try { localStorage.setItem(LOGSEQ_KEY, String(n)); } catch {} };
+function requestLog() { send(`log since ${loadLogSeq()}`); }
 
 function loadArchive() {
   try { return JSON.parse(localStorage.getItem(ARCHIVE_KEY)) || []; } catch { return []; }
@@ -1258,7 +1280,9 @@ function archiveSlot(epoch, sl) {
   const a = loadArchive();
   const key = `${epoch}-${sl.id}`;
   if (loadDeleted().has(key)) return false;     // removed by hand before
-  let endedAt = (sl.ago !== null && sl.ago !== undefined) ? Date.now() - sl.ago * 60000 : null;
+  let endedAt = null;
+  if (sl.start) endedAt = sl.start * 1000 + sl.min * 60000;                  // stored on the sight
+  else if (sl.ago !== null && sl.ago !== undefined) endedAt = Date.now() - sl.ago * 60000;
   if (endedAt === null) {
     const started = loadStarts()[key];
     if (started) endedAt = started + sl.min * 60000;
@@ -1386,7 +1410,7 @@ function exportCsv() {
 
 $("btnSync").addEventListener("click", () => {
   if (state.conn !== "connected") { toast("Connect to the sight first.", true); return; }
-  send("log");
+  requestLog();
 });
 $("btnExport").addEventListener("click", exportCsv);
 
@@ -1546,7 +1570,11 @@ function renderSettings() {
   $("setBody").hidden = !(connected && state.cfg);
   $("btnDfu").disabled = !connected;
   const h = state.hello;
-  $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}, protocol ${h.proto}` : "");
+  const li = state.loginfo;
+  $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}, protocol ${h.proto}` : "") +
+    (li ? (li.ok ? `. Log on the sight: ${li.count} sessions (room for about ${li.capacity})` +
+                   (li.clock ? "" : ", clock not set")
+                 : ". Log flash on the sight NOT available") : "");
   $("saveBar").hidden = !cfgDirty;
   if (!connected || !state.cfg || activeView !== "settings") return;
   // Don't rebuild while the user is dragging a slider or typing
@@ -1754,9 +1782,10 @@ document.querySelectorAll("nav button").forEach((b) => {
     if (activeView === "status" && state.conn === "connected" && !confirmOpen) send("status");
     const idle = state.conn === "connected" && !confirmOpen && !awaitingEnd;
     if (activeView === "training" && idle) send("shots");
-    if (activeView === "history"  && idle) send("log");
+    if (activeView === "history"  && idle) requestLog();
     if (activeView === "settings" && idle) {
       send("level");
+      send("log info");
       if (state.cfg) send("get");
       else { cfgRetries = 0; requestCfg(); }
     }

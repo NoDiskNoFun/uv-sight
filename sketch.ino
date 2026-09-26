@@ -152,6 +152,8 @@ const uint32_t ACTIVE_POLL_MS     = 250;   // loop interval while active
 const uint32_t SENSOR_INTERVAL_MS = 2000;  // check light + battery every 2 s
 const uint32_t IMU_SETTLE_MS      = 1000;  // ignore motion after a mode change
 const uint32_t LEVEL_LOOP_MS      = 30;    // loop interval while the tilt indicator runs
+const uint32_t AWAKE_MAX_S        = 900;   // longest hold the app can ask for ("awake <s>")
+const uint32_t AWAKE_PUT_MS       = 60000; // every "log put" keeps the sight awake this long
 
 // Circuit
 const float R_LED_OHM      = 68.0;
@@ -177,8 +179,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "3.4";
-const uint8_t  PROTO_VERSION     = 7;
+const char*    FW_VERSION        = "3.5";
+const uint8_t  PROTO_VERSION     = 8;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -518,6 +520,8 @@ uint32_t lastMotionMs      = 0;
 uint32_t lastSensorMs      = 0;
 uint32_t lastReportMs      = 0;
 uint32_t ignoreMotionUntil = 0;
+uint32_t awakeUntil        = 0;   // app hold: stay reachable until then ("awake <s>")
+const char* awakeReason    = "";  // "usb", "app" or "" (for the status)
 float    lastShotG         = -1;      // peak of the last counted shot in g (-1 = none yet)
 bool     lastShotClip      = false;   // the peak hit the +-16 g limit
 volatile bool     tapFlag  = false;   // set by the INT1 interrupt
@@ -2179,7 +2183,7 @@ String statusJson() {
              ",\"mode\":\"" + mode + "\"" +
              ",\"lowbat\":" + jbool(lowBatLock) +
              ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) +
-             ",\"session\":" + jbool(sessionActive) +
+             ",\"session\":" + jbool(sessionActive) + ",\"awake\":\"" + awakeReason + "\"" +
              ",\"lastShotG\":" + (lastShotG >= 0 ? String(lastShotG, 1) : String("null")) +
              ",\"lastShotClip\":" + jbool(lastShotClip);
   if (sessionActive) j += ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots);
@@ -2245,6 +2249,7 @@ void printHelp() {
   out("level cal         calibration step 1");
   out("level cal2        calibration step 2");
   out("app on|off        JSON output for the app");
+  out("awake <s>         stay reachable without movement (max 900 s, 0 = off)");
   out("dfu               reboot into update mode (USB needed)");
 }
 
@@ -2312,6 +2317,8 @@ void logPut(String args) {
     return;
   }
   if (!qfOk) { say("Log flash not available.", key + "\"error\"}"); return; }
+  // Copying from the app: stay awake while sessions keep coming
+  if ((int32_t)(awakeUntil - (millis() + AWAKE_PUT_MS)) < 0) awakeUntil = millis() + AWAKE_PUT_MS;
   if (logHasKey(v[0], v[1])) {
     say("Session " + String(v[0]) + "-" + String(v[1]) + " is already stored.", key + "\"exists\"}");
     return;
@@ -2328,6 +2335,18 @@ void logPut(String args) {
   say(ok ? "Session " + String(v[0]) + "-" + String(v[1]) + " added as #" + String(r.seq) + "."
          : String("ERROR: could not write to the log flash!"),
       key + (ok ? "\"added\",\"seq\":" + String(r.seq) + "}" : String("\"error\"}")));
+}
+
+// "awake <seconds>": stay reachable (Bluetooth, readings) without movement, e.g.
+// while the app copies sessions. 0 releases the hold. Bow functions still sleep.
+void setAwake(String args) {
+  args.trim();
+  long sec = args.toInt();
+  if (sec < 0) sec = 0;
+  if ((uint32_t)sec > AWAKE_MAX_S) sec = AWAKE_MAX_S;
+  awakeUntil = sec ? millis() + (uint32_t)sec * 1000UL : 0;
+  say(sec ? "Staying awake for " + String(sec) + " s." : String("Awake hold released."),
+      "{\"t\":\"ack\",\"cmd\":\"awake\",\"s\":" + String(sec) + "}");
 }
 
 // "time <unix seconds> [offset to UTC in minutes]" from the app
@@ -2410,6 +2429,7 @@ void handleCommand(String line) {
   else if (line == "log clear" || line.startsWith("log clear ")) logClear(line.substring(9));
   else if (line.startsWith("log since ")) printLog((uint32_t)line.substring(10).toInt(), true);
   else if (line.startsWith("time "))      setClock(line.substring(5));
+  else if (line.startsWith("awake "))     setAwake(line.substring(6));
   else if (line.startsWith("log put "))   logPut(line.substring(8));
   else if (line == "level")               handleLevel("");
   else if (line.startsWith("level "))     { String a = line.substring(6); a.trim(); handleLevel(a); }
@@ -2631,6 +2651,14 @@ void loop() {
 
   const bool active = (now - lastMotionMs) < cfg.timeoutS * 1000UL;
 
+  // Stay reachable without movement while charging over USB or while the app
+  // holds the sight awake (e.g. "Copy to sight"). Only Bluetooth and readings:
+  // LED, shot detection and cant indicator still need movement.
+  const bool usb  = usbPresent();
+  const bool held = (int32_t)(awakeUntil - now) > 0;
+  awakeReason = active ? "" : (usb ? "usb" : (held ? "app" : ""));
+  const bool reachable = active || usb || held;
+
   // Shot detection only if the counter is on and the bow is in use
   imuSetFast(active && shotState.shotsOn);
 
@@ -2639,7 +2667,7 @@ void loop() {
     finishSession(false);
   }
 
-  bleUpdate(active);
+  bleUpdate(reachable);
   readCommands();
   now = millis();
 
@@ -2661,6 +2689,21 @@ void loop() {
     tiltReset();
     wasInactive = true;
     darkCount = brightCount = 0;
+    if (reachable) {
+      // Kept awake: fresh readings for the app, LED stays off
+      if ((now - lastSensorMs) >= SENSOR_INTERVAL_MS) {
+        lastSensorMs = now;
+        evaluate();
+        wasInactive = true;            // evaluate() cleared it; the bow is still at rest
+        if (liveMode) { sendStatus(); lastReportMs = now; }
+      }
+      if (connected && !liveMode && cfg.reportS > 0 && (now - lastReportMs) >= cfg.reportS * 1000UL) {
+        sendStatus();
+        lastReportMs = now;
+      }
+      delay(ACTIVE_POLL_MS);
+      return;
+    }
     delay(IDLE_POLL_MS);
     return;
   }

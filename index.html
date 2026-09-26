@@ -533,7 +533,7 @@ const PROTO_EXPECTED  = 6;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.2";
+const APP_VERSION     = "3.3";
 
 // ---------------------------------------------------------------------------
 // State
@@ -804,7 +804,13 @@ function handleLine(line) {
         break;
       }
       copyOnSlot(m);
-      if (syncEpoch !== null && archiveSlot(m.epoch ?? syncEpoch, m)) syncCount++;
+      if (syncEpoch === null) {
+        // A slot line outside a log answer (e.g. an unexpected session end):
+        // keep the session, but never move the fetched-up-to marker for it
+        archiveSlot(m.epoch, m);
+        break;
+      }
+      if (archiveSlot(m.epoch ?? syncEpoch, m)) syncCount++;
       if (typeof m.seq === "number" && m.seq > loadLogSeq() && !syncResync) saveLogSeq(m.seq);
       break;
     case "logEnd":
@@ -1320,6 +1326,12 @@ const LOGSEQ_KEY = "uvsight.logseq.v1";   // newest log record already fetched f
 const loadLogSeq = () => Number(localStorage.getItem(LOGSEQ_KEY)) || 0;
 const saveLogSeq = (n) => { try { localStorage.setItem(LOGSEQ_KEY, String(n)); } catch {} };
 function requestLog() { send(`log since ${loadLogSeq()}`); }
+// App 3.3 repair: the marker could have moved past sessions that were never stored.
+// Fetch the whole log once; sessions already on the phone are skipped.
+if (localStorage.getItem("uvsight.logseq.repair") !== "3.3") {
+  saveLogSeq(0);
+  try { localStorage.setItem("uvsight.logseq.repair", "3.3"); } catch {}
+}
 
 function loadArchive() {
   try { return JSON.parse(localStorage.getItem(ARCHIVE_KEY)) || []; } catch { return []; }

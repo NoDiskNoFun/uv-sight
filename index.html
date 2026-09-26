@@ -533,7 +533,7 @@ const PROTO_EXPECTED  = 6;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.1";
+const APP_VERSION     = "3.2";
 
 // ---------------------------------------------------------------------------
 // State
@@ -779,17 +779,16 @@ function handleLine(line) {
       toast("Not saved. Correct the scores and save again.");
       break;
     case "sessionEnd":
-      if (m.stored && m.slot) {
-        archiveSlot(m.slot.epoch ?? m.epoch, m.slot);
-        if (m.slot.seq === loadLogSeq() + 1) saveLogSeq(m.slot.seq);   // only if nothing was skipped
-      }
+      // Firmware 3.2+: the session's details follow as a separate "slot" line
       entries = [];
       lastEnd = null;
       setAwaiting(false);
-      if (m.stored && m.slot) {
-        toast(`Session saved: ${m.slot.scored} arrows, average ${m.slot.avg.toFixed(2)}, ${m.slot.x} X`);
-      } else {
+      if (!m.epoch && !m.slot) {                           // empty session, nothing to keep
+        liveSlot = null;
         toast("Empty session, nothing saved.");
+      } else {
+        liveSlot = { epoch: m.epoch ?? m.slot.epoch, id: m.id ?? m.slot.id, stored: !!m.stored, error: m.error };
+        if (m.slot) handleLiveSlot(m.slot);                // older firmware: details inline
       }
       send("shots");
       break;
@@ -800,6 +799,10 @@ function handleLine(line) {
       syncResync = typeof m.last === "number" && m.last < loadLogSeq();
       break;
     case "slot":
+      if (syncEpoch === null && liveSlot && m.epoch === liveSlot.epoch && m.id === liveSlot.id) {
+        handleLiveSlot(m);
+        break;
+      }
       copyOnSlot(m);
       if (syncEpoch !== null && archiveSlot(m.epoch ?? syncEpoch, m)) syncCount++;
       if (typeof m.seq === "number" && m.seq > loadLogSeq() && !syncResync) saveLogSeq(m.seq);
@@ -1300,6 +1303,19 @@ function resolveDates(a) {
   return changed;
 }
 let syncEpoch = null, syncCount = 0, syncResync = false;
+let liveSlot = null;   // session that just ended, its "slot" line is expected next
+
+// A session that just ended: keep it on the phone even if the sight could not store it
+function handleLiveSlot(sl) {
+  const stored = !liveSlot || liveSlot.stored;
+  const error  = liveSlot && liveSlot.error;
+  archiveSlot(sl.epoch, sl);
+  if (stored) toast(`Session saved: ${sl.scored} arrows, average ${Number(sl.avg).toFixed(2)}, ${sl.x} X`);
+  else toast("The sight could not store this session" + (error ? ` (${error})` : "") +
+             ". It is kept on this phone.", true);
+  if (sl.seq && sl.seq === loadLogSeq() + 1) saveLogSeq(sl.seq);   // only if nothing was skipped
+  liveSlot = null;
+}
 const LOGSEQ_KEY = "uvsight.logseq.v1";   // newest log record already fetched from the sight
 const loadLogSeq = () => Number(localStorage.getItem(LOGSEQ_KEY)) || 0;
 const saveLogSeq = (n) => { try { localStorage.setItem(LOGSEQ_KEY, String(n)); } catch {} };

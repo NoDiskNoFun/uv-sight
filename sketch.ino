@@ -46,8 +46,11 @@
     the sensor, all arrows 0 points, not included in the overall average).
   - Last end without entry at session end: 1 shot is ignored (setting the
     bow down), more than 1 shot = invalid end.
-  - 32 sessions are stored (rotating): ends, shots, scored arrows, average,
-    invalid ends/arrows, duration.
+  - Sessions are stored on the external 2 MB QSPI flash as 64-byte records
+    with CRC (about 32,000 sessions; the oldest are overwritten when full):
+    date (if the app set the clock), ends, shots, scored arrows, average,
+    X, invalid ends/arrows, duration. A log of firmware 1.2 - 2.1 in the
+    internal flash is taken over automatically on the first start.
 
   Tilt indicator (cant)
   ---------------------
@@ -76,6 +79,8 @@
   - Stored sessions carry an "id" (running number) and the log an "epoch"
     (random, new whenever the log starts empty), so the app can archive
     them without duplicates. "ago" = minutes since saving (null after reboot).
+  - "log put" writes a session from a backup into the log (skipped if its
+    epoch + id are already stored). The app uses it to restore the sight.
   - Every line has a type field "t": hello, status, cfgStart/cfgItem/cfgEnd,
     session, shot, end,
     confirm, discarded, sessionEnd, logStart/slot/logEnd, level, cal,
@@ -113,6 +118,7 @@
 #include <LSM6DS3.h>
 #include <bluefruit.h>
 #include <nrf_nvic.h>   // sd_nvic_SystemReset
+#include <nrfx_qspi.h>  // external 2 MB flash for the session log
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
 
@@ -120,6 +126,11 @@ using namespace Adafruit_LittleFS_Namespace;
 
 #if !defined(PIN_VBAT) || !defined(VBAT_ENABLE)
   #error "Wrong board: select 'Seeed XIAO nRF52840 Sense' from 'Seeed nRF52 Boards' (not mbed)."
+#endif
+
+#if !defined(PIN_QSPI_SCK) || !defined(PIN_QSPI_CS) || !defined(PIN_QSPI_IO0) || \
+    !defined(PIN_QSPI_IO1) || !defined(PIN_QSPI_IO2) || !defined(PIN_QSPI_IO3)
+  #error "Board package without QSPI pin definitions: the session log needs the external flash."
 #endif
 
 #ifndef PIN_LSM6DS3TR_C_INT1
@@ -163,12 +174,11 @@ const float    CAL_MIN_ANGLE_DEG = 15.0;  // minimum angle between calibration s
 const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration measurement
 
 // Shot counter
-const uint8_t  SLOT_COUNT      = 32;
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "2.1";
-const uint8_t  PROTO_VERSION     = 4;
+const char*    FW_VERSION        = "3.2";
+const uint8_t  PROTO_VERSION     = 6;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -289,14 +299,22 @@ const SettingDef SETTINGS[] = {
 const uint8_t SETTING_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
 
 // ============================================================================
-// SHOT LOG (stored in flash automatically)
+// SESSION LOG on the external 2 MB QSPI flash
 // ============================================================================
-#define SLOT_USED     0x01
+// Records of 64 bytes are appended in a ring over the whole chip. Each record
+// has a magic, a running write number (seq) and a CRC, so a record torn by a
+// power loss is detected and skipped. Before a 4 KB sector is reused, it is
+// erased; the oldest sessions are overwritten only when the chip is full
+// (about 32,000 sessions).
 #define SLOT_MISMATCH 0x02   // at least one end invalid or accepted with "yes" despite mismatch
 #define SLOT_MANUAL   0x04
 
-struct ShotSlot {
-  uint32_t id;             // running session number (unique per log epoch)
+struct __attribute__((packed, aligned(4))) LogRec {
+  uint32_t magic;          // REC_MAGIC
+  uint32_t seq;            // write order on this flash (1, 2, 3 ...)
+  uint32_t epoch;          // log key part 1 (random per log, kept on import)
+  uint32_t id;             // log key part 2 (session number)
+  uint32_t start;          // session start, unix seconds, 0 = unknown
   uint16_t shots;          // total shots (sensor, corrected by "yes")
   uint16_t scores;         // validly scored arrows
   uint16_t avgX100;        // average of valid arrows x 100
@@ -305,28 +323,76 @@ struct ShotSlot {
   uint16_t invalidEnds;    // invalid ends
   uint16_t invalidArrows;  // arrows with 0 points (invalid)
   uint16_t xCount;         // inner tens (X), included in scores
+  uint8_t  flags;          // SLOT_MISMATCH / SLOT_MANUAL
+  uint8_t  reserved[23];   // room for later fields, kept 0xFF
+  uint32_t crc;            // CRC32 over the first 60 bytes
+};
+static_assert(sizeof(LogRec) == 64, "LogRec must be 64 bytes");
+typedef bool (*LogVisitor)(const LogRec&);   // callback for logForEach()
+
+const uint32_t REC_MAGIC       = 0x31565531;              // "1UV1"
+const uint32_t QF_SIZE         = 2UL * 1024UL * 1024UL;   // P25Q16H: 2 MB
+const uint32_t QF_SECTOR       = 4096;
+const uint16_t QF_SECTORS      = QF_SIZE / QF_SECTOR - 1; // 511 for the log ring
+const uint32_t QF_TEST_ADDR    = (QF_SIZE / QF_SECTOR - 1) * QF_SECTOR;  // last sector: "log test" only
+const uint16_t RECS_PER_SECTOR = QF_SECTOR / sizeof(LogRec); // 64
+const uint16_t LOG_PRINT_LAST  = 20;                      // "log" in the terminal
+
+bool     qfOk      = false;          // external flash answered at boot
+uint32_t qfJedec   = 0;              // manufacturer / type / capacity id
+uint32_t sectorFirstSeq[QF_SECTORS]; // seq of the first record per sector, 0 = empty
+uint32_t logHeadAddr = 0;            // next write address
+uint32_t logLastSeq  = 0;            // seq of the newest record
+uint32_t logCount    = 0;            // valid records on the chip
+String   logError;                   // reason of the last failed flash access
+uint8_t  qfStatus1 = 0, qfStatus2 = 0; // status registers read at boot
+bool     qfUnprotected = false;      // write protection was found and cleared
+
+// RAM only: when recent sessions were saved (age for the app, lost on reboot)
+const uint8_t RECENT_SAVES = 16;
+uint32_t recentSeq[RECENT_SAVES];
+uint32_t recentMs[RECENT_SAVES];
+uint8_t  recentNext = 0;
+
+// Small state file in internal flash
+struct ShotState {
+  uint32_t magic;
+  uint8_t  shotsOn;   // counter on/off
+  uint8_t  pad[3];
+  uint32_t epoch;     // log key part 1 for new sessions
+  uint32_t lastId;    // last session number handed out
+};
+const uint32_t STATE_MAGIC = 0x53545331;   // "1STS"
+const char*    STATE_FILE  = "/shotstate.bin";
+ShotState shotState;
+
+// Log format of firmware 1.2 - 2.1 (internal flash, 32 slots), for migration
+struct LegacySlot {
+  uint32_t id;
+  uint16_t shots, scores, avgX100, minutes, ends, invalidEnds, invalidArrows, xCount;
   uint8_t  flags;
   uint8_t  pad;
 };
-
-struct ShotLog {
+const uint8_t LEGACY_SLOTS = 32;
+struct LegacyLog {
   uint32_t magic;
-  uint8_t  shotsOn;   // counter on/off
-  uint8_t  next;      // next slot to write
+  uint8_t  shotsOn;
+  uint8_t  next;
   uint8_t  pad[2];
-  uint32_t epoch;     // random id of this log, new whenever the log starts empty
-  uint32_t seq;       // last session number handed out
-  ShotSlot slots[SLOT_COUNT];
+  uint32_t epoch;
+  uint32_t seq;
+  LegacySlot slots[LEGACY_SLOTS];
 };
+const uint32_t LEGACY_MAGIC  = 0x53484F04;
+const char*    LEGACY_FILE   = "/shots.bin";
+const char*    LEGACY_BACKUP = "/shots.old";
+uint8_t migratedCount = 0;   // sessions taken over at this boot
 
-const uint32_t LOG_MAGIC = 0x53484F04;
-const char*    LOG_FILE  = "/shots.bin";
-
-ShotLog shotLog;
-
-// RAM only: when each slot was saved (lost on reboot -> age unknown)
-uint32_t slotSavedMs[SLOT_COUNT];
-bool     slotSavedKnown[SLOT_COUNT];
+// Clock, set by the app ("time <unix> [tz minutes]"), valid until reboot
+bool     clockValid = false;
+uint32_t clockUnix  = 0;     // unix seconds at clockMs
+uint32_t clockMs    = 0;
+int16_t  clockTzMin = 0;     // phone's offset to UTC in minutes
 
 // ============================================================================
 // TILT: calibration and on/off (stored in flash automatically)
@@ -628,39 +694,414 @@ bool cfgSave() {
   return true;
 }
 
-void logLoad() {
-  memset(&shotLog, 0, sizeof(shotLog));
-  shotLog.magic = LOG_MAGIC;
+// ----------------------------------------------------------------------------
+// State file (counter on/off, epoch, session numbers)
+// ----------------------------------------------------------------------------
+bool stateLoad() {
+  memset(&shotState, 0, sizeof(shotState));
+  shotState.magic = STATE_MAGIC;
   File f(InternalFS);
-  if (f.open(LOG_FILE, FILE_O_READ)) {
-    ShotLog tmp;
-    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) &&
-        tmp.magic == LOG_MAGIC && tmp.next < SLOT_COUNT) {
-      shotLog = tmp;
-    }
-    f.close();
-  }
+  if (!f.open(STATE_FILE, FILE_O_READ)) return false;
+  ShotState tmp;
+  const bool ok = f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == STATE_MAGIC;
+  f.close();
+  if (ok) shotState = tmp;
+  return ok;
 }
 
-bool logSave() {
-  InternalFS.remove(LOG_FILE);
+bool stateSave() {
+  InternalFS.remove(STATE_FILE);
   File f(InternalFS);
-  if (!f.open(LOG_FILE, FILE_O_WRITE)) return false;
-  f.write((const uint8_t*)&shotLog, sizeof(shotLog));
+  if (!f.open(STATE_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)&shotState, sizeof(shotState));
   f.close();
   return true;
 }
 
 // Give a fresh log a random epoch, so the app can tell logs apart
 void ensureLogEpoch() {
-  if (shotLog.epoch != 0) return;
+  if (shotState.epoch != 0) return;
   uint32_t e = 0;
   for (uint8_t tries = 0; tries < 50 && e == 0; tries++) {
     if (sd_rand_application_vector_get((uint8_t*)&e, sizeof(e)) != 0) e = 0;
     if (e == 0) delay(2);
   }
   if (e == 0) e = millis() | 1;   // fallback, should not happen
-  shotLog.epoch = e;
+  shotState.epoch = e;
+}
+
+// ----------------------------------------------------------------------------
+// Clock from the app
+// ----------------------------------------------------------------------------
+uint32_t unixAt(uint32_t ms) {
+  if (!clockValid) return 0;
+  return clockUnix + (int32_t)(ms - clockMs) / 1000;
+}
+
+// "2026-09-25 18:03" in the phone's local time
+String fmtUnix(uint32_t t) {
+  if (t == 0) return "date unknown";
+  int32_t s = (int32_t)t + clockTzMin * 60;
+  int32_t days = s / 86400, rem = s % 86400;
+  if (rem < 0) { rem += 86400; days--; }
+  // civil date from days since 1970-01-01 (H. Hinnant)
+  days += 719468;
+  const int32_t era = (days >= 0 ? days : days - 146096) / 146097;
+  const uint32_t doe = (uint32_t)(days - era * 146097);
+  const uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const uint32_t mp  = (5 * doy + 2) / 153;
+  const uint32_t d   = doy - (153 * mp + 2) / 5 + 1;
+  const uint32_t m   = mp < 10 ? mp + 3 : mp - 9;
+  const int32_t  y   = (int32_t)yoe + era * 400 + (m <= 2);
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04ld-%02lu-%02lu %02ld:%02ld",
+           (long)y, (unsigned long)m, (unsigned long)d, (long)(rem / 3600), (long)((rem / 60) % 60));
+  return String(buf);
+}
+
+// ----------------------------------------------------------------------------
+// External flash (QSPI). Only powered up for an access, then deep power-down.
+// ----------------------------------------------------------------------------
+bool qspiOn = false;
+
+uint8_t qspiPin(uint32_t arduinoPin) { return (uint8_t)g_ADigitalPinMap[arduinoPin]; }
+
+nrf_qspi_cinstr_conf_t qspiInstr(uint8_t opcode, nrf_qspi_cinstr_len_t len) {
+  nrf_qspi_cinstr_conf_t c;
+  memset(&c, 0, sizeof(c));
+  c.opcode    = opcode;
+  c.length    = len;
+  c.io2_level = true;    // WP# and HOLD# inactive
+  c.io3_level = true;
+  c.wipwait   = false;
+  c.wren      = false;
+  return c;
+}
+
+uint8_t qspiReadStatus(uint8_t opcode) {   // 0x05 = status 1, 0x35 = status 2
+  uint8_t v[2] = {0, 0};
+  nrf_qspi_cinstr_conf_t c = qspiInstr(opcode, NRF_QSPI_CINSTR_LEN_2B);
+  nrfx_qspi_cinstr_xfer(&c, NULL, v);
+  return v[0];
+}
+
+// Wait until the flash finished programming / erasing (WIP bit in status 1)
+bool qspiWaitReady(uint32_t timeoutMs) {
+  const uint32_t t0 = millis();
+  while (qspiReadStatus(0x05) & 0x01) {
+    if (millis() - t0 > timeoutMs) { logError = "flash busy timeout"; return false; }
+    delay(1);
+  }
+  return true;
+}
+
+bool qspiOpen() {
+  if (qspiOn) return true;
+  nrfx_qspi_config_t c;
+  memset(&c, 0, sizeof(c));
+  c.xip_offset        = 0;
+  c.pins.sck_pin      = qspiPin(PIN_QSPI_SCK);
+  c.pins.csn_pin      = qspiPin(PIN_QSPI_CS);
+  c.pins.io0_pin      = qspiPin(PIN_QSPI_IO0);
+  c.pins.io1_pin      = qspiPin(PIN_QSPI_IO1);
+  c.pins.io2_pin      = qspiPin(PIN_QSPI_IO2);
+  c.pins.io3_pin      = qspiPin(PIN_QSPI_IO3);
+  c.prot_if.readoc    = NRF_QSPI_READOC_FASTREAD;   // single line: no quad-enable bit needed
+  c.prot_if.writeoc   = NRF_QSPI_WRITEOC_PP;
+  c.prot_if.addrmode  = NRF_QSPI_ADDRMODE_24BIT;
+  c.prot_if.dpmconfig = false;
+  c.phy_if.sck_delay  = 10;
+  c.phy_if.dpmen      = false;
+  c.phy_if.spi_mode   = NRF_QSPI_MODE_0;
+  c.phy_if.sck_freq   = NRF_QSPI_FREQ_32MDIV4;      // 8 MHz, plenty for 64-byte records
+  c.irq_priority      = 7;
+  if (nrfx_qspi_init(&c, NULL, NULL) != NRFX_SUCCESS) return false;
+  qspiOn = true;
+  nrf_qspi_cinstr_conf_t wake = qspiInstr(0xAB, NRF_QSPI_CINSTR_LEN_1B);  // release deep power-down
+  nrfx_qspi_cinstr_xfer(&wake, NULL, NULL);
+  delayMicroseconds(50);
+  return true;
+}
+
+void qspiClose() {
+  if (!qspiOn) return;
+  qspiWaitReady(400);
+  nrf_qspi_cinstr_conf_t dpd = qspiInstr(0xB9, NRF_QSPI_CINSTR_LEN_1B);   // deep power-down
+  nrfx_qspi_cinstr_xfer(&dpd, NULL, NULL);
+  nrfx_qspi_uninit();
+  *(volatile uint32_t*)0x40029054UL = 1;   // nRF52840 anomaly 122: no current after disabling QSPI
+  const uint8_t cs = qspiPin(PIN_QSPI_CS);  // keep the chip deselected
+  nrf_gpio_cfg_output(cs);
+  nrf_gpio_pin_set(cs);
+  qspiOn = false;
+}
+
+uint32_t qspiReadJedec() {
+  uint8_t id[4] = {0, 0, 0, 0};
+  nrf_qspi_cinstr_conf_t c = qspiInstr(0x9F, NRF_QSPI_CINSTR_LEN_4B);
+  if (nrfx_qspi_cinstr_xfer(&c, NULL, id) != NRFX_SUCCESS) return 0;
+  return ((uint32_t)id[0] << 16) | ((uint32_t)id[1] << 8) | id[2];
+}
+
+bool qfRead(uint32_t addr, LogRec& r) {
+  if (!qspiWaitReady(400)) return false;
+  if (nrfx_qspi_read(&r, sizeof(r), addr) != NRFX_SUCCESS) { logError = "read call failed"; return false; }
+  return true;
+}
+
+bool qfWrite(uint32_t addr, const LogRec& r) {
+  if (!qspiWaitReady(400)) return false;
+  if (nrfx_qspi_write(&r, sizeof(r), addr) != NRFX_SUCCESS) { logError = "write call failed"; return false; }
+  return qspiWaitReady(50);
+}
+
+bool qfEraseSector(uint32_t addr) {
+  if (!qspiWaitReady(400)) return false;
+  if (nrfx_qspi_erase(NRF_QSPI_ERASE_LEN_4KB, addr) != NRFX_SUCCESS) { logError = "erase call failed"; return false; }
+  return qspiWaitReady(500);
+}
+
+// Clear block-protection bits (BP0-BP4 in status 1) if the chip came protected
+void qspiUnprotect() {
+  qfStatus1 = qspiReadStatus(0x05);
+  qfStatus2 = qspiReadStatus(0x35);
+  if ((qfStatus1 & 0x7C) == 0) return;
+  uint8_t sr[2] = { (uint8_t)(qfStatus1 & ~0x7C), qfStatus2 };   // keep SR2 (quad enable etc.)
+  nrf_qspi_cinstr_conf_t c = qspiInstr(0x01, NRF_QSPI_CINSTR_LEN_3B);
+  c.wren = true;                                                    // write enable first
+  nrfx_qspi_cinstr_xfer(&c, sr, NULL);
+  qspiWaitReady(100);
+  qfUnprotected = (qspiReadStatus(0x05) & 0x7C) == 0;
+}
+
+uint32_t crc32(const void* data, size_t len) {
+  const uint8_t* p = (const uint8_t*)data;
+  uint32_t c = 0xFFFFFFFF;
+  while (len--) {
+    c ^= *p++;
+    for (uint8_t k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320 & (0 - (c & 1)));
+  }
+  return ~c;
+}
+
+bool recValid(const LogRec& r) {
+  return r.magic == REC_MAGIC && r.seq != 0 && r.crc == crc32(&r, 60);
+}
+
+bool recBlank(const LogRec& r) {
+  const uint32_t* w = (const uint32_t*)&r;
+  for (uint8_t i = 0; i < sizeof(LogRec) / 4; i++) if (w[i] != 0xFFFFFFFF) return false;
+  return true;
+}
+
+// Seq numbers on the chip are gapless from the oldest sector to the newest record
+// (seq only advances on a verified write, and whole sectors are erased from the
+// oldest end), so the count follows from the smallest first-seq.
+void logRecount() {
+  uint32_t oldest = 0;
+  for (uint16_t s = 0; s < QF_SECTORS; s++) {
+    if (sectorFirstSeq[s] && (oldest == 0 || sectorFirstSeq[s] < oldest)) oldest = sectorFirstSeq[s];
+  }
+  logCount = oldest ? logLastSeq - oldest + 1 : 0;
+}
+
+// Find the newest record and the next write position (reads 512 + up to 64 records).
+// Invariant: every sector holds a gapless prefix of valid records; anything
+// unexpected makes the writer continue in the next sector.
+void logScan() {
+  memset(sectorFirstSeq, 0, sizeof(sectorFirstSeq));
+  logHeadAddr = 0; logLastSeq = 0; logCount = 0;
+  int16_t head = -1;
+  uint32_t best = 0;
+  LogRec r;
+  for (uint16_t s = 0; s < QF_SECTORS; s++) {
+    if (qfRead((uint32_t)s * QF_SECTOR, r) && recValid(r)) {
+      sectorFirstSeq[s] = r.seq;
+      if (r.seq > best) { best = r.seq; head = s; }
+    }
+  }
+  if (head < 0) return;                     // empty log
+  uint16_t i = 0;
+  for (; i < RECS_PER_SECTOR; i++) {
+    if (!qfRead((uint32_t)head * QF_SECTOR + i * sizeof(LogRec), r) || !recValid(r)) break;
+    logLastSeq = r.seq;
+  }
+  logHeadAddr = (i < RECS_PER_SECTOR) ? (uint32_t)head * QF_SECTOR + i * sizeof(LogRec)
+                                      : (uint32_t)((head + 1) % QF_SECTORS) * QF_SECTOR;
+  logRecount();
+}
+
+// Append one record; fills magic, seq and crc. Returns false on a write error.
+// justSaved: a session that ended now (its age is reported to the app); false
+// for sessions taken over or imported, whose age is unknown.
+bool logAppend(LogRec& r, bool justSaved) {
+  if (!qfOk) { logError = "log flash not available"; return false; }
+  if (!qspiOpen()) { logError = "QSPI init failed"; return false; }
+  logError = "";
+  bool ok = false;
+  for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+    const uint16_t sec = logHeadAddr / QF_SECTOR;
+    LogRec probe;
+    if (!qfRead(logHeadAddr, probe)) break;
+    if (!recBlank(probe)) {
+      // Starting a sector with old data (ring wrapped, or factory content): erase it
+      if (logHeadAddr % QF_SECTOR != 0) {        // garbage mid-sector: continue in the next sector
+        logHeadAddr = (uint32_t)((sec + 1) % QF_SECTORS) * QF_SECTOR;
+        continue;
+      }
+      sectorFirstSeq[sec] = 0;
+      if (!qfEraseSector(logHeadAddr)) break;
+      logRecount();
+    }
+    memset(r.reserved, 0xFF, sizeof(r.reserved));
+    r.magic = REC_MAGIC;
+    r.seq   = logLastSeq + 1;
+    r.crc   = crc32(&r, 60);
+    LogRec check;
+    ok = qfWrite(logHeadAddr, r) && qfRead(logHeadAddr, check);
+    if (ok && memcmp(&check, &r, sizeof(r)) != 0) { ok = false; logError = "read-back differs (write protected?)"; }
+    if (ok) {
+      if (logHeadAddr % QF_SECTOR == 0) sectorFirstSeq[sec] = r.seq;
+      logLastSeq = r.seq;
+      logRecount();
+      logHeadAddr += sizeof(LogRec);
+      if (logHeadAddr % QF_SECTOR == 0) logHeadAddr = (uint32_t)((sec + 1) % QF_SECTORS) * QF_SECTOR;
+    } else {
+      // A failed write leaves a broken slot: continue in the next sector so
+      // every sector stays a gapless run of valid records
+      logHeadAddr = (uint32_t)((sec + 1) % QF_SECTORS) * QF_SECTOR;
+    }
+  }
+  qspiClose();
+  if (ok && justSaved) {
+    recentSeq[recentNext] = r.seq;
+    recentMs[recentNext]  = millis();
+    recentNext = (recentNext + 1) % RECENT_SAVES;
+  }
+  return ok;
+}
+
+// Call fn for every record with seq > since, oldest first. Stops when fn returns false.
+void logForEach(uint32_t since, LogVisitor fn) {
+  if (!qfOk || logCount == 0 || !qspiOpen()) return;
+  const uint16_t headSec = (logHeadAddr / QF_SECTOR + QF_SECTORS - (logHeadAddr % QF_SECTOR == 0 ? 1 : 0)) % QF_SECTORS;
+  LogRec r;
+  bool go = true;
+  for (uint16_t n = 1; n <= QF_SECTORS && go; n++) {
+    const uint16_t s = (headSec + n) % QF_SECTORS;          // oldest sector first
+    const uint32_t first = sectorFirstSeq[s];
+    if (!first || first + RECS_PER_SECTOR - 1 <= since) continue;
+    uint16_t i = (since >= first) ? (uint16_t)(since - first + 1) : 0;
+    for (; i < RECS_PER_SECTOR && go; i++) {
+      if (!qfRead((uint32_t)s * QF_SECTOR + i * sizeof(LogRec), r) || !recValid(r)) break;
+      if (r.seq > since) go = fn(r);
+    }
+  }
+  qspiClose();
+}
+
+// Step-by-step check of the external flash, uses its last sector only
+void logTest() {
+  auto step = [](const String& name, bool ok, const String& detail) {
+    say(name + ": " + (ok ? "ok" : "FAILED") + (detail.length() ? " (" + detail + ")" : ""),
+        "{\"t\":\"logtest\",\"step\":" + jstr(name) + ",\"ok\":" + jbool(ok) + ",\"detail\":" + jstr(detail) + "}");
+  };
+  logError = "";
+  const uint32_t t0 = millis();
+  if (!qspiOpen()) { step("QSPI init", false, ""); return; }
+  step("QSPI init", true, "");
+  char buf[40];
+  const uint32_t jed = qspiReadJedec();
+  snprintf(buf, sizeof(buf), "%06lX, expected 856015", (unsigned long)jed);
+  step("JEDEC id", jed != 0 && jed != 0xFFFFFF, buf);
+  const uint8_t s1 = qspiReadStatus(0x05), s2 = qspiReadStatus(0x35);
+  snprintf(buf, sizeof(buf), "SR1 %02X, SR2 %02X%s", s1, s2, (s1 & 0x7C) ? ", PROTECTED" : "");
+  step("status", (s1 & 0x7C) == 0 && !(s1 & 0x01), buf);
+  bool ok = qfEraseSector(QF_TEST_ADDR);
+  step("erase test sector", ok, logError);
+  LogRec w, r;
+  memset(&w, 0xA5, sizeof(w));
+  w.seq = millis();
+  ok = ok && qfWrite(QF_TEST_ADDR, w);
+  step("write", ok, logError);
+  ok = ok && qfRead(QF_TEST_ADDR, r);
+  const bool same = ok && memcmp(&w, &r, sizeof(w)) == 0;
+  snprintf(buf, sizeof(buf), "first bytes %02X %02X %02X %02X", ((uint8_t*)&r)[0], ((uint8_t*)&r)[1],
+           ((uint8_t*)&r)[2], ((uint8_t*)&r)[3]);
+  step("read back", same, buf);
+  qspiClose();
+  step("done", same, String(millis() - t0) + " ms");
+}
+
+// Is a session with this log key already on the chip? (reads all records)
+static uint32_t findEpoch, findId;
+static bool     findHit;
+bool logHasKey(uint32_t epoch, uint32_t id) {
+  findEpoch = epoch; findId = id; findHit = false;
+  logForEach(0, [](const LogRec& r) {
+    if (r.epoch == findEpoch && r.id == findId) { findHit = true; return false; }
+    return true;
+  });
+  return findHit;
+}
+
+// Take over the internal-flash log of firmware 1.2 - 2.1 once
+void migrateLegacyLog(bool stateFound) {
+  File f(InternalFS);
+  if (!f.open(LEGACY_FILE, FILE_O_READ)) return;
+  LegacyLog* L = (LegacyLog*)malloc(sizeof(LegacyLog));
+  if (!L) { f.close(); return; }
+  const bool ok = f.read(L, sizeof(LegacyLog)) == (int)sizeof(LegacyLog) && L->magic == LEGACY_MAGIC;
+  f.close();
+  if (!ok) { free(L); return; }             // unknown format: leave the file alone
+
+  if (!stateFound) {                        // counter state and numbering come along
+    shotState.shotsOn = L->shotsOn;
+    shotState.epoch   = L->epoch;
+    shotState.lastId  = L->seq;
+    stateSave();
+  }
+
+  if (qfOk && logCount == 0) {
+    uint8_t order[LEGACY_SLOTS], used = 0;
+    for (uint8_t i = 0; i < LEGACY_SLOTS; i++) if (L->slots[i].flags & 0x01) order[used++] = i;
+    for (uint8_t i = 1; i < used; i++) {     // oldest first (by session number)
+      const uint8_t k = order[i];
+      int8_t j = i - 1;
+      while (j >= 0 && L->slots[order[j]].id > L->slots[k].id) { order[j + 1] = order[j]; j--; }
+      order[j + 1] = k;
+    }
+    uint8_t written = 0;
+    for (uint8_t i = 0; i < used; i++) {
+      const LegacySlot& s = L->slots[order[i]];
+      LogRec r;
+      memset(&r, 0, sizeof(r));
+      r.epoch = L->epoch;  r.id = s.id;  r.start = 0;
+      r.shots = s.shots;   r.scores = s.scores;  r.avgX100 = s.avgX100;  r.minutes = s.minutes;
+      r.ends = s.ends;     r.invalidEnds = s.invalidEnds;  r.invalidArrows = s.invalidArrows;
+      r.xCount = s.xCount; r.flags = s.flags & (SLOT_MISMATCH | SLOT_MANUAL);
+      if (logAppend(r, false)) written++;
+    }
+    if (written == used) {                  // verified: keep the old file as a backup copy
+      InternalFS.remove(LEGACY_BACKUP);
+      InternalFS.rename(LEGACY_FILE, LEGACY_BACKUP);
+      migratedCount = written;
+    }
+  }
+  free(L);
+}
+
+void logInit() {
+  qfOk = false;
+  if (qspiOpen()) {
+    qfJedec = qspiReadJedec();
+    qfOk = qfJedec != 0 && qfJedec != 0xFFFFFF;
+    if (qfOk) { qspiUnprotect(); logScan(); }
+    qspiClose();                             // deep power-down right away
+  }
+  const bool stateFound = stateLoad();
+  migrateLegacyLog(stateFound);
 }
 
 void levelLoad() {
@@ -1215,12 +1656,12 @@ String fmtAvg(uint32_t sum, uint16_t count) {
 }
 
 String sessionJson() {
-  String j = "{\"t\":\"session\",\"counter\":" + jbool(shotLog.shotsOn) +
+  String j = "{\"t\":\"session\",\"counter\":" + jbool(shotState.shotsOn) +
              ",\"active\":" + jbool(sessionActive);
   if (sessionActive) {
     // epoch + nextId = the key this session will get in the log, so the app
     // can remember its start time even if the board restarts before import
-    j += ",\"epoch\":" + String(shotLog.epoch) + ",\"nextId\":" + String(shotLog.seq + 1) +
+    j += ",\"epoch\":" + String(shotState.epoch) + ",\"nextId\":" + String(shotState.lastId + 1) +
          ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
          ",\"ends\":" + String(endCount) + ",\"invalidEnds\":" + String(invalidEnds) +
          ",\"shots\":" + String(shotCount) + ",\"scored\":" + String(scoreCount) +
@@ -1247,7 +1688,7 @@ void startSession(uint32_t now) {
 // True if an impact at this time would be counted (outside the lockout)
 bool shotAllowed(uint32_t now) {
   // Signed compare: an interrupt timestamp can be slightly older than lastShotMs
-  return shotLog.shotsOn && (int32_t)(now - lastShotMs) >= (int32_t)cfg.lockoutMs;
+  return shotState.shotsOn && (int32_t)(now - lastShotMs) >= (int32_t)cfg.lockoutMs;
 }
 
 String shotGText() {
@@ -1304,10 +1745,13 @@ void closeEndInvalid(uint16_t arrows, const String& reason) {
   emit(sessionJson());
 }
 
-String slotJson(const ShotSlot& s, uint8_t i, int16_t idx) {
+String slotJson(const LogRec& s) {
   String ago = "null";
-  if (idx >= 0 && slotSavedKnown[idx]) ago = String((millis() - slotSavedMs[idx]) / 60000UL);
-  return "{\"t\":\"slot\",\"i\":" + String(i) + ",\"id\":" + String(s.id) +
+  for (uint8_t k = 0; k < RECENT_SAVES; k++) {
+    if (recentSeq[k] == s.seq && s.seq != 0) ago = String((millis() - recentMs[k]) / 60000UL);
+  }
+  return "{\"t\":\"slot\",\"seq\":" + String(s.seq) + ",\"epoch\":" + String(s.epoch) +
+         ",\"id\":" + String(s.id) + ",\"start\":" + (s.start ? String(s.start) : String("null")) +
          ",\"ago\":" + ago + ",\"ends\":" + String(s.ends) +
          ",\"shots\":" + String(s.shots) + ",\"scored\":" + String(s.scores) +
          ",\"avg\":" + String(s.avgX100 / 100.0f, 2) + ",\"x\":" + String(s.xCount) +
@@ -1315,6 +1759,17 @@ String slotJson(const ShotSlot& s, uint8_t i, int16_t idx) {
          ",\"invalidArrows\":" + String(s.invalidArrows) +
          ",\"mismatch\":" + jbool(s.flags & SLOT_MISMATCH) +
          ",\"manual\":" + jbool(s.flags & SLOT_MANUAL) + "}";
+}
+
+String slotLine(const LogRec& s) {
+  String line = "#" + String(s.seq) + " " + fmtUnix(s.start) + ": " + String(s.ends) + " ends, " +
+                String(s.shots) + " shots, " + String(s.scores) + " scored, avg " +
+                String(s.avgX100 / 100.0f, 2) + ", " + String(s.xCount) + " X, " + String(s.minutes) + " min";
+  if (s.invalidEnds > 0) {
+    line += " | invalid: " + String(s.invalidEnds) + " ends, " + String(s.invalidArrows) + " arrows";
+  }
+  if (s.flags & SLOT_MISMATCH) line += "  [!]";
+  return line;
 }
 
 // Close the session and write it to the next slot
@@ -1342,7 +1797,7 @@ void finishSession(bool manual) {
     return;
   }
 
-  ShotSlot s;
+  LogRec s;
   memset(&s, 0, sizeof(s));
   s.shots         = shotCount;
   s.scores        = scoreCount;
@@ -1352,25 +1807,25 @@ void finishSession(bool manual) {
   s.invalidEnds   = invalidEnds;
   s.invalidArrows = invalidArrows;
   s.xCount        = xCount;
-  s.flags         = SLOT_USED | (manual ? SLOT_MANUAL : 0);
+  s.flags         = manual ? SLOT_MANUAL : 0;
   if (invalidEnds > 0 || mismatchAccepted) s.flags |= SLOT_MISMATCH;
 
   ensureLogEpoch();
-  s.id = ++shotLog.seq;
-  const uint8_t idx = shotLog.next;
-  shotLog.slots[idx]  = s;
-  slotSavedMs[idx]    = now;
-  slotSavedKnown[idx] = true;
-  shotLog.next = (shotLog.next + 1) % SLOT_COUNT;
-  const bool ok = logSave();
+  s.epoch = shotState.epoch;
+  s.id    = ++shotState.lastId;
+  s.start = unixAt(sessionStartMs);
+  stateSave();                         // session number must never repeat
+  const bool ok = logAppend(s, true);
 
   say(String(manual ? "Session ended" : "Session ended automatically (" + String(cfg.sessionEndMin) + " min without a shot)") +
       ": " + String(s.ends) + " ends (" + String(s.invalidEnds) + " invalid), " +
       String(s.scores) + " arrows scored, avg " + String(s.avgX100 / 100.0f, 2) +
       ", " + String(s.xCount) + " X, " + String(s.minutes) + " min" +
-      (ok ? "" : "  ERROR while saving!"),
+      (ok ? "" : "  ERROR: could not write to the log flash (" + logError + ")!"),
       "{\"t\":\"sessionEnd\",\"manual\":" + jbool(manual) + ",\"stored\":" + jbool(ok) +
-      ",\"epoch\":" + String(shotLog.epoch) + ",\"slot\":" + slotJson(s, 1, idx) + "}");
+      ",\"epoch\":" + String(s.epoch) + ",\"id\":" + String(s.id) + ",\"seq\":" + String(ok ? s.seq : 0) +
+      (ok ? String("") : ",\"error\":" + jstr(logError)) + "}");
+  emit(slotJson(s));                   // details on their own line (keeps lines short)
 }
 
 String sessionLine() {
@@ -1382,56 +1837,75 @@ String sessionLine() {
          fmtAvg(scoreSum, scoreCount) + ", " + String(xCount) + " X, " + String(mins) + " min";
 }
 
-void printLog() {
-  uint8_t used = 0;
-  for (uint8_t i = 0; i < SLOT_COUNT; i++) if (shotLog.slots[i].flags & SLOT_USED) used++;
+String logInfoJson() {
+  char jed[8];
+  snprintf(jed, sizeof(jed), "%06lX", (unsigned long)qfJedec);
+  return "{\"t\":\"loginfo\",\"ok\":" + jbool(qfOk) + ",\"jedec\":\"" + String(jed) + "\"" +
+         ",\"count\":" + String(logCount) + ",\"capacity\":" + String((uint32_t)(QF_SECTORS - 1) * RECS_PER_SECTOR) +
+         ",\"last\":" + String(logLastSeq) + ",\"clock\":" + jbool(clockValid) +
+         ",\"migrated\":" + String(migratedCount) + ",\"error\":" + jstr(logError) + "}";
+}
 
-  if (appMode) sendLine("{\"t\":\"logStart\",\"count\":" + String(used) +
-                        ",\"epoch\":" + String(shotLog.epoch) + "}");
-  else         out("--- Sessions (1 = newest) ---");
+void printLogInfo() {
+  if (appMode) { sendLine(logInfoJson()); return; }
+  char jed[8];
+  snprintf(jed, sizeof(jed), "%06lX", (unsigned long)qfJedec);
+  char sr[24];
+  snprintf(sr, sizeof(sr), "SR1 %02X, SR2 %02X", qfStatus1, qfStatus2);
+  out(String("Log flash: ") + (qfOk ? "OK" : "NOT AVAILABLE") + " (JEDEC " + jed + ", " + sr +
+      (qfUnprotected ? ", write protection cleared" : "") + ")");
+  if (logError.length()) out("Last flash error: " + logError);
+  out("Sessions stored: " + String(logCount) + " of about " +
+      String((uint32_t)(QF_SECTORS - 1) * RECS_PER_SECTOR) + ", newest #" + String(logLastSeq));
+  out(String("Clock: ") + (clockValid ? fmtUnix(unixAt(millis())) : "not set (connect the app)"));
+  if (migratedCount) out("Taken over from the old log at this start: " + String(migratedCount) + " sessions");
+}
 
-  uint8_t shown = 0;
-  for (uint8_t i = 0; i < SLOT_COUNT; i++) {
-    const uint8_t   idx = (shotLog.next + SLOT_COUNT - 1 - i) % SLOT_COUNT;
-    const ShotSlot& s   = shotLog.slots[idx];
-    if (!(s.flags & SLOT_USED)) continue;
-    shown++;
-    if (appMode) { sendLine(slotJson(s, shown, idx)); continue; }
-    String line = String(shown) + ": " + String(s.ends) + " ends, " + String(s.shots) +
-                  " shots, " + String(s.scores) + " scored, avg " +
-                  String(s.avgX100 / 100.0f, 2) + ", " + String(s.xCount) + " X, " +
-                  String(s.minutes) + " min";
-    if (s.invalidEnds > 0) {
-      line += " | invalid: " + String(s.invalidEnds) + " ends, " +
-              String(s.invalidArrows) + " arrows";
-    }
-    if (s.flags & SLOT_MISMATCH) line += "  [!]";
-    out(line);
+// App: every record newer than "since". Terminal: the newest LOG_PRINT_LAST, or all.
+void printLog(uint32_t since, bool all) {
+  if (appMode) {
+    sendLine("{\"t\":\"logStart\",\"since\":" + String(since) + ",\"last\":" + String(logLastSeq) +
+             ",\"total\":" + String(logCount) + ",\"epoch\":" + String(shotState.epoch) + "}");
+    logForEach(since, [](const LogRec& r) { sendLine(slotJson(r)); return true; });
+    sendLine("{\"t\":\"logEnd\",\"last\":" + String(logLastSeq) + "}");
+    return;
   }
-
-  if (appMode)         sendLine("{\"t\":\"logEnd\"}");
-  else if (shown == 0) out("No sessions stored yet.");
+  if (!qfOk) { err("Log flash not available."); return; }
+  if (logCount == 0) { out("No sessions stored yet."); return; }
+  if (all) {
+    out("--- Sessions (oldest first) ---");
+    logForEach(since, [](const LogRec& r) { out(slotLine(r)); return true; });
+    return;
+  }
+  // newest LOG_PRINT_LAST, newest first
+  static LogRec buf[LOG_PRINT_LAST];
+  static uint8_t n;
+  n = 0;
+  const uint32_t from = logLastSeq > LOG_PRINT_LAST ? logLastSeq - LOG_PRINT_LAST : 0;
+  logForEach(from, [](const LogRec& r) { if (n < LOG_PRINT_LAST) buf[n++] = r; return true; });
+  out("--- Newest " + String(n) + " of " + String(logCount) + " sessions ('log all' for all) ---");
+  for (int8_t i = n - 1; i >= 0; i--) out(slotLine(buf[i]));
 }
 
 void handleShots(const String& arg) {
   if (arg == "") {
     if (appMode) { sendLine(sessionJson()); return; }
-    out(String("Shot counter: ") + (shotLog.shotsOn ? "on" : "off"));
+    out(String("Shot counter: ") + (shotState.shotsOn ? "on" : "off"));
     out(sessionLine());
   }
   else if (arg == "on") {
-    shotLog.shotsOn = 1;
-    if (!logSave()) { err("ERROR while saving!"); return; }
+    shotState.shotsOn = 1;
+    if (!stateSave()) { err("ERROR while saving!"); return; }
     say("Shot counter on.", sessionJson());
   }
   else if (arg == "off") {
     if (sessionActive) { err("End the running session first ('shots stop')."); return; }
-    shotLog.shotsOn = 0;
-    if (!logSave()) { err("ERROR while saving!"); return; }
+    shotState.shotsOn = 0;
+    if (!stateSave()) { err("ERROR while saving!"); return; }
     say("Shot counter off.", sessionJson());
   }
   else if (arg == "start") {
-    if (!shotLog.shotsOn) { err("Shot counter is off ('shots on')."); return; }
+    if (!shotState.shotsOn) { err("Shot counter is off ('shots on')."); return; }
     if (sessionActive)    { err("Session already started"); return; }
     startSession(millis());
     say("Session started.", sessionJson());
@@ -1590,7 +2064,11 @@ void printHelp() {
   out("shots start|stop  start/end a session manually");
   out("score 9 x 7 0     score an end (0-10, x = inner ten)");
   out("score skip        end without scores (invalid)");
-  out("log               stored sessions");
+  out("log               newest sessions (log all: all)");
+  out("log since <n>     sessions after #n");
+  out("log info          log flash, number of sessions, clock");
+  out("log put ...       write a session from a backup (used by the app)");
+  out("log test          check the log flash step by step");
   out("level             tilt indicator status");
   out("level on|auto|off tilt indicator always / in sessions / off");
   out("level style normal|inverted  blink faster when tilted / when level");
@@ -1642,14 +2120,68 @@ void enterDfu() {
   sd_nvic_SystemReset();
 }
 
+// "log put <epoch> <id> <start> <ends> <shots> <scored> <avgX100> <x> <min>
+//          <invalidEnds> <invalidArrows> <flags>"
+// Writes a session from a backup into the log, unless its key is already there.
+void logPut(String args) {
+  uint32_t v[12];
+  uint8_t n = 0;
+  args.trim();
+  while (args.length() && n < 12) {
+    int sp = args.indexOf(' ');
+    String tok = sp < 0 ? args : args.substring(0, sp);
+    v[n++] = (uint32_t)strtoul(tok.c_str(), nullptr, 10);
+    args = sp < 0 ? String("") : args.substring(sp + 1);
+    args.trim();
+  }
+  const String key = "{\"t\":\"ack\",\"cmd\":\"put\",\"epoch\":" + String(n > 0 ? v[0] : 0) +
+                     ",\"id\":" + String(n > 1 ? v[1] : 0) + ",\"result\":";
+  if (n != 12 || v[0] == 0 || v[1] == 0) {
+    say("Format: log put <epoch> <id> <start> <ends> <shots> <scored> <avgX100> <x> <min> "
+        "<invalidEnds> <invalidArrows> <flags>", key + "\"error\"}");
+    return;
+  }
+  if (!qfOk) { say("Log flash not available.", key + "\"error\"}"); return; }
+  if (logHasKey(v[0], v[1])) {
+    say("Session " + String(v[0]) + "-" + String(v[1]) + " is already stored.", key + "\"exists\"}");
+    return;
+  }
+  LogRec r;
+  memset(&r, 0, sizeof(r));
+  r.epoch = v[0];  r.id = v[1];  r.start = v[2];
+  r.ends = v[3];   r.shots = v[4];  r.scores = v[5];  r.avgX100 = v[6];  r.xCount = v[7];
+  r.minutes = v[8];  r.invalidEnds = v[9];  r.invalidArrows = v[10];
+  r.flags = v[11] & (SLOT_MISMATCH | SLOT_MANUAL);
+  const bool ok = logAppend(r, false);
+  // Never hand out a session number twice in the current log
+  if (ok && r.epoch == shotState.epoch && r.id > shotState.lastId) { shotState.lastId = r.id; stateSave(); }
+  say(ok ? "Session " + String(v[0]) + "-" + String(v[1]) + " added as #" + String(r.seq) + "."
+         : String("ERROR: could not write to the log flash!"),
+      key + (ok ? "\"added\",\"seq\":" + String(r.seq) + "}" : String("\"error\"}")));
+}
+
+// "time <unix seconds> [offset to UTC in minutes]" from the app
+void setClock(String args) {
+  args.trim();
+  const int sp = args.indexOf(' ');
+  const uint32_t t = (uint32_t)atoll((sp < 0 ? args : args.substring(0, sp)).c_str());
+  if (t < 1600000000UL) { err("Format: time <unix seconds> [tz minutes]"); return; }
+  clockUnix  = t;
+  clockMs    = millis();
+  clockTzMin = sp < 0 ? 0 : (int16_t)args.substring(sp + 1).toInt();
+  clockValid = true;
+  say("Clock set: " + fmtUnix(t), "{\"t\":\"ack\",\"cmd\":\"time\"}");
+}
+
 void appOn() {
   appMode = true;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
-           "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + "}");
+           "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) + "}");
   sendCfg();
   sendLine(statusJson());
   sendLine(sessionJson());
   sendLine(levelJson());
+  sendLine(logInfoJson());
 }
 
 void handleCommand(String line) {
@@ -1700,7 +2232,13 @@ void handleCommand(String line) {
   else if (line.startsWith("shots "))     { String a = line.substring(6); a.trim(); handleShots(a); }
   else if (line == "score")               handleScore("");
   else if (line.startsWith("score "))     handleScore(line.substring(6));
-  else if (line == "log")                 printLog();
+  else if (line == "log")                 printLog(0, appMode);
+  else if (line == "log all")             printLog(0, true);
+  else if (line == "log info")            printLogInfo();
+  else if (line == "log test")            logTest();
+  else if (line.startsWith("log since ")) printLog((uint32_t)line.substring(10).toInt(), true);
+  else if (line.startsWith("time "))      setClock(line.substring(5));
+  else if (line.startsWith("log put "))   logPut(line.substring(8));
   else if (line == "level")               handleLevel("");
   else if (line.startsWith("level "))     { String a = line.substring(6); a.trim(); handleLevel(a); }
   else if (line.startsWith("set "))       handleSet(line.substring(4));
@@ -1872,11 +2410,12 @@ void setup() {
 
   InternalFS.begin();
   cfgLoad();
-  logLoad();
+  // logInit() runs after bleInit(): the random epoch needs the SoftDevice
   levelLoad();
 
   imuOk = imuInit();
   bleInit();
+  logInit();
   chargeInit();
   lastCharge = readCharge();
 
@@ -1921,7 +2460,7 @@ void loop() {
   const bool active = (now - lastMotionMs) < cfg.timeoutS * 1000UL;
 
   // Shot detection only if the counter is on and the bow is in use
-  imuSetFast(active && shotLog.shotsOn);
+  imuSetFast(active && shotState.shotsOn);
 
   // End the session automatically after session_end minutes without a shot
   if (sessionActive && (now - sessionLastShotMs) >= cfg.sessionEndMin * 60000UL) {

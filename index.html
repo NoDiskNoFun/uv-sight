@@ -233,6 +233,8 @@
   #sessDlg h4 { margin: 14px 0 6px; font-size: .95rem; }
   .dist { display: grid; grid-template-columns: 34px 1fr 30px; gap: 4px 8px; align-items: center; font-size: .85rem; }
   .dist .bar { height: 12px; border-radius: 6px; }
+  .sessions li.hidden-entry button { opacity: .55; }
+  .sessions .hid { color: var(--muted); font-size: .85rem; grid-column: 1 / -1; font-style: italic; }
   .rm-choices { display: grid; gap: 10px; margin-top: 4px; }
   .rm-choices .btn { border-radius: var(--radius-s); min-height: 52px; text-align: left; padding: 10px 16px; }
   .rm-choices .btn small { display: block; font-weight: 400; opacity: .8; font-size: .82rem; margin-top: 2px; }
@@ -478,6 +480,11 @@
                style="width:96px;min-height:40px;border-radius:10px;border:2px solid var(--line);background:var(--paper);color:var(--ink);padding:0 8px;font:inherit;text-align:right" aria-label="Battery capacity in mAh">
       </div>
       <div class="switchrow">
+        <div><div class="lbl">Show hidden history entries</div>
+          <div class="desc">Sessions removed from this phone only appear greyed out in History and can be shown again.</div></div>
+        <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show hidden history entries"><span></span></label>
+      </div>
+      <div class="switchrow">
         <div><div class="lbl">Session log on the sight</div>
           <div class="desc">Delete all sessions stored on the sight. The phone keeps its copies.</div></div>
         <button class="btn secondary" id="btnClearLog" style="color:var(--red); box-shadow: inset 0 0 0 2px var(--red)">Clear</button>
@@ -497,6 +504,7 @@
     <div id="sdEnds"></div>
     <div id="sdDist"></div>
     <div class="row" style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px">
+      <button class="btn secondary" id="sdUnhide" hidden>Show again</button>
       <button class="btn secondary" id="sdDelete">Remove…</button>
       <button class="btn" id="sdClose">Close</button>
     </div>
@@ -554,7 +562,7 @@ const PROTO_EXPECTED  = 7;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.4";
+const APP_VERSION     = "3.5";
 
 // ---------------------------------------------------------------------------
 // State
@@ -836,6 +844,11 @@ function handleLine(line) {
       break;
     case "logEnd":
       syncEpoch = null;
+      if (hiddenFetch) {
+        hiddenFetch = false;
+        try { localStorage.setItem(HIDDEN_FETCHED_KEY, "1"); } catch {}
+        renderHistory();
+      }
       if (copyState && copyState.phase === "keys") { copyOnLogEnd(); break; }
       if (syncResync) {                     // start over from the beginning of the sight's log
         syncResync = false;
@@ -861,7 +874,7 @@ function handleLine(line) {
       if (m.cmd === "put") copyOnAck(m);
       if (m.cmd === "del") delOnAck(m);
       if (m.cmd === "clear") {
-        toast(m.ok ? `Log on the sight cleared (${m.count} sessions).` : "Could not clear the sight's log.", !m.ok);
+        toast(m.ok ? `Log on the sight cleared (${m.count} ${m.count === 1 ? "session" : "sessions"}).` : "Could not clear the sight's log.", !m.ok);
         send("log info");
       }
       if (m.cmd === "dfu") toast("The sight restarts as a USB drive. Copy the new firmware onto it.");
@@ -1298,6 +1311,17 @@ const DELETED_MAX = 1000;
 function loadDeleted() {
   try { return new Set(JSON.parse(localStorage.getItem(DELETED_KEY)) || []); } catch { return new Set(); }
 }
+const SHOW_HIDDEN_KEY = "uvsight.showHidden";
+const HIDDEN_FETCHED_KEY = "uvsight.hiddenFetched";
+const showHidden = () => localStorage.getItem(SHOW_HIDDEN_KEY) === "1";
+let hiddenFetch = false;   // a full log answer is running to recover older hidden sessions
+
+function unmarkDeleted(key) {
+  const set = loadDeleted();
+  set.delete(key);
+  try { localStorage.setItem(DELETED_KEY, JSON.stringify([...set])); } catch {}
+}
+
 function markDeleted(key) {
   const list = [...loadDeleted().add(key)].slice(-DELETED_MAX);   // keep the newest entries
   try { localStorage.setItem(DELETED_KEY, JSON.stringify(list)); } catch {}
@@ -1371,7 +1395,18 @@ function saveArchive(a) {
 function archiveSlot(epoch, sl) {
   const a = loadArchive();
   const key = `${epoch}-${sl.id}`;
-  if (loadDeleted().has(key)) return false;     // removed by hand before
+  if (loadDeleted().has(key)) {                 // removed by hand before
+    // Sessions removed before app 3.5 lost their data on the phone: take it
+    // back from the sight, but keep it hidden
+    if (hiddenFetch && !a.some((r) => r.key === key)) {
+      a.push({ key, epoch, id: sl.id, hidden: true,
+        endedAt: sl.start ? sl.start * 1000 + sl.min * 60000 : null, importedAt: Date.now(),
+        ends: sl.ends, shots: sl.shots, scored: sl.scored, avg: sl.avg, x: sl.x, min: sl.min,
+        invalidEnds: sl.invalidEnds, invalidArrows: sl.invalidArrows, mismatch: sl.mismatch, manual: sl.manual });
+      saveArchive(a);
+    }
+    return false;
+  }
   let endedAt = null;
   if (sl.start) endedAt = sl.start * 1000 + sl.min * 60000;                  // stored on the sight
   else if (sl.ago !== null && sl.ago !== undefined) endedAt = Date.now() - sl.ago * 60000;
@@ -1412,7 +1447,7 @@ function fmtDate(r) {
 function renderHistory() {
   const all = loadArchive();
   if (resolveDates(all)) saveArchive(all);
-  const list = sortedArchive();
+  const list = sortedArchive().filter((r) => !r.hidden || showHidden());
   const ul = $("sessionList");
   ul.textContent = "";
   $("historyEmpty").hidden = list.length > 0;
@@ -1435,11 +1470,18 @@ function renderHistory() {
       if (r.mismatch && !r.invalidEnds) parts.push("counts corrected by hand");
       f.textContent = parts.join(", ");
     }
+    if (r.hidden) {
+      li.className = "hidden-entry";
+      const h = document.createElement("span");
+      h.className = "hid";
+      h.textContent = "hidden, removed from this phone";
+      b.appendChild(h);
+    }
     b.addEventListener("click", () => showSession(r));
     li.appendChild(b);
     ul.appendChild(li);
   }
-  renderChart(list);
+  renderChart(list.filter((r) => !r.hidden));
 }
 
 function renderChart(list) {
@@ -1568,6 +1610,8 @@ function showSession(r) {
   const d = $("sessDlg");
   $("sdClose").onclick = () => d.close();
   $("sdDelete").onclick = () => { d.close(); askRemove(r); };
+  $("sdUnhide").hidden = !r.hidden;
+  $("sdUnhide").onclick = () => { d.close(); unhideSession(r); };
   d.showModal();
 }
 
@@ -1576,11 +1620,39 @@ function showSession(r) {
 // ---------------------------------------------------------------------------
 let pendingDel = null;   // { r, timer } while waiting for the sight's answer
 
+// Remove from phone: the session is hidden, its data (and end details) stay
 function removeFromPhone(r) {
+  markDeleted(r.key);
+  const a = loadArchive();
+  const rec = a.find((x) => x.key === r.key);
+  if (rec) { rec.hidden = true; saveArchive(a); }
+  renderHistory();
+}
+
+// Remove completely: the data is gone from the phone as well
+function purgeSession(r) {
   markDeleted(r.key);
   saveArchive(loadArchive().filter((x) => x.key !== r.key));
   const e = loadEnds(); delete e[r.key]; saveEnds(e);
   renderHistory();
+}
+
+function unhideSession(r) {
+  unmarkDeleted(r.key);
+  const a = loadArchive();
+  const rec = a.find((x) => x.key === r.key);
+  if (rec) { delete rec.hidden; saveArchive(a); }
+  renderHistory();
+  toast("Shown in History again.");
+}
+
+// Once, when hidden entries are shown: fetch the whole log to recover sessions
+// that were removed from the phone before their data was kept
+function fetchHiddenOnce() {
+  if (!showHidden() || localStorage.getItem(HIDDEN_FETCHED_KEY) === "1") return;
+  if (state.conn !== "connected" || loadDeleted().size === 0) return;
+  hiddenFetch = true;
+  send("log since 0");
 }
 
 function askRemove(r) {
@@ -1588,6 +1660,7 @@ function askRemove(r) {
   const onSight = Number(r.epoch) > 0 && Number(r.id) > 0;
   $("rmText").textContent = fmtDate(r) + `: ${r.ends} ends, ${r.scored} arrows, average ${Number(r.avg).toFixed(2)}.`;
   $("rmAll").hidden = !onSight;          // CSV-only sessions have no key on the sight
+  $("rmPhone").hidden = !!r.hidden;      // already removed from the phone
   $("rmPhone").onclick = () => {
     d.close();
     removeFromPhone(r);
@@ -1605,7 +1678,7 @@ function askRemove(r) {
   };
   $("rmCancel").onclick = () => d.close();
   d.showModal();
-  $("rmPhone").focus();
+  if (!r.hidden) $("rmPhone").focus();
 }
 
 function delOnAck(m) {
@@ -1615,7 +1688,7 @@ function delOnAck(m) {
   clearTimeout(pendingDel.timer);
   pendingDel = null;
   if (m.result === "deleted" || m.result === "notfound") {
-    removeFromPhone(r);
+    purgeSession(r);
     toast(m.result === "deleted" ? "Removed from this phone and the sight."
                                  : "Removed from this phone. The sight did not have it anymore.");
   } else {
@@ -1817,7 +1890,7 @@ $("importFile").addEventListener("change", () => {
 $("btnToSight").addEventListener("click", copyToSight);
 
 function exportCsv() {
-  const list = sortedArchive();
+  const list = sortedArchive().filter((r) => !r.hidden);
   const head = "epoch,id,start,start_known,fetched,ends,shots,scored,average,x,minutes,invalid_ends,invalid_arrows,corrected,ended_by_hand";
   const rows = list.map((r) => [
     r.epoch ?? "", r.id ?? "",
@@ -2129,6 +2202,15 @@ function onCal(m) {
 
 $("btnSave").addEventListener("click", () => send("save"));
 
+$("showHiddenCb").checked = showHidden();
+$("showHiddenCb").addEventListener("change", () => {
+  try { localStorage.setItem(SHOW_HIDDEN_KEY, $("showHiddenCb").checked ? "1" : "0"); } catch {}
+  renderHistory();
+  if ($("showHiddenCb").checked) {
+    if (state.conn === "connected") fetchHiddenOnce();
+    toast("Hidden entries are shown greyed out in History.");
+  }
+});
 $("btnClearLog").addEventListener("click", clearSightLog);
 $("batCap").value = batteryCapacity();
 $("batCap").addEventListener("change", () => {
@@ -2210,7 +2292,7 @@ document.querySelectorAll("nav button").forEach((b) => {
     if (activeView === "status" && state.conn === "connected" && !confirmOpen) send("status");
     const idle = state.conn === "connected" && !confirmOpen && !awaitingEnd;
     if (activeView === "training" && idle) send("shots");
-    if (activeView === "history"  && idle) requestLog();
+    if (activeView === "history"  && idle) { requestLog(); fetchHiddenOnce(); }
     if (activeView === "settings" && idle) {
       send("level");
       send("log info");

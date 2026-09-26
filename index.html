@@ -233,6 +233,12 @@
   #sessDlg h4 { margin: 14px 0 6px; font-size: .95rem; }
   .dist { display: grid; grid-template-columns: 34px 1fr 30px; gap: 4px 8px; align-items: center; font-size: .85rem; }
   .dist .bar { height: 12px; border-radius: 6px; }
+  .rm-choices { display: grid; gap: 10px; margin-top: 4px; }
+  .rm-choices .btn { border-radius: var(--radius-s); min-height: 52px; text-align: left; padding: 10px 16px; }
+  .rm-choices .btn small { display: block; font-weight: 400; opacity: .8; font-size: .82rem; margin-top: 2px; }
+  .rm-choices .preferred { background: var(--ink); color: var(--paper); }
+  .rm-choices .complete { background: transparent; color: var(--red); box-shadow: inset 0 0 0 2px var(--red); }
+  .rm-choices .cancel { text-align: center; }
   .dist .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
   .chart { background: var(--surface); border-radius: var(--radius-l); padding: 14px 14px 8px; margin-bottom: 14px; }
   .chart h3 { margin: 0 0 6px; font-size: 1rem; }
@@ -471,6 +477,11 @@
         <input type="number" id="batCap" min="10" max="5000" step="1" inputmode="numeric"
                style="width:96px;min-height:40px;border-radius:10px;border:2px solid var(--line);background:var(--paper);color:var(--ink);padding:0 8px;font:inherit;text-align:right" aria-label="Battery capacity in mAh">
       </div>
+      <div class="switchrow">
+        <div><div class="lbl">Session log on the sight</div>
+          <div class="desc">Delete all sessions stored on the sight. The phone keeps its copies.</div></div>
+        <button class="btn secondary" id="btnClearLog" style="color:var(--red); box-shadow: inset 0 0 0 2px var(--red)">Clear</button>
+      </div>
       <div class="switchrow" id="installRow" hidden>
         <div><div class="lbl">Install app</div>
           <div class="desc">Adds UV-Sight to the home screen. It then starts without internet.</div></div>
@@ -486,8 +497,18 @@
     <div id="sdEnds"></div>
     <div id="sdDist"></div>
     <div class="row" style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px">
-      <button class="btn secondary" id="sdDelete" style="background:var(--red); color:#fff">Remove from phone</button>
+      <button class="btn secondary" id="sdDelete">Remove…</button>
       <button class="btn" id="sdClose">Close</button>
+    </div>
+  </dialog>
+
+  <dialog id="rmDlg">
+    <h3>Remove this session?</h3>
+    <p class="muted" id="rmText"></p>
+    <div class="rm-choices">
+      <button class="btn preferred" id="rmPhone">Remove from phone<small>The sight keeps its copy as a backup.</small></button>
+      <button class="btn complete" id="rmAll">Remove completely<small>Also deleted on the sight. Only your backup files still have it.</small></button>
+      <button class="btn secondary cancel" id="rmCancel">Cancel</button>
     </div>
   </dialog>
 
@@ -529,11 +550,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 6;
+const PROTO_EXPECTED  = 7;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.3";
+const APP_VERSION     = "3.4";
 
 // ---------------------------------------------------------------------------
 // State
@@ -838,6 +859,11 @@ function handleLine(line) {
       if (m.cmd === "save") { cfgDirty = false; toast("Settings saved on the sight"); }
       if (m.cmd === "mode" && state.status) state.status.mode = m.mode;
       if (m.cmd === "put") copyOnAck(m);
+      if (m.cmd === "del") delOnAck(m);
+      if (m.cmd === "clear") {
+        toast(m.ok ? `Log on the sight cleared (${m.count} sessions).` : "Could not clear the sight's log.", !m.ok);
+        send("log info");
+      }
       if (m.cmd === "dfu") toast("The sight restarts as a USB drive. Copy the new firmware onto it.");
       break;
     case "cal":
@@ -1541,17 +1567,73 @@ function showSession(r) {
   $("sdDist").innerHTML = scoreDistribution(ends);
   const d = $("sessDlg");
   $("sdClose").onclick = () => d.close();
-  $("sdDelete").onclick = async () => {
-    d.close();
-    const ok = await dialog({ title: "Remove this session?", text: "It is removed from this phone only. The sight keeps its copy, but the app will not fetch it again.", yes: "Remove", no: "Cancel", danger: true });
-    if (!ok) return;
-    markDeleted(r.key);
-    saveArchive(loadArchive().filter((x) => x.key !== r.key));
-    const e = loadEnds(); delete e[r.key]; saveEnds(e);
-    renderHistory();
-    toast("Removed from this phone. It won't come back when you fetch sessions again.");
-  };
+  $("sdDelete").onclick = () => { d.close(); askRemove(r); };
   d.showModal();
+}
+
+// ---------------------------------------------------------------------------
+// Removing sessions: from the phone (preferred) or completely (phone + sight)
+// ---------------------------------------------------------------------------
+let pendingDel = null;   // { r, timer } while waiting for the sight's answer
+
+function removeFromPhone(r) {
+  markDeleted(r.key);
+  saveArchive(loadArchive().filter((x) => x.key !== r.key));
+  const e = loadEnds(); delete e[r.key]; saveEnds(e);
+  renderHistory();
+}
+
+function askRemove(r) {
+  const d = $("rmDlg");
+  const onSight = Number(r.epoch) > 0 && Number(r.id) > 0;
+  $("rmText").textContent = fmtDate(r) + `: ${r.ends} ends, ${r.scored} arrows, average ${Number(r.avg).toFixed(2)}.`;
+  $("rmAll").hidden = !onSight;          // CSV-only sessions have no key on the sight
+  $("rmPhone").onclick = () => {
+    d.close();
+    removeFromPhone(r);
+    toast("Removed from this phone. The sight keeps its copy.");
+  };
+  $("rmAll").onclick = async () => {
+    d.close();
+    const ok = await withConnection(() => {});
+    if (!ok) return;                     // withConnection already told why
+    pendingDel = { r, timer: setTimeout(() => {
+      pendingDel = null;
+      toast("The sight did not answer. Nothing was removed.", true);
+    }, 8000) };
+    send(`log del ${r.epoch} ${r.id}`);
+  };
+  $("rmCancel").onclick = () => d.close();
+  d.showModal();
+  $("rmPhone").focus();
+}
+
+function delOnAck(m) {
+  if (!pendingDel) return;
+  const r = pendingDel.r;
+  if (String(m.epoch) !== String(r.epoch) || String(m.id) !== String(r.id)) return;
+  clearTimeout(pendingDel.timer);
+  pendingDel = null;
+  if (m.result === "deleted" || m.result === "notfound") {
+    removeFromPhone(r);
+    toast(m.result === "deleted" ? "Removed from this phone and the sight."
+                                 : "Removed from this phone. The sight did not have it anymore.");
+  } else {
+    toast("The sight could not delete the session. Nothing was removed.", true);
+  }
+}
+
+async function clearSightLog() {
+  const li = state.loginfo;
+  const ok = await dialog({
+    title: "Clear the sight's log?",
+    text: `All ${li ? li.count + " " : ""}sessions on the sight are deleted. Your phone keeps its copies. ` +
+          `"Copy to sight" in History would bring them back.`,
+    yes: "Clear log", no: "Cancel", danger: true,
+  });
+  if (!ok) return;
+  if (!(await withConnection(() => {}))) return;
+  send("log clear confirm");
 }
 
 // ---------------------------------------------------------------------------
@@ -2047,6 +2129,7 @@ function onCal(m) {
 
 $("btnSave").addEventListener("click", () => send("save"));
 
+$("btnClearLog").addEventListener("click", clearSightLog);
 $("batCap").value = batteryCapacity();
 $("batCap").addEventListener("change", () => {
   const v = Math.round(Number($("batCap").value));

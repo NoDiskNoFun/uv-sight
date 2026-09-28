@@ -373,7 +373,7 @@
       <div style="text-align:center; margin-top:18px">
         <button class="btn secondary" id="btnReconnect" hidden>Reconnect</button>
       </div>
-      <p class="fw" id="runNote">Runtimes come from the sight: from its measured current draw once it has enough data, before that from estimates.</p>
+      <p class="fw" id="runNote">Runtimes get more accurate over the first weeks, as the sight learns how much power it uses.</p>
       <p class="fw" id="fw"></p>
     </div>
   </section>
@@ -457,7 +457,7 @@
     </div>
     <ul class="sessions" id="sessionList"></ul>
     <div class="empty" id="historyEmpty">
-      <p>No sessions on this phone yet. Finished sessions are stored here automatically while the app is connected, or fetched with the button above.</p>
+      <p>No sessions yet. Finished sessions appear here once the app has been connected to the sight.</p>
     </div>
   </section>
 
@@ -472,7 +472,7 @@
       <div class="group" id="setSwitches"></div>
       <div id="setGroups"></div>
       <div class="savebar" id="saveBar" hidden>
-        <span>Changes are active but not saved. The sight forgets them on restart.</span>
+        <span>Changes apply right away. Save them to keep them after the sight restarts.</span>
         <button class="btn" id="btnSave">Save</button>
       </div>
       <div style="text-align:center; margin: 18px 0 6px">
@@ -480,32 +480,36 @@
       </div>
     </div>
 
-    <div class="group" id="fwGroup">
-      <h3>Firmware and app</h3>
+    <div class="group" id="sessGroup">
+      <h3>Sessions</h3>
       <div class="switchrow">
-        <div><div class="lbl">Update mode</div>
-          <div class="desc" id="fwText">Restarts the sight as a USB drive, like a double click on the reset button. Needs the USB cable.</div></div>
-        <button class="btn secondary" id="btnDfu">Start</button>
-      </div>
-      <div class="switchrow">
-        <div><div class="lbl">Show hidden history entries</div>
-          <div class="desc">Sessions removed from this phone only appear greyed out in History and can be shown again.</div></div>
-        <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show hidden history entries"><span></span></label>
-      </div>
-      <div class="switchrow">
-        <div><div class="lbl">Sync logs automatically</div>
+        <div><div class="lbl">Sync automatically</div>
           <div class="desc" id="syncDesc"></div></div>
-        <label class="switch"><input type="checkbox" id="autoCopyCb" aria-label="Sync logs automatically"><span></span></label>
+        <label class="switch"><input type="checkbox" id="autoCopyCb" aria-label="Sync automatically"><span></span></label>
       </div>
       <div class="switchrow">
-        <div><div class="lbl">Session log on the sight</div>
-          <div class="desc">Delete all sessions stored on the sight. The phone keeps its copies.</div></div>
-        <button class="btn secondary" id="btnClearLog" style="color:var(--red); box-shadow: inset 0 0 0 2px var(--red)">Clear</button>
+        <div><div class="lbl">Show removed sessions</div>
+          <div class="desc">Sessions you removed from this phone appear greyed out in History, so you can bring them back.</div></div>
+        <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show removed sessions"><span></span></label>
       </div>
+      <div class="switchrow">
+        <div><div class="lbl">Delete sessions on the sight</div>
+          <div class="desc">Deletes all sessions stored on the sight, for example before you give it away. The sessions on this phone are kept.</div></div>
+        <button class="btn secondary" id="btnClearLog" style="color:var(--red); box-shadow: inset 0 0 0 2px var(--red)">Delete</button>
+      </div>
+    </div>
+
+    <div class="group" id="fwGroup">
+      <h3>App and firmware</h3>
       <div class="switchrow" id="installRow" hidden>
         <div><div class="lbl">Install app</div>
-          <div class="desc">Adds UV-Sight to the home screen. It then starts without internet.</div></div>
+          <div class="desc">Adds UV-Sight to your home screen. It then also works without internet.</div></div>
         <button class="btn secondary" id="btnInstall">Install</button>
+      </div>
+      <div class="switchrow">
+        <div><div class="lbl">Firmware update</div>
+          <div class="desc" id="fwText">Prepares the sight for new firmware. Connect it to your computer with the USB cable first.</div></div>
+        <button class="btn secondary" id="btnDfu">Start</button>
       </div>
       <p class="gnote" id="versions"></p>
     </div>
@@ -589,7 +593,7 @@ const PROTO_EXPECTED  = 9;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.1";
+const APP_VERSION     = "4.2";
 
 // ---------------------------------------------------------------------------
 // State
@@ -923,10 +927,10 @@ function handleLine(line) {
       if (m.cmd === "del") delOnAck(m);
       if (m.cmd === "clear") {
         send("log info");
-        if (!m.ok) { toast("Could not clear the sight's log.", true); }
+        if (!m.ok) { toast("Could not delete the sessions on the sight.", true); }
         else afterClear(m.count);
       }
-      if (m.cmd === "dfu") toast("The sight restarts as a USB drive. Copy the new firmware onto it.");
+      if (m.cmd === "dfu") toast("The sight now shows up as a drive on your computer. Copy the new firmware onto it.");
       break;
     case "cal":
       onCal(m);
@@ -951,8 +955,9 @@ function checkProto() {
   const p = state.hello && state.hello.proto;
   if (p !== PROTO_EXPECTED) {
     w.hidden = false;
-    w.textContent = `The sight speaks protocol ${p}, this app expects ${PROTO_EXPECTED}. ` +
-                    `Update the ${p < PROTO_EXPECTED ? "sight firmware" : "app"}.`;
+    w.textContent = p < PROTO_EXPECTED
+      ? "The sight's firmware is older than this app. Please update the firmware on the sight."
+      : "This app is older than the sight's firmware. Please update the app.";
   } else {
     w.hidden = true;
   }
@@ -1020,7 +1025,7 @@ function render() {
   if (s.led === "on" && typeof s.bright === "number") ledText += `, ${s.bright} %`;
   const bm = cfgValue("bright_mode");
   const bmText = bm === null ? "" : (bm === 1 ? "auto" : "fixed");
-  const modeText = s.mode === "on" ? "LED switch on" : s.mode === "off" ? "LED switch off" : bmText;
+  const modeText = s.mode === "on" ? "switched on" : s.mode === "off" ? "switched off" : bmText;
   $("vLed").innerHTML = ledText + (modeText ? ` <small>${modeText}</small>` : "");
 
   // Ambient light
@@ -1079,12 +1084,12 @@ function runtimeEstimates(s) {
   const b = state.bat;
   if (!b) return null;
   if (s.chg === "charging") return { light: "Charging", idle: "Charging" };
-  const src = b.src === "measured" ? `measured, ${b.rows} windows` : "estimate";
+  const src = b.src === "measured" ? "measured" : "estimated";
   const bright = cfgValue("bright");
   const auto = cfgValue("bright_mode") === 1;
   return {
     light: `${fmtDuration(b.light)} <small>LED ${bright === null ? "" : Math.round(bright) + " %"}${auto ? " (fully dark)" : ""}, ${src}</small>`,
-    idle:  `${fmtDuration(b.rest)} <small>bow lying still, ${src}</small>`,
+    idle:  `${fmtDuration(b.rest)} <small>at rest, ${src}</small>`,
   };
 }
 
@@ -1508,7 +1513,7 @@ function renderHistory() {
       li.className = "hidden-entry";
       const h = document.createElement("span");
       h.className = "hid";
-      h.textContent = "hidden, removed from this phone";
+      h.textContent = "removed from this phone";
       b.appendChild(h);
     }
     b.addEventListener("click", () => showSession(r));
@@ -1736,7 +1741,7 @@ function applySyncUi() {
   $("autoCopyCb").checked = on;
   $("manualSyncBar").hidden = on;
   $("syncDesc").textContent = on
-    ? "New sessions are fetched from the sight on every connect, and sessions the sight is missing are copied to it."
+    ? "Keeps the sessions on this phone and on the sight up to date whenever they are connected."
     : "Off: use Get from sight and Copy to sight in History.";
 }
 
@@ -1744,23 +1749,22 @@ function applySyncUi() {
 async function afterClear(count) {
   markOnSight(new Set(loadArchive().map((r) => r.key)), false);
   const back = await dialog({
-    title: `Log cleared (${count} ${count === 1 ? "session" : "sessions"})`,
-    text: "Keep syncing and copy the sessions from this phone back to the sight? Choose No if you give the sight away; syncing is then switched off.",
+    title: `${count} ${count === 1 ? "session" : "sessions"} deleted on the sight`,
+    text: "Copy the sessions from this phone back to the sight? Choose No if you give the sight away. Automatic sync is then switched off.",
     yes: "Copy back", no: "No",
   });
   try { localStorage.setItem(AUTOCOPY_KEY, back ? "on" : "off"); } catch {}
   applySyncUi();
   if (back) startAutoCopy();
-  else toast("Sync logs automatically is off. You can turn it on again in Settings.");
+  else toast("Automatic sync is off. You can turn it on again in Settings.");
 }
 
 async function clearSightLog() {
   const li = state.loginfo;
   const ok = await dialog({
-    title: "Clear the sight's log?",
-    text: `All ${li ? li.count + " " : ""}sessions on the sight are deleted. Your phone keeps its copies. ` +
-          `"Copy to sight" in History would bring them back.`,
-    yes: "Clear log", no: "Cancel", danger: true,
+    title: "Delete all sessions on the sight?",
+    text: `All ${li ? li.count + " " : ""}sessions stored on the sight are deleted. The sessions on this phone are kept.`,
+    yes: "Delete", no: "Cancel", danger: true,
   });
   if (!ok) return;
   if (!(await withConnection(() => {}))) return;
@@ -1973,7 +1977,7 @@ async function copyToSight() {
   const ok = await withConnection(() => {});
   if (!ok) return;
   copyState = { phase: "keys", keys: new Set(), queue: [], done: 0, added: 0, exists: 0, timer: null };
-  setCopyProgress("Reading what the sight already has…");
+  setCopyProgress("Checking which sessions the sight has…");
   send("awake 300");                 // don't fall asleep while choosing and copying
   send("log since 0");
 }
@@ -2004,7 +2008,7 @@ function chooseCopies(candidates) {
     li.querySelector("input").dataset.key = r.key;
     li.querySelector(".d").textContent = fmtDate(r);
     li.querySelector(".a").textContent = Number(r.avg).toFixed(2);
-    li.querySelector(".m").textContent = `${r.ends} ends, ${r.scored} arrows` + (r.hidden ? ", hidden" : "");
+    li.querySelector(".m").textContent = `${r.ends} ends, ${r.scored} arrows` + (r.hidden ? ", removed from this phone" : "");
     ul.appendChild(li);
   }
   const boxes = () => [...ul.querySelectorAll("input")];
@@ -2141,32 +2145,32 @@ const DESCS = {
   confirm: "Readings in a row (one every 2 s) before switching. Higher is calmer, lower reacts faster.",
   bright: "Fixed: brightness of the light. Auto: brightness at Dark below and darker. More drains the battery faster.",
   bright_min: "Auto: brightness at Bright above, where the light starts. It rises to Brightness as it gets darker.",
-  tilt_offset: "The cant blinking is this many points darker than Brightness. 0 = equally bright.",
+  tilt_offset: "How much darker the cant blinking is than the normal light. 0 = same brightness.",
   fade: "Auto: how long the light takes to follow a change in darkness. 0 = instantly.",
-  tilt_full: "Cant at which the blink rate reaches its end value. Lower makes small cant differences easier to tell apart.",
-  blink_min: "Normal style: rate just outside the tolerance. Inverted style: rate from the full-rate angle on.",
-  blink_max: "Normal style: rate from the full-rate angle on. Inverted style: rate just outside the tolerance. Above about 10 Hz it looks like steady light.",
+  tilt_full: "From this cant on the blinking no longer changes. A smaller angle makes small differences easier to see.",
+  blink_min: "Blinks per second at the slow end of the range.",
+  blink_max: "Blinks per second at the fast end of the range. Above about 10 it looks like a steady light.",
   tilt_smooth: "Higher is calmer against hand tremor, lower reacts faster.",
   session_end: "A session ends automatically after this long without a shot.",
-  vf: "Only change this if you swap the LED.",
+  vf: "Only change this if you fit a different LED.",
   level_tol: "A cant up to this angle counts as level.",
-  tap_ths: "Lower counts softer impacts, raise it if carrying the bow counts as a shot. Compare with the last shot on the Status tab. Applied in 0.5 g steps.",
+  tap_ths: "Lower it if shots are missed, raise it if carrying the bow counts as a shot. The Status tab shows how strong your last shot was.",
   lockout: "After a shot, further impacts are ignored and the cant indicator pauses.",
   cutoff: "Below this voltage the light switches off to protect the battery. This is 0 %.",
   ths: "Lower wakes the sight with smaller movements.",
   timeout: "The sight sleeps after this time without movement.",
-  report: "Automatic status message while connected.",
-  tx_power: "More range, slightly more current while the sight is active. Rounded to the steps the radio supports.",
-  bat_mah: "Capacity of the battery. The sight measures its own current draw; this turns it into hours.",
+  report: "How often the sight sends its readings to the app while connected. Off saves a little power.",
+  tx_power: "Higher reaches farther but uses a little more battery.",
+  bat_mah: "The capacity printed on the battery. Used for the remaining runtime.",
 };
 const LABELS = {
   dark_on: "Dark below", dark_off: "Bright above", confirm: "Readings before switching",
-  bright: "Brightness", bright_min: "Start brightness", tilt_offset: "Blink dimming", vf: "LED forward voltage",
-  fade: "Fade time", tilt_full: "Full-rate angle", blink_min: "Slow blink rate", blink_max: "Fast blink rate",
+  bright: "Brightness", bright_min: "Start brightness", tilt_offset: "Blink dimming", vf: "LED voltage",
+  fade: "Fade time", tilt_full: "Blinking range up to", blink_min: "Slowest blinking", blink_max: "Fastest blinking",
   tilt_smooth: "Smoothing", session_end: "End session after",
   level_tol: "Tolerance", tap_ths: "Shot threshold", lockout: "Pause after a shot",
-  cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Status report every",
-  tx_power: "Radio power", bat_mah: "Battery capacity",
+  cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Update the app every",
+  tx_power: "Bluetooth range", bat_mah: "Battery capacity",
 };
 
 function shownValue(it, v) {
@@ -2174,7 +2178,7 @@ function shownValue(it, v) {
   if (it.k === "tap_ths") return (v * 0.25).toFixed(2) + " g";
   if (it.k === "ths")     return (v * 125) + " mg";
   if (it.zero && v === 0) return "off";
-  const u = it.unit === "deg" ? "°" : (it.unit ? " " + it.unit : "");
+  const u = it.unit === "deg" ? "°" : it.unit === "Hz" ? " per s" : (it.unit ? " " + it.unit : "");
   return v.toFixed(it.dec) + u;
 }
 
@@ -2266,10 +2270,10 @@ function renderSettings() {
   $("btnDfu").disabled = !connected;
   const h = state.hello;
   const li = state.loginfo;
-  $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}, protocol ${h.proto}` : "") +
-    (li ? (li.ok ? `. Log on the sight: ${li.count} sessions (room for about ${li.capacity})` +
-                   (li.clock ? "" : ", clock not set")
-                 : ". Log flash on the sight NOT available") : "");
+  $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}` : "") +
+    (li ? (li.ok ? `. The sight stores ${li.count} ${li.count === 1 ? "session" : "sessions"} ` +
+                   `(room for about ${Math.floor(li.capacity / 1000) * 1000}).`
+                 : ". The sight's session memory is not working.") : "");
   $("saveBar").hidden = !cfgDirty;
   if (!connected || !state.cfg || activeView !== "settings") return;
   // Don't rebuild while the user is dragging a slider or typing
@@ -2403,7 +2407,7 @@ $("showHiddenCb").addEventListener("change", () => {
   renderHistory();
   if ($("showHiddenCb").checked) {
     if (state.conn === "connected") fetchHiddenOnce();
-    toast("Hidden entries are shown greyed out in History.");
+    toast("Removed sessions are now shown greyed out in History.");
   }
 });
 $("btnClearLog").addEventListener("click", clearSightLog);
@@ -2416,10 +2420,10 @@ $("autoCopyCb").addEventListener("change", () => {
 
 $("btnDfu").addEventListener("click", async () => {
   const ok = await dialog({
-    title: "Start update mode?",
-    text: "Connect the USB cable to your computer first. The sight restarts as a drive and stays there " +
-          "until you copy new firmware onto it or press reset. The connection to this app ends.",
-    yes: "Start update mode", no: "Cancel", danger: true,
+    title: "Prepare a firmware update?",
+    text: "Connect the sight to your computer with the USB cable first. It then shows up there as a drive; " +
+          "copy the new firmware onto it. Until then the sight does nothing else, and the app disconnects.",
+    yes: "Start", no: "Cancel", danger: true,
   });
   if (ok) send("dfu");
 });

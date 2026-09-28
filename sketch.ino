@@ -179,8 +179,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "3.5";
-const uint8_t  PROTO_VERSION     = 8;
+const char*    FW_VERSION        = "3.6";
+const uint8_t  PROTO_VERSION     = 9;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -222,6 +222,7 @@ struct Config {
   float    blinkMinHz;    // blink rate just outside the tolerance (normal style)
   float    blinkMaxHz;    // blink rate from tiltFullDeg on (normal style)
   float    fadeS;         // auto brightness: time to follow a change, s (0 = instant)
+  uint16_t batMah;        // battery capacity, for the runtime estimate
                          // (new fields are appended at the end so older stored
                          //  settings stay valid and get the default for them)
 };
@@ -256,7 +257,8 @@ const Config DEFAULTS = {
   10.0f,   // tiltFullDeg
   1.0f,    // blinkMinHz
   8.0f,    // blinkMaxHz
-  5.0f     // fadeS
+  5.0f,    // fadeS
+  85       // batMah
 };
 
 Config cfg = DEFAULTS;
@@ -297,6 +299,7 @@ const SettingDef SETTINGS[] = {
   {"timeout",   S_U32, offsetof(Config, timeoutS),    10,   3600, 0, false, "s",      "without movement until idle"},
   {"report",    S_U32, offsetof(Config, reportS),     2,    600,  0, true,  "s",      "between status reports, 0 = off"},
   {"tx_power",  S_I8,  offsetof(Config, txPower),     -20,  8,    0, false, "dBm",    "radio power, higher = more range and current"},
+  {"bat_mah",   S_U16, offsetof(Config, batMah),      10,   5000, 0, false, "mAh",    "battery capacity, for the runtime estimate"},
 };
 const uint8_t SETTING_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
 
@@ -393,6 +396,64 @@ const uint32_t LEGACY_MAGIC  = 0x53484F04;
 const char*    LEGACY_FILE   = "/shots.bin";
 const char*    LEGACY_BACKUP = "/shots.old";
 uint8_t migratedCount = 0;   // sessions taken over at this boot
+
+// ----------------------------------------------------------------------------
+// Battery history (internal flash): unloaded voltage at state changes plus the
+// time spent in each state since the previous point. The sight fits its own
+// current draw from it (idle, awake, LED factor) and estimates runtimes.
+// ----------------------------------------------------------------------------
+enum BatPointType : uint8_t {
+  BP_BOOT = 1, BP_IDLE, BP_WAKE, BP_LED_ON, BP_LED_OFF, BP_USB_IN, BP_FULL, BP_USB_OUT
+};
+#define BPF_USB   0x01     // USB was connected at this point
+#define BPF_CLOCK 0x02     // t is a real time (clock set by the app)
+
+struct __attribute__((packed)) BatPoint {
+  uint32_t t;        // unix seconds (0 = unknown)
+  uint16_t mv;       // battery voltage without load
+  uint8_t  type;     // BatPointType
+  uint8_t  flags;    // BPF_*
+  uint32_t idleS;    // seconds asleep since the previous point
+  uint32_t activeS;  // seconds awake since the previous point
+  uint32_t ledMAs;   // LED charge since the previous point, mA*s (from the set brightness)
+  uint32_t ledS;     // seconds the LED was lit (or blinking) since the previous point
+};
+static_assert(sizeof(BatPoint) == 24, "BatPoint must be 24 bytes");
+
+const uint16_t BH_POINTS       = 256;                     // ring, about 2 months
+const uint32_t BH_MAGIC        = 0x31484142;              // "BAH1"
+const char*    BH_FILE         = "/bathist.bin";
+const uint32_t BH_MIN_GAP_MS   = 10UL * 60UL * 1000UL;    // at most one point per 10 min
+const uint32_t BH_IDLE_MIN_MS  = 6UL * 3600UL * 1000UL;   // wake point only after 6 h asleep
+const uint32_t BH_RELAX_MS     = 45000;                   // wait after load before measuring
+const uint32_t BH_IDLE_READ_MS = 60000;                   // refresh the unloaded voltage while asleep
+const float    BH_WINDOW_PCT   = 4.0f;                    // discharge per fit row (above the noise)
+
+struct BatHist {
+  uint32_t magic;
+  uint16_t next;
+  uint16_t count;
+  BatPoint p[BH_POINTS];
+};
+BatHist bh;
+
+// Accumulators since the last saved point
+float    bhIdleMs = 0, bhActiveMs = 0, bhLedMAs = 0, bhLedMs = 0;
+uint32_t bhTickMs = 0, bhLastPointMs = 0, bhIdlePointMs = 0;
+bool     bhPrevAwake = true, bhPrevUsb = false, bhPrevActive = true;
+float    ledMaNow  = 0;                 // model LED current right now (for the accumulators)
+uint16_t unloadedMv = 0;                // latest battery voltage measured without load
+uint32_t unloadedMs = 0, ledOffMs = 0;
+uint8_t  bhPending = 0;                 // point to take once the battery has relaxed
+bool     bhPendingForce = false;
+uint32_t plugMs = 0;                    // USB plugged in (this boot)
+float    plugSoc = -1;                  // state of charge when plugged in (%), -1 = unknown
+
+// Fit results
+float    fitIdleMa = 0.06f, fitActiveMa = 0.8f, fitLedK = 1.0f;
+float    fitChgMinPerPct = 1.0f, fitChgTailMin = 20.0f;
+uint16_t fitRows = 0, fitCharges = 0;
+float    fitMah = 0;                    // discharge covered by the fit rows
 
 // Clock, set by the app ("time <unix> [tz minutes]"), valid until reboot
 bool     clockValid = false;
@@ -1533,6 +1594,221 @@ float vbatToPercent(float v) {
 }
 
 // ============================================================================
+// Battery history and runtime estimate
+// ============================================================================
+void bhLoad() {
+  memset(&bh, 0, sizeof(bh));
+  bh.magic = BH_MAGIC;
+  File f(InternalFS);
+  if (!f.open(BH_FILE, FILE_O_READ)) return;
+  BatHist* tmp = (BatHist*)malloc(sizeof(BatHist));
+  if (tmp) {
+    if (f.read(tmp, sizeof(BatHist)) == (int)sizeof(BatHist) && tmp->magic == BH_MAGIC &&
+        tmp->next < BH_POINTS && tmp->count <= BH_POINTS) bh = *tmp;
+    free(tmp);
+  }
+  f.close();
+}
+
+bool bhSaveFile() {
+  InternalFS.remove(BH_FILE);
+  File f(InternalFS);
+  if (!f.open(BH_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)&bh, sizeof(bh));
+  f.close();
+  return true;
+}
+
+// i = 0 is the oldest point
+const BatPoint& bhAt(uint16_t i) {
+  return bh.p[(bh.next + BH_POINTS - bh.count + i) % BH_POINTS];
+}
+
+// Add time to the accumulators; called on every loop pass
+void bhTick(uint32_t now, bool awake) {
+  const uint32_t dt = now - bhTickMs;
+  bhTickMs = now;
+  if (dt > 60000) return;                    // implausible gap (should not happen)
+  if (bhPrevAwake) bhActiveMs += dt; else bhIdleMs += dt;
+  if (ledMaNow > 0) { bhLedMAs += ledMaNow * dt / 1000.0f; bhLedMs += dt; }
+  bhPrevAwake = awake;
+}
+
+void bhFit();   // below
+
+// Store a point; the minimum gap is skipped for anchors (force)
+void bhPoint(uint8_t type, uint16_t mv, bool force) {
+  const uint32_t now = millis();
+  if (!force && bhLastPointMs && (now - bhLastPointMs) < BH_MIN_GAP_MS) return;
+  BatPoint& p = bh.p[bh.next];
+  p.t       = clockValid ? unixAt(now) : 0;
+  p.mv      = mv;
+  p.type    = type;
+  p.flags   = (usbPresent() ? BPF_USB : 0) | (clockValid ? BPF_CLOCK : 0);
+  p.idleS   = (uint32_t)(bhIdleMs / 1000);
+  p.activeS = (uint32_t)(bhActiveMs / 1000);
+  p.ledMAs  = (uint32_t)bhLedMAs;
+  p.ledS    = (uint32_t)(bhLedMs / 1000);
+  bh.next = (bh.next + 1) % BH_POINTS;
+  if (bh.count < BH_POINTS) bh.count++;
+  bhIdleMs = bhActiveMs = bhLedMAs = bhLedMs = 0;
+  bhLastPointMs = now;
+  bhSaveFile();
+  bhFit();
+}
+
+// Measure without load: now if the LED has been off long enough, else later
+void bhPointUnloaded(uint8_t type, bool force) {
+  if (ledMaNow > 0 || (millis() - ledOffMs) < BH_RELAX_MS) {
+    bhPending = type;                        // a newer request replaces an older one
+    bhPendingForce = bhPendingForce || force;
+    return;
+  }
+  bhPoint(type, (uint16_t)(readVbat() * 1000), force);
+}
+
+// Pending measurements and the voltage kept fresh while asleep; every loop pass
+void bhService(uint32_t now, bool usb) {
+  if (!usb && ledMaNow == 0 && (now - ledOffMs) >= BH_RELAX_MS) {
+    if (bhPending) {
+      const uint16_t mv = (uint16_t)(readVbat() * 1000);
+      unloadedMv = mv; unloadedMs = now;
+      bhPoint(bhPending, mv, bhPendingForce);
+      bhPending = 0; bhPendingForce = false;
+    } else if ((now - unloadedMs) >= BH_IDLE_READ_MS) {
+      unloadedMv = (uint16_t)(readVbat() * 1000);
+      unloadedMs = now;
+    }
+  }
+}
+
+// Solve a 3x3 system (Gauss); false if singular
+bool solve3(float A[3][3], float b[3], float x[3]) {
+  for (uint8_t c = 0; c < 3; c++) {
+    uint8_t piv = c;
+    for (uint8_t r = c + 1; r < 3; r++) if (fabsf(A[r][c]) > fabsf(A[piv][c])) piv = r;
+    if (fabsf(A[piv][c]) < 1e-9f) return false;
+    for (uint8_t k = 0; k < 3; k++) { float t = A[c][k]; A[c][k] = A[piv][k]; A[piv][k] = t; }
+    float t = b[c]; b[c] = b[piv]; b[piv] = t;
+    for (uint8_t r = 0; r < 3; r++) {
+      if (r == c) continue;
+      const float f = A[r][c] / A[c][c];
+      for (uint8_t k = 0; k < 3; k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  for (uint8_t c = 0; c < 3; c++) x[c] = b[c] / A[c][c];
+  return true;
+}
+
+// Fit idle current, awake current and an LED factor from discharge windows:
+//   used mAh = idleMa * idleH + activeMa * activeH + ledK * ledModelMah
+// Each row covers at least BH_WINDOW_PCT of discharge. Priors (the former
+// estimates) keep the result sensible while there is little data.
+void bhFit() {
+  const float prior[3] = { 0.06f, 0.8f, 1.0f };
+  const float scale[3] = { 24.0f, 5.0f, 20.0f };      // prior counts like one such observation
+  float A[3][3] = {{0}}, b[3] = {0};
+  for (uint8_t i = 0; i < 3; i++) { A[i][i] = scale[i] * scale[i]; b[i] = scale[i] * scale[i] * prior[i]; }
+
+  uint16_t rows = 0; float mah = 0;
+  bool open = false; float socStart = 0, x0 = 0, x1 = 0, x2 = 0;
+  // charge learning: minutes from plug-in to full vs. state of charge at plug-in
+  float C[2][2] = {{30.0f * 30.0f, 0}, {0, 3.0f * 3.0f}};
+  float cb[2]   = {30.0f * 30.0f * (cfg.batMah / 50.0f * 60.0f / 100.0f), 3.0f * 3.0f * 20.0f};
+  uint16_t charges = 0; float chgSoc = -1, chgMin = 0;
+
+  for (uint16_t i = 0; i < bh.count; i++) {
+    const BatPoint& p = bhAt(i);
+    const float soc = rawPercent(p.mv / 1000.0f);
+    // Charging and restarts break a discharge window
+    if (p.type == BP_BOOT || p.type == BP_USB_IN || p.type == BP_FULL || (p.flags & BPF_USB)) {
+      if (p.type == BP_USB_IN) { chgSoc = soc; chgMin = 0; }
+      else if (p.type == BP_FULL && chgSoc >= 0) {
+        chgMin += (p.idleS + p.activeS) / 60.0f;
+        const float u[2] = { 100.0f - chgSoc, 1.0f };
+        for (uint8_t r = 0; r < 2; r++) { for (uint8_t k = 0; k < 2; k++) C[r][k] += u[r] * u[k]; cb[r] += u[r] * chgMin; }
+        charges++; chgSoc = -1;
+      } else if (chgSoc >= 0) chgMin += (p.idleS + p.activeS) / 60.0f;
+      open = false;
+      continue;
+    }
+    if (p.type == BP_USB_OUT) { open = true; socStart = soc; x0 = x1 = x2 = 0; continue; }
+    if (!open) { open = true; socStart = soc; x0 = x1 = x2 = 0; continue; }
+    x0 += p.idleS / 3600.0f;  x1 += p.activeS / 3600.0f;  x2 += p.ledMAs / 3600.0f;
+    const float drop = socStart - soc;
+    if (drop >= BH_WINDOW_PCT) {
+      const float y = cfg.batMah * drop / 100.0f;
+      const float x[3] = { x0, x1, x2 };
+      for (uint8_t r = 0; r < 3; r++) { for (uint8_t k = 0; k < 3; k++) A[r][k] += x[r] * x[k]; b[r] += x[r] * y; }
+      rows++; mah += y;
+      socStart = soc; x0 = x1 = x2 = 0;
+    }
+  }
+  float res[3];
+  if (solve3(A, b, res)) {
+    fitIdleMa   = constrain(res[0], 0.005f, 2.0f);
+    fitActiveMa = constrain(res[1], 0.05f, 10.0f);
+    fitLedK     = constrain(res[2], 0.3f, 3.0f);
+  }
+  fitRows = rows; fitMah = mah;
+  const float det = C[0][0] * C[1][1] - C[0][1] * C[1][0];
+  if (fabsf(det) > 1e-6f) {
+    fitChgMinPerPct = constrain((cb[0] * C[1][1] - C[0][1] * cb[1]) / det, 0.2f, 10.0f);
+    fitChgTailMin   = constrain((C[0][0] * cb[1] - C[1][0] * cb[0]) / det, 0.0f, 120.0f);
+  }
+  fitCharges = charges;
+}
+
+bool fitMeasured() { return fitRows >= 3 && fitMah >= 20; }
+
+// Hours left (remaining capacity down to the cutoff divided by the current)
+float hoursWithLight() {
+  const float ma = fitActiveMa + fitLedK * percentToMa(cfg.brightMax);
+  return cfg.batMah * lastPct / 100.0f / ma;
+}
+float hoursResting() { return cfg.batMah * lastPct / 100.0f / fitIdleMa; }
+
+// Minutes until full while charging, -1 = unknown (e.g. plugged in before a restart)
+float minutesToFull() {
+  if (lastCharge != CHG_CHARGING || plugSoc < 0) return -1;
+  const float total = fitChgMinPerPct * (100.0f - plugSoc) + fitChgTailMin;
+  const float left  = total - (millis() - plugMs) / 60000.0f;
+  return left < 1 ? 1 : left;
+}
+
+String batJson() {
+  const float full = minutesToFull();
+  return "{\"t\":\"bat\",\"light\":" + String(hoursWithLight(), 1) + ",\"rest\":" + String(hoursResting(), 0) +
+         ",\"full\":" + (full < 0 ? String("null") : String((int)(full + 0.5f))) +
+         ",\"src\":\"" + (fitMeasured() ? "measured" : "estimate") + "\"" +
+         ",\"rows\":" + String(fitRows) + ",\"charges\":" + String(fitCharges) +
+         ",\"idleMa\":" + String(fitIdleMa, 3) + ",\"activeMa\":" + String(fitActiveMa, 2) +
+         ",\"ledK\":" + String(fitLedK, 2) + ",\"cap\":" + String(cfg.batMah) + "}";
+}
+
+void printBat() {
+  if (appMode) { sendLine(batJson()); return; }
+  out(String("Runtime (") + (fitMeasured() ? "measured" : "estimate, not enough data yet") + "):");
+  out("  with light at " + String((int)cfg.brightMax) + " %: about " + String(hoursWithLight(), 1) + " h");
+  out("  resting: about " + String(hoursResting() / 24.0f, 0) + " days");
+  const float full = minutesToFull();
+  if (full >= 0) out("  full in about " + String((int)(full + 0.5f)) + " min");
+  out("Current draw: resting " + String(fitIdleMa, 3) + " mA, awake " + String(fitActiveMa, 2) +
+      " mA, LED factor " + String(fitLedK, 2));
+  out("Based on " + String(fitRows) + " discharge windows (" + String(fitMah, 0) + " mAh) and " +
+      String(fitCharges) + " charges; " + String(bh.count) + " points stored, capacity " + String(cfg.batMah) + " mAh");
+}
+
+void bhReset() {
+  memset(&bh, 0, sizeof(bh));
+  bh.magic = BH_MAGIC;
+  bhSaveFile();
+  bhFit();
+  say("Battery history cleared.", "{\"t\":\"ack\",\"cmd\":\"batreset\"}");
+}
+
+// ============================================================================
 // UV LED
 // ============================================================================
 uint16_t dutyForVbat(float vbat, float targetMa) {
@@ -1789,6 +2065,17 @@ void updateLed(uint32_t now) {
   else if (ledMode == MODE_OFF)                   st = LS_OFF;
   else if (isDark)                                st = LS_ON;    // auto: light sensor
   else                                            st = LS_OFF;
+
+  // Model current for the battery history (blinking is lit half the time)
+  const float ma = st == LS_ON    ? percentToMa(brightNow < 0 ? brightTarget() : brightNow)
+                 : st == LS_BLINK ? percentToMa(tiltBrightness()) * 0.5f : 0.0f;
+  if (ledMaNow == 0 && ma > 0) {
+    if ((millis() - unloadedMs) < 10000) bhPoint(BP_LED_ON, unloadedMv, false);   // voltage before the load
+  } else if (ledMaNow > 0 && ma == 0) {
+    ledOffMs = millis();
+    bhPointUnloaded(BP_LED_OFF, false);      // measured after the battery relaxed
+  }
+  ledMaNow = ma;
 
   switch (st) {
     case LS_OFF:
@@ -2192,6 +2479,7 @@ String statusJson() {
 
 void sendStatus() {
   say(statusLine(), statusJson());
+  emit(batJson());
 }
 
 // Settings go out as one short line per item: long lines were unreliable over BLE
@@ -2250,6 +2538,8 @@ void printHelp() {
   out("level cal2        calibration step 2");
   out("app on|off        JSON output for the app");
   out("awake <s>         stay reachable without movement (max 900 s, 0 = off)");
+  out("bat               runtime estimate and measured current draw");
+  out("bat reset         clear the battery history");
   out("dfu               reboot into update mode (USB needed)");
 }
 
@@ -2430,6 +2720,8 @@ void handleCommand(String line) {
   else if (line.startsWith("log since ")) printLog((uint32_t)line.substring(10).toInt(), true);
   else if (line.startsWith("time "))      setClock(line.substring(5));
   else if (line.startsWith("awake "))     setAwake(line.substring(6));
+  else if (line == "bat")                 printBat();
+  else if (line == "bat reset")           bhReset();
   else if (line.startsWith("log put "))   logPut(line.substring(8));
   else if (line == "level")               handleLevel("");
   else if (line.startsWith("level "))     { String a = line.substring(6); a.trim(); handleLevel(a); }
@@ -2521,11 +2813,17 @@ void evaluate() {
     if (c == CHG_CHARGING)      say("Charging started.", json);
     else if (c == CHG_FULL)     say("Battery full, charging finished.", json);
     else                        say("USB disconnected.", json);
+    if (c == CHG_FULL && lastCharge == CHG_CHARGING) bhPoint(BP_FULL, 4200, true);   // anchor: 100 %
     lastCharge = c;
   }
 
   lastVbat = readVbat();
   lastPct  = vbatToPercent(lastVbat);
+  // A reading counts as unloaded if the LED has been dark long enough and no charger is on
+  if (ledMaNow == 0 && (millis() - ledOffMs) >= BH_RELAX_MS && !usbPresent()) {
+    unloadedMv = (uint16_t)(lastVbat * 1000);
+    unloadedMs = millis();
+  }
   lastLdr  = readLdr();
 
   // Battery protection
@@ -2610,6 +2908,12 @@ void setup() {
   logInit();
   chargeInit();
   lastCharge = readCharge();
+  bhLoad();
+  bhFit();
+  bhTickMs = millis();
+  bhPrevUsb = usbPresent();
+  unloadedMv = (uint16_t)(readVbat() * 1000); unloadedMs = millis();
+  bhPoint(BP_BOOT, unloadedMv, true);             // the time before this restart is unknown
 
   lastMotionMs = millis();                        // active right after start
   lastSensorMs = millis() - SENSOR_INTERVAL_MS;
@@ -2659,6 +2963,32 @@ void loop() {
   awakeReason = active ? "" : (usb ? "usb" : (held ? "app" : ""));
   const bool reachable = active || usb || held;
 
+  // Battery history: time per state, and points at state changes
+  bhTick(now, reachable);
+  if (usb != bhPrevUsb) {
+    if (usb) {                                   // voltage from just before the charger took over
+      plugMs = now;
+      plugSoc = (now - unloadedMs) < 120000 ? rawPercent(unloadedMv / 1000.0f) : -1;
+      bhPoint(BP_USB_IN, unloadedMv, true);
+      bhPending = 0;
+    } else {
+      plugSoc = -1;
+      ledOffMs = now;                             // let the charged battery relax first
+      bhPointUnloaded(BP_USB_OUT, true);
+    }
+    bhPrevUsb = usb;
+  }
+  if (active != bhPrevActive) {
+    if (!active) {                               // falling asleep
+      bhIdlePointMs = now;
+      if (!usb) bhPointUnloaded(BP_IDLE, false);
+    } else if (bhIdlePointMs && (now - bhIdlePointMs) >= BH_IDLE_MIN_MS && !usb) {
+      bhPoint(BP_WAKE, (uint16_t)(readVbat() * 1000), true);   // LED is still off here
+    }
+    bhPrevActive = active;
+  }
+  bhService(now, usb);
+
   // Shot detection only if the counter is on and the bow is in use
   imuSetFast(active && shotState.shotsOn);
 
@@ -2684,6 +3014,7 @@ void loop() {
 
   // ---- Idle: bow lies still ----
   if (!active) {
+    if (ledMaNow > 0) { ledMaNow = 0; ledOffMs = now; }
     uvOff();
     ledState = LS_OFF;
     tiltReset();

@@ -438,17 +438,13 @@
 
   <!-- History -->
   <section class="view" id="view-history" hidden>
-    <div class="toolbar">
-      <button class="btn secondary" id="btnSync">Get from sight</button>
-      <button class="btn secondary" id="btnToSight">Copy to sight</button>
-    </div>
     <div class="toolbar three">
       <button class="btn secondary" id="btnExport">CSV</button>
       <button class="btn secondary" id="btnBackup">Backup</button>
       <button class="btn secondary" id="btnImport">Import</button>
     </div>
     <input type="file" id="importFile" accept=".json,.csv,application/json,text/csv" hidden>
-    <p class="progress" id="copyProgress" hidden></p>
+    <p class="progress" id="syncLine" hidden></p>
     <div class="chart" id="chart" hidden>
       <h3>Average per session <small class="muted" id="chartSub"></small></h3>
       <svg id="chartSvg" viewBox="0 0 320 150" preserveAspectRatio="none" role="img" aria-label="Average per session"></svg>
@@ -490,6 +486,17 @@
         <div><div class="lbl">Show hidden history entries</div>
           <div class="desc">Sessions removed from this phone only appear greyed out in History and can be shown again.</div></div>
         <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show hidden history entries"><span></span></label>
+      </div>
+      <div class="switchrow">
+        <div><div class="lbl">Copy sessions to the sight automatically</div>
+          <div class="desc">Sessions on this phone that the sight doesn't have (imported, or not stored there) are copied whenever the app is connected.</div></div>
+        <label class="switch"><input type="checkbox" id="autoCopyCb" aria-label="Copy sessions to the sight automatically"><span></span></label>
+      </div>
+      <div class="switchrow">
+        <div><div class="lbl">Copy to sight by hand</div>
+          <div class="desc">Choose which of the missing sessions to copy.</div>
+          <p class="progress" id="copyProgress" hidden style="margin:6px 0 0"></p></div>
+        <button class="btn secondary" id="btnToSight">Choose…</button>
       </div>
       <div class="switchrow">
         <div><div class="lbl">Session log on the sight</div>
@@ -583,7 +590,7 @@ const PROTO_EXPECTED  = 9;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.8";
+const APP_VERSION     = "4.0";
 
 // ---------------------------------------------------------------------------
 // State
@@ -676,6 +683,8 @@ function onDisconnected() {
   setAwaiting(false);
   if (confirmOpen) { $("dlg").close(); confirmOpen = false; }
   stopPolling();
+  stopAutoCopy();
+  fullScan = false; syncSeen = null;
   const wasConnected = state.conn === "connected";
   setConn("off");
   if (wasConnected && !sightAsleep) startAutoReconnect();
@@ -777,6 +786,7 @@ function handleLine(line) {
     case "hello":
       state.hello = m;
       checkProto();
+      setTimeout(autoSync, 1500);                  // after settings and status have arrived
       break;
     case "status":  state.status  = m; break;
     case "cfgStart":
@@ -845,6 +855,7 @@ function handleLine(line) {
     case "logStart":
       syncEpoch = m.epoch;
       syncCount = 0;
+      syncSeen = new Set();
       // The sight's log is behind what we fetched: its flash was replaced or cleared
       syncResync = typeof m.last === "number" && m.last < loadLogSeq();
       break;
@@ -860,11 +871,22 @@ function handleLine(line) {
         archiveSlot(m.epoch, m);
         break;
       }
+      if (syncSeen) syncSeen.add(`${m.epoch ?? syncEpoch}-${m.id}`);
       if (archiveSlot(m.epoch ?? syncEpoch, m)) syncCount++;
       if (typeof m.seq === "number" && m.seq > loadLogSeq() && !syncResync) saveLogSeq(m.seq);
       break;
     case "logEnd":
       syncEpoch = null;
+      if (syncSeen) { markOnSight(syncSeen, true); }
+      if (fullScan) {
+        // Everything not in this complete answer is not on the sight
+        const all = new Set(loadArchive().map((r) => r.key));
+        for (const k of syncSeen || []) all.delete(k);
+        markOnSight(all, false);
+        fullScan = false;
+        try { localStorage.setItem(ONSIGHT_INIT_KEY, "1"); } catch {}
+      }
+      syncSeen = null;
       if (hiddenFetch) {
         hiddenFetch = false;
         try { localStorage.setItem(HIDDEN_FETCHED_KEY, "1"); } catch {}
@@ -874,12 +896,14 @@ function handleLine(line) {
       if (syncResync) {                     // start over from the beginning of the sight's log
         syncResync = false;
         saveLogSeq(0);
-        requestLog();
+        fullScan = true;                    // and learn again which sessions it has
+        send("log since 0");
         break;
       }
       if (typeof m.last === "number" && m.last >= loadLogSeq()) saveLogSeq(m.last);
-      toast(syncCount ? `${syncCount} new ${syncCount === 1 ? "session" : "sessions"} stored on this phone`
-                      : "Everything is already on this phone");
+      if (syncCount) toast(`${syncCount} new ${syncCount === 1 ? "session" : "sessions"} from the sight`);
+      renderHistory();
+      startAutoCopy();                             // then send back what the sight is missing
       break;
     case "loginfo":
       state.loginfo = m;
@@ -895,11 +919,12 @@ function handleLine(line) {
       }
       if (m.cmd === "save") { cfgDirty = false; toast("Settings saved on the sight"); }
       if (m.cmd === "mode" && state.status) state.status.mode = m.mode;
-      if (m.cmd === "put") copyOnAck(m);
+      if (m.cmd === "put" && !autoCopyOnAck(m)) copyOnAck(m);
       if (m.cmd === "del") delOnAck(m);
       if (m.cmd === "clear") {
-        toast(m.ok ? `Log on the sight cleared (${m.count} ${m.count === 1 ? "session" : "sessions"}).` : "Could not clear the sight's log.", !m.ok);
         send("log info");
+        if (!m.ok) { toast("Could not clear the sight's log.", true); }
+        else afterClear(m.count);
       }
       if (m.cmd === "dfu") toast("The sight restarts as a USB drive. Copy the new firmware onto it.");
       break;
@@ -1374,6 +1399,7 @@ function handleLiveSlot(sl) {
   const stored = !liveSlot || liveSlot.stored;
   const error  = liveSlot && liveSlot.error;
   archiveSlot(sl.epoch, sl);
+  markOnSight(new Set([`${sl.epoch}-${sl.id}`]), !!stored);   // not stored: copied later
   if (stored) toast(`Session saved: ${sl.scored} arrows, average ${Number(sl.avg).toFixed(2)}, ${sl.x} X`);
   else toast("The sight could not store this session" + (error ? ` (${error})` : "") +
              ". It is kept on this phone.", true);
@@ -1704,6 +1730,20 @@ function delOnAck(m) {
   }
 }
 
+// After clearing: copy everything back (testing, new chip) or keep the sight empty (giving it away)
+async function afterClear(count) {
+  markOnSight(new Set(loadArchive().map((r) => r.key)), false);
+  const back = await dialog({
+    title: `Log cleared (${count} ${count === 1 ? "session" : "sessions"})`,
+    text: "Copy the sessions from this phone back to the sight automatically? Choose No if you give the sight away.",
+    yes: "Copy back", no: "No",
+  });
+  try { localStorage.setItem(AUTOCOPY_KEY, back ? "on" : "off"); } catch {}
+  $("autoCopyCb").checked = back;
+  if (back) startAutoCopy();
+  else toast("Automatic copying to the sight is off. You can turn it on in Settings.");
+}
+
 async function clearSightLog() {
   const li = state.loginfo;
   const ok = await dialog({
@@ -1809,17 +1849,106 @@ async function importFile(file) {
   const parts = [`${result.added} new`];
   if (result.filled)  parts.push(`${result.filled} dates added`);
   if (result.skipped) parts.push(`${result.skipped} skipped (removed before)`);
-  toast(`Imported from ${what}: ${parts.join(", ")}`);
-  if (result.added > 0) {
-    const ok = await dialog({ title: "Copy to the sight as well?",
-      text: "The sight keeps its own copy of every session as a third backup. Copy the sessions it doesn't have yet?",
-      yes: "Copy to sight", no: "Not now" });
-    if (ok) copyToSight();
-  }
+  toast(`Imported from ${what}: ${parts.join(", ")}` +
+        (result.added && autoCopyOn() ? ". They are copied to the sight when it is connected." : ""));
+  if (result.added) startAutoCopy();
 }
 
 // ---------------------------------------------------------------------------
-// Copy sessions from this phone to the sight ("log put", one at a time)
+// Automatic sync: fetch new sessions on every connect, copy missing ones back
+// ---------------------------------------------------------------------------
+const AUTOCOPY_KEY = "uvsight.autocopy";          // "off" disables copying to the sight
+const ONSIGHT_INIT_KEY = "uvsight.onsight.init";  // "1" once every record knows if it is on the sight
+const autoCopyOn = () => localStorage.getItem(AUTOCOPY_KEY) !== "off";
+let syncSeen = null;        // keys seen in the current log answer
+let fullScan = false;       // a "log since 0" to learn which sessions the sight has
+let autoCopy = null;        // { queue, i, added, timer, wait }
+
+function markOnSight(keys, value) {
+  if (!keys.size) return;
+  const a = loadArchive();
+  let changed = false;
+  for (const r of a) if (keys.has(r.key) && !!r.onSight !== value) { r.onSight = value; changed = true; }
+  if (changed) saveArchive(a);
+}
+
+// Called once the app is connected and the sight speaks JSON
+function autoSync() {
+  if (state.conn !== "connected" || copyState) return;
+  if (localStorage.getItem(ONSIGHT_INIT_KEY) !== "1") {
+    fullScan = true;                              // first time: learn what the sight has
+    send("log since 0");
+  } else {
+    requestLog();
+  }
+}
+
+// Nothing may interrupt an open score question on the sight: any command cancels it
+function syncBlocked() {
+  return awaitingEnd || confirmOpen || reconnecting || calBusy || !!copyState || !!pendingDel ||
+         (state.session && state.session.pending) || state.conn !== "connected";
+}
+
+function startAutoCopy() {
+  if (!autoCopyOn() || autoCopy || copyState) return;
+  const queue = loadArchive().filter((r) => Number(r.epoch) > 0 && Number(r.id) > 0 && !r.onSight);
+  if (!queue.length) return;
+  autoCopy = { queue, i: 0, added: 0, timer: null, wait: null };
+  autoCopyNext();
+}
+
+function setSyncLine(text) {
+  $("syncLine").hidden = !text;
+  $("syncLine").textContent = text || "";
+}
+
+function autoCopyNext() {
+  const c = autoCopy;
+  if (!c) return;
+  clearTimeout(c.wait);
+  if (state.conn !== "connected") { stopAutoCopy(); return; }
+  if (syncBlocked()) { c.wait = setTimeout(autoCopyNext, 3000); return; }   // try again later
+  if (c.i >= c.queue.length) {
+    if (c.added) toast(`${c.added} ${c.added === 1 ? "session" : "sessions"} copied to the sight`);
+    stopAutoCopy();
+    send("log info");
+    return;
+  }
+  const r = c.queue[c.i];
+  const start = r.endedAt ? Math.round((r.endedAt - r.min * 60000) / 1000) : 0;
+  const flags = (r.mismatch ? 2 : 0) | (r.manual ? 4 : 0);
+  setSyncLine(`Copying to the sight: ${c.i + 1} of ${c.queue.length}`);
+  send(`log put ${r.epoch} ${r.id} ${start} ${r.ends} ${r.shots} ${r.scored} ${Math.round(Number(r.avg) * 100)} ` +
+       `${r.x} ${r.min} ${r.invalidEnds} ${r.invalidArrows} ${flags}`);
+  clearTimeout(c.timer);
+  c.timer = setTimeout(stopAutoCopy, 8000);      // no answer: continue on the next connect
+}
+
+function autoCopyOnAck(m) {
+  const c = autoCopy;
+  if (!c) return false;
+  const r = c.queue[c.i];
+  if (!r || String(m.epoch) !== String(r.epoch) || String(m.id) !== String(r.id)) return false;
+  clearTimeout(c.timer);
+  if (m.result === "added" || m.result === "exists") {
+    if (m.result === "added") c.added++;
+    markOnSight(new Set([r.key]), true);
+    c.i++;
+    autoCopyNext();
+  } else {
+    stopAutoCopy();                              // storage problem: don't hammer the sight
+  }
+  return true;
+}
+
+function stopAutoCopy() {
+  if (autoCopy) { clearTimeout(autoCopy.timer); clearTimeout(autoCopy.wait); }
+  autoCopy = null;
+  setSyncLine("");
+}
+
+// ---------------------------------------------------------------------------
+// Copy sessions from this phone to the sight by hand ("log put", with a choice)
 // ---------------------------------------------------------------------------
 let copyState = null;   // { phase: "keys" | "put", keys: Set, queue: [], done, added, exists, timer }
 
@@ -1917,6 +2046,10 @@ function copyOnAck(m) {
   clearTimeout(c.timer);
   if (m.result === "added") c.added++;
   else if (m.result === "exists") c.exists++;
+  if (m.result === "added" || m.result === "exists") {
+    const r = c && c.queue[c.done];
+    if (r) markOnSight(new Set([r.key]), true);
+  }
   else { finishCopy("The sight could not store a session. Copying stopped.", true); return; }
   c.done++;
   copyNext();
@@ -1959,10 +2092,6 @@ function exportCsv() {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-$("btnSync").addEventListener("click", () => {
-  if (state.conn !== "connected") { toast("Connect to the sight first.", true); return; }
-  requestLog();
-});
 $("btnExport").addEventListener("click", exportCsv);
 
 // ---------------------------------------------------------------------------
@@ -2264,6 +2393,11 @@ $("showHiddenCb").addEventListener("change", () => {
   }
 });
 $("btnClearLog").addEventListener("click", clearSightLog);
+$("autoCopyCb").checked = autoCopyOn();
+$("autoCopyCb").addEventListener("change", () => {
+  try { localStorage.setItem(AUTOCOPY_KEY, $("autoCopyCb").checked ? "on" : "off"); } catch {}
+  if ($("autoCopyCb").checked) startAutoCopy(); else stopAutoCopy();
+});
 
 $("btnDfu").addEventListener("click", async () => {
   const ok = await dialog({

@@ -438,6 +438,10 @@
 
   <!-- History -->
   <section class="view" id="view-history" hidden>
+    <div class="toolbar" id="manualSyncBar" hidden>
+      <button class="btn secondary" id="btnSync">Get from sight</button>
+      <button class="btn secondary" id="btnToSight">Copy to sight</button>
+    </div>
     <div class="toolbar three">
       <button class="btn secondary" id="btnExport">CSV</button>
       <button class="btn secondary" id="btnBackup">Backup</button>
@@ -445,6 +449,7 @@
     </div>
     <input type="file" id="importFile" accept=".json,.csv,application/json,text/csv" hidden>
     <p class="progress" id="syncLine" hidden></p>
+    <p class="progress" id="copyProgress" hidden></p>
     <div class="chart" id="chart" hidden>
       <h3>Average per session <small class="muted" id="chartSub"></small></h3>
       <svg id="chartSvg" viewBox="0 0 320 150" preserveAspectRatio="none" role="img" aria-label="Average per session"></svg>
@@ -488,15 +493,9 @@
         <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show hidden history entries"><span></span></label>
       </div>
       <div class="switchrow">
-        <div><div class="lbl">Copy sessions to the sight automatically</div>
-          <div class="desc">Sessions on this phone that the sight doesn't have (imported, or not stored there) are copied whenever the app is connected.</div></div>
-        <label class="switch"><input type="checkbox" id="autoCopyCb" aria-label="Copy sessions to the sight automatically"><span></span></label>
-      </div>
-      <div class="switchrow">
-        <div><div class="lbl">Copy to sight by hand</div>
-          <div class="desc">Choose which of the missing sessions to copy.</div>
-          <p class="progress" id="copyProgress" hidden style="margin:6px 0 0"></p></div>
-        <button class="btn secondary" id="btnToSight">Choose…</button>
+        <div><div class="lbl">Sync logs automatically</div>
+          <div class="desc" id="syncDesc"></div></div>
+        <label class="switch"><input type="checkbox" id="autoCopyCb" aria-label="Sync logs automatically"><span></span></label>
       </div>
       <div class="switchrow">
         <div><div class="lbl">Session log on the sight</div>
@@ -590,7 +589,7 @@ const PROTO_EXPECTED  = 9;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.0";
+const APP_VERSION     = "4.1";
 
 // ---------------------------------------------------------------------------
 // State
@@ -902,6 +901,7 @@ function handleLine(line) {
       }
       if (typeof m.last === "number" && m.last >= loadLogSeq()) saveLogSeq(m.last);
       if (syncCount) toast(`${syncCount} new ${syncCount === 1 ? "session" : "sessions"} from the sight`);
+      else if (!autoCopyOn()) toast("Everything is already on this phone");
       renderHistory();
       startAutoCopy();                             // then send back what the sight is missing
       break;
@@ -1730,18 +1730,28 @@ function delOnAck(m) {
   }
 }
 
+// Sync on: everything automatic. Sync off: the manual buttons in History (as before)
+function applySyncUi() {
+  const on = autoCopyOn();
+  $("autoCopyCb").checked = on;
+  $("manualSyncBar").hidden = on;
+  $("syncDesc").textContent = on
+    ? "New sessions are fetched from the sight on every connect, and sessions the sight is missing are copied to it."
+    : "Off: use Get from sight and Copy to sight in History.";
+}
+
 // After clearing: copy everything back (testing, new chip) or keep the sight empty (giving it away)
 async function afterClear(count) {
   markOnSight(new Set(loadArchive().map((r) => r.key)), false);
   const back = await dialog({
     title: `Log cleared (${count} ${count === 1 ? "session" : "sessions"})`,
-    text: "Copy the sessions from this phone back to the sight automatically? Choose No if you give the sight away.",
+    text: "Keep syncing and copy the sessions from this phone back to the sight? Choose No if you give the sight away; syncing is then switched off.",
     yes: "Copy back", no: "No",
   });
   try { localStorage.setItem(AUTOCOPY_KEY, back ? "on" : "off"); } catch {}
-  $("autoCopyCb").checked = back;
+  applySyncUi();
   if (back) startAutoCopy();
-  else toast("Automatic copying to the sight is off. You can turn it on in Settings.");
+  else toast("Sync logs automatically is off. You can turn it on again in Settings.");
 }
 
 async function clearSightLog() {
@@ -1874,7 +1884,7 @@ function markOnSight(keys, value) {
 
 // Called once the app is connected and the sight speaks JSON
 function autoSync() {
-  if (state.conn !== "connected" || copyState) return;
+  if (!autoCopyOn() || state.conn !== "connected" || copyState) return;
   if (localStorage.getItem(ONSIGHT_INIT_KEY) !== "1") {
     fullScan = true;                              // first time: learn what the sight has
     send("log since 0");
@@ -2092,6 +2102,10 @@ function exportCsv() {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
+$("btnSync").addEventListener("click", () => {
+  if (state.conn !== "connected") { toast("Connect to the sight first.", true); return; }
+  requestLog();
+});
 $("btnExport").addEventListener("click", exportCsv);
 
 // ---------------------------------------------------------------------------
@@ -2393,10 +2407,11 @@ $("showHiddenCb").addEventListener("change", () => {
   }
 });
 $("btnClearLog").addEventListener("click", clearSightLog);
-$("autoCopyCb").checked = autoCopyOn();
+applySyncUi();
 $("autoCopyCb").addEventListener("change", () => {
   try { localStorage.setItem(AUTOCOPY_KEY, $("autoCopyCb").checked ? "on" : "off"); } catch {}
-  if ($("autoCopyCb").checked) startAutoCopy(); else stopAutoCopy();
+  applySyncUi();
+  if ($("autoCopyCb").checked) autoSync(); else stopAutoCopy();
 });
 
 $("btnDfu").addEventListener("click", async () => {

@@ -373,7 +373,7 @@
       <div style="text-align:center; margin-top:18px">
         <button class="btn secondary" id="btnReconnect" hidden>Reconnect</button>
       </div>
-      <p class="fw" id="runNote">Runtimes are rough estimates from the current battery level, the battery capacity and the LED brightness.</p>
+      <p class="fw" id="runNote">Runtimes come from the sight: from its measured current draw once it has enough data, before that from estimates.</p>
       <p class="fw" id="fw"></p>
     </div>
   </section>
@@ -487,12 +487,6 @@
         <button class="btn secondary" id="btnDfu">Start</button>
       </div>
       <div class="switchrow">
-        <div><div class="lbl">Battery capacity</div>
-          <div class="desc">Used for the runtime estimate on the Status tab. Stored on this phone.</div></div>
-        <input type="number" id="batCap" min="10" max="5000" step="1" inputmode="numeric"
-               style="width:96px;min-height:40px;border-radius:10px;border:2px solid var(--line);background:var(--paper);color:var(--ink);padding:0 8px;font:inherit;text-align:right" aria-label="Battery capacity in mAh">
-      </div>
-      <div class="switchrow">
         <div><div class="lbl">Show hidden history entries</div>
           <div class="desc">Sessions removed from this phone only appear greyed out in History and can be shown again.</div></div>
         <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show hidden history entries"><span></span></label>
@@ -585,11 +579,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 8;
+const PROTO_EXPECTED  = 9;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "3.7";
+const APP_VERSION     = "3.8";
 
 // ---------------------------------------------------------------------------
 // State
@@ -890,6 +884,9 @@ function handleLine(line) {
     case "loginfo":
       state.loginfo = m;
       break;
+    case "bat":
+      state.bat = m;
+      break;
     case "ack":
       if (m.cmd === "set" && state.cfg) {
         const it = state.cfg.items.find((x) => x.k === m.k);
@@ -1015,7 +1012,9 @@ function render() {
   const lvDetail = lv && lv.mode !== "off" ? `${lv.mode}, ${lv.style || "normal"}` : "";
   $("vTilt").innerHTML = tiltText + (lvDetail && tiltText !== "Off" ? ` <small>${lvDetail}</small>` : "");
 
-  $("vCharge").textContent = chargeLabel(s.chg);
+  const full = state.bat && s.chg === "charging" && typeof state.bat.full === "number"
+    ? `, full in ${fmtDuration(state.bat.full / 60)}` : "";
+  $("vCharge").textContent = chargeLabel(s.chg) + full;
 
   // Strength of the last shot, with the threshold for comparison
   const tap = cfgValue("tap_ths");
@@ -1036,26 +1035,12 @@ function render() {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime estimate (rough, from battery level, capacity and settings)
+// Runtime estimate: computed on the sight ("bat" message), only shown here
 // ---------------------------------------------------------------------------
-const BATCAP_KEY      = "uvsight.batcap";
-const BATCAP_DEFAULT  = 85;     // mAh
-const IDLE_MA         = 0.06;   // board asleep, IMU in low-power mode
-const ACTIVE_BASE_MA  = 0.6;    // board awake, Bluetooth advertising or connected
-const SHOT_MODE_MA    = 0.2;    // IMU at 416 Hz for shot detection
-const CANT_LOOP_MA    = 0.2;    // faster loop for the cant indicator
-const LED_MAX_MA      = 15;     // must match BRIGHT_MAX_MA in the firmware
-const LED_GAMMA       = 2.2;    // must match BRIGHT_GAMMA in the firmware
-
-function batteryCapacity() {
-  const v = Number(localStorage.getItem(BATCAP_KEY));
-  return v > 0 ? v : BATCAP_DEFAULT;
-}
 function cfgValue(k) {
   const it = state.cfg && state.cfg.items.find((x) => x.k === k);
   return it ? Number(it.v) : null;
 }
-const pctToMa = (p) => LED_MAX_MA * Math.pow(Math.max(0, Math.min(100, p)) / 100, LED_GAMMA);
 
 function fmtDuration(hours) {
   if (!isFinite(hours) || hours <= 0) return "–";
@@ -1066,19 +1051,15 @@ function fmtDuration(hours) {
 }
 
 function runtimeEstimates(s) {
+  const b = state.bat;
+  if (!b) return null;
   if (s.chg === "charging") return { light: "Charging", idle: "Charging" };
-  const remaining = batteryCapacity() * Math.max(0, s.pct) / 100;   // 0 % = cutoff
+  const src = b.src === "measured" ? `measured, ${b.rows} windows` : "estimate";
   const bright = cfgValue("bright");
-  if (bright === null) return null;
-  const ses = state.session || {}, lv = state.level || {};
-  let active = ACTIVE_BASE_MA;
-  if (ses.counter)                     active += SHOT_MODE_MA;
-  if (lv.mode && lv.mode !== "off")    active += CANT_LOOP_MA;
-  const withLight = active + pctToMa(bright);       // full brightness, worst case in auto mode
   const auto = cfgValue("bright_mode") === 1;
   return {
-    light: `${fmtDuration(remaining / withLight)} <small>LED ${Math.round(bright)} %${auto ? " (fully dark)" : ""}</small>`,
-    idle:  `${fmtDuration(remaining / IDLE_MA)} <small>bow lying still</small>`,
+    light: `${fmtDuration(b.light)} <small>LED ${bright === null ? "" : Math.round(bright) + " %"}${auto ? " (fully dark)" : ""}, ${src}</small>`,
+    idle:  `${fmtDuration(b.rest)} <small>bow lying still, ${src}</small>`,
   };
 }
 
@@ -2008,7 +1989,7 @@ const GROUPS = [
   { title: "UV light",     keys: ["bright_mode", "bright", "bright_min", "fade", "vf"] },
   { title: "Cant",         keys: ["level_tol", "tilt_offset", "tilt_full", "blink_min", "blink_max", "tilt_smooth"], cal: true },
   { title: "Shot detection and sessions", keys: ["tap_ths", "lockout", "session_end"] },
-  { title: "Battery",      keys: ["cutoff"] },
+  { title: "Battery",      keys: ["cutoff", "bat_mah"] },
   { title: "Power and Bluetooth", keys: ["ths", "timeout", "report", "tx_power"] },
 ];
 const DESCS = {
@@ -2033,6 +2014,7 @@ const DESCS = {
   timeout: "The sight sleeps after this time without movement.",
   report: "Automatic status message while connected.",
   tx_power: "More range, slightly more current while the sight is active. Rounded to the steps the radio supports.",
+  bat_mah: "Capacity of the battery. The sight measures its own current draw; this turns it into hours.",
 };
 const LABELS = {
   dark_on: "Dark below", dark_off: "Bright above", confirm: "Readings before switching",
@@ -2041,7 +2023,7 @@ const LABELS = {
   tilt_smooth: "Smoothing", session_end: "End session after",
   level_tol: "Tolerance", tap_ths: "Shot threshold", lockout: "Pause after a shot",
   cutoff: "Cutoff voltage", ths: "Wake-up sensitivity", timeout: "Sleep after", report: "Status report every",
-  tx_power: "Radio power",
+  tx_power: "Radio power", bat_mah: "Battery capacity",
 };
 
 function shownValue(it, v) {
@@ -2282,13 +2264,6 @@ $("showHiddenCb").addEventListener("change", () => {
   }
 });
 $("btnClearLog").addEventListener("click", clearSightLog);
-$("batCap").value = batteryCapacity();
-$("batCap").addEventListener("change", () => {
-  const v = Math.round(Number($("batCap").value));
-  if (v >= 10 && v <= 5000) { localStorage.setItem(BATCAP_KEY, String(v)); toast(`Battery capacity set to ${v} mAh`); }
-  $("batCap").value = batteryCapacity();
-  render();
-});
 
 $("btnDfu").addEventListener("click", async () => {
   const ok = await dialog({

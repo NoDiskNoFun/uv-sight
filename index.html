@@ -194,6 +194,15 @@
   .r-white { background: #FAFAF7; color: #1B1B1B; box-shadow: inset 0 0 0 1.5px #BFC5BD; }
   .r-miss  { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line); }
 
+  .distrow { display: flex; align-items: center; gap: 10px; margin: 12px 0 0; }
+  .distrow .lbl { color: var(--muted); }
+  .distrow button { width: 44px; height: 44px; border-radius: 50%; border: 0; font-size: 1.4rem; font-weight: 700;
+                    background: transparent; color: var(--ink); box-shadow: inset 0 0 0 2px var(--line); cursor: pointer; }
+  .distrow b { min-width: 64px; text-align: center; font-size: 1.25rem; font-variant-numeric: tabular-nums; }
+  .distrow .ang { margin-left: auto; color: var(--muted); font-size: .9rem; font-variant-numeric: tabular-nums; }
+  .endtab { width: 100%; border-collapse: collapse; font-size: .9rem; font-variant-numeric: tabular-nums; }
+  .endtab th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 6px 4px 0; }
+  .endtab td { padding: 5px 6px 5px 0; border-top: 1px solid var(--line); }
   .keypad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .keypad button {
     border: 0; border-radius: var(--radius-s); min-height: 60px;
@@ -410,6 +419,13 @@
         <div class="last-end" id="tOffline" hidden>Not connected. Keep scoring: the app reconnects when you tap Save.</div>
       </div>
 
+      <div class="distrow">
+        <span class="lbl">Distance</span>
+        <button id="distMinus" aria-label="Shorter">−</button>
+        <b id="distVal">50 m</b>
+        <button id="distPlus" aria-label="Longer">+</button>
+        <span class="ang" id="lastAng"></span>
+      </div>
       <div class="entry" id="entry" aria-live="polite"></div>
 
       <div class="keypad" id="keypad">
@@ -589,11 +605,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 9;
+const PROTO_EXPECTED  = 10;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.2";
+const APP_VERSION     = "4.3";
 
 // ---------------------------------------------------------------------------
 // State
@@ -616,6 +632,13 @@ let awaitTimer = null;
 let confirmOpen = false;
 let lastEnd = null;        // last closed end, for the summary line
 let lastSentScores = null; // scores of the end just sent, kept for the end details
+const DIST_KEY = "uvsight.dist";
+let distM = Number(localStorage.getItem(DIST_KEY)) || 50;   // distance for the next end, 10 m steps
+function setDist(d) {
+  distM = Math.max(10, Math.min(150, d));
+  try { localStorage.setItem(DIST_KEY, String(distM)); } catch {}
+  $("distVal").textContent = `${distM} m`;
+}
 let reconnecting = false;  // Save/Skip/End is re-establishing the connection
 const TRAIN_KEY = "uvsight.training.v1";
 const RECONNECT_TIMEOUT_MS = 10000;
@@ -815,6 +838,7 @@ function handleLine(line) {
       break;
     case "level":   state.level   = m; break;
     case "shot":
+      $("lastAng").textContent = typeof m.ang === "number" ? `last shot ${m.ang.toFixed(2)}°` : "";
       if (state.status && typeof m.g === "number") {
         state.status.lastShotG = m.g;
         state.status.lastShotClip = !!m.clip;
@@ -912,6 +936,9 @@ function handleLine(line) {
     case "loginfo":
       state.loginfo = m;
       break;
+    case "endrec":
+      mergeEndRec(m);
+      break;
     case "bat":
       state.bat = m;
       break;
@@ -924,6 +951,7 @@ function handleLine(line) {
       if (m.cmd === "save") { cfgDirty = false; toast("Settings saved on the sight"); }
       if (m.cmd === "mode" && state.status) state.status.mode = m.mode;
       if (m.cmd === "put" && !autoCopyOnAck(m)) copyOnAck(m);
+      if (m.cmd === "putend") endPutOnAck();
       if (m.cmd === "del") delOnAck(m);
       if (m.cmd === "clear") {
         send("log info");
@@ -1244,7 +1272,7 @@ function sendEnd() {
     const tokens = entries.map((v) => (v === "X" ? "x" : v === "M" ? "0" : v));
     lastSentScores = entries.slice();
     setAwaiting(true);
-    send("score " + tokens.join(" "));
+    send("score " + tokens.join(" ") + ` @${distM}`);
     render();
   });
 }
@@ -1307,7 +1335,7 @@ $("btnSkip").addEventListener("click", async () => {
   withConnection(() => {
     entries = [];
     saveTraining();
-    send("score skip");
+    send(`score skip @${distM}`);
     render();
   });
 });
@@ -1574,6 +1602,8 @@ function recordEnd(m) {
   const all = loadEnds();
   const list = (all[key] || []).filter((e) => e.n !== m.n);
   const rec = { n: m.n, valid: !!m.valid, arrows: m.arrows };
+  if (typeof m.dist === "number") rec.dist = m.dist;
+  if (typeof m.ang === "number") { rec.ang = m.ang; rec.angSd = m.angSd; rec.angN = m.angN; }
   if (m.valid) {
     rec.sum = m.sum; rec.x = m.x;
     if (lastSentScores && lastSentScores.length === m.arrows) rec.scores = lastSentScores;
@@ -1586,6 +1616,64 @@ function recordEnd(m) {
   saveEnds(all);
   lastSentScores = null;
 }
+// An end stored on the sight: add it, or fill in what the phone doesn't know yet
+function mergeEndRec(m) {
+  const key = `${m.epoch}-${m.id}`;
+  const all = loadEnds();
+  const list = all[key] || [];
+  let e = list.find((x) => x.n === m.n);
+  if (!e) {
+    e = { n: m.n, valid: !!m.valid, arrows: m.arrows };
+    if (m.valid) {
+      e.sum = m.sum; e.x = m.x;
+      if (m.scores) e.scores = m.scores.split(" ").filter(Boolean).map((v) => (v === "0" ? "M" : v));
+    } else {
+      e.reason = m.skipped ? "skipped" : "no scores";
+    }
+    list.push(e);
+    list.sort((a, b) => a.n - b.n);
+  }
+  if (e.dist == null && typeof m.dist === "number") e.dist = m.dist;
+  if (e.ang == null && typeof m.ang === "number") { e.ang = m.ang; e.angSd = m.angSd; e.angN = m.angN; }
+  all[key] = list;
+  saveEnds(all);
+}
+
+// Send the ends of a session to the sight ("log putend"), then continue with done()
+let endPut = null;
+const scoringBusy = () => awaitingEnd || confirmOpen || reconnecting || calBusy ||
+                          (state.session && state.session.pending) || state.conn !== "connected";
+function putEndsThen(r, done) {
+  const list = (loadEnds()[r.key] || []).slice();
+  if (!list.length) { done(); return; }
+  endPut = { r, list, i: 0, done, timer: null, wait: null };
+  putEndNext();
+}
+function putEndNext() {
+  const p = endPut;
+  if (!p) return;
+  clearTimeout(p.wait);
+  if (p.i >= p.list.length) { endPut = null; p.done(); return; }
+  if (state.conn !== "connected") { endPut = null; return; }
+  if (scoringBusy()) { p.wait = setTimeout(putEndNext, 3000); return; }
+  const e = p.list[p.i];
+  const flags = (e.valid ? 1 : 0) | (e.reason === "skipped" ? 2 : 0);
+  const hex = (e.scores || []).map((v) => (v === "X" ? "B" : v === "10" ? "A" : v === "M" ? "0" : v)).join("") || "-";
+  const angC = typeof e.ang === "number" ? Math.round(e.ang * 100) : -32768;
+  const sdC  = typeof e.angSd === "number" ? Math.round(e.angSd * 100) : 0;
+  send(`log putend ${p.r.epoch} ${p.r.id} ${e.n} ${e.arrows || 0} ${flags} ${e.sum || 0} ${e.x || 0} ` +
+       `${e.dist || 0} ${angC} ${sdC} ${e.angN || 0} ${hex}`);
+  clearTimeout(p.timer);
+  p.timer = setTimeout(() => { const q = endPut; endPut = null; if (q) q.done(); }, 8000);
+}
+function endPutOnAck() {
+  const p = endPut;
+  if (!p) return;
+  clearTimeout(p.timer);
+  p.i++;
+  putEndNext();
+}
+
 const SCORE_ORDER = ["X", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1", "M"];
 const RING_COLOR = { X: "#F2C230", 10: "#F2C230", 9: "#F2C230", 8: "#D6402F", 7: "#D6402F",
   6: "#2F6DB5", 5: "#2F6DB5", 4: "#555", 3: "#555", 2: "#BFC5BD", 1: "#BFC5BD", M: "var(--line)" };
@@ -1617,6 +1705,14 @@ function sessionEndsSvg(ends) {
   return svg;
 }
 
+function endsTable(ends) {
+  if (!ends.some((e) => e.dist != null || e.ang != null)) return "";
+  const rows = ends.map((e) => `<tr><td>${e.n}</td><td>${e.dist != null ? e.dist + " m" : "–"}</td>` +
+    `<td>${e.valid ? e.sum : "invalid"}</td>` +
+    `<td>${e.ang != null ? e.ang.toFixed(2) + "° <small class=\"muted\">±" + Number(e.angSd || 0).toFixed(2) + "</small>" : "–"}</td></tr>`).join("");
+  return `<h4>Ends</h4><table class="endtab"><tr><th>End</th><th>Distance</th><th>Points</th><th>Aiming angle</th></tr>${rows}</table>`;
+}
+
 function scoreDistribution(ends) {
   const count = {};
   let total = 0;
@@ -1645,7 +1741,7 @@ function showSession(r) {
   } else {
     $("sdEnds").innerHTML = `<p class="bar-note">No end details: this session was not scored in this app.</p>`;
   }
-  $("sdDist").innerHTML = scoreDistribution(ends);
+  $("sdDist").innerHTML = endsTable(ends) + scoreDistribution(ends);
   const d = $("sessDlg");
   $("sdClose").onclick = () => d.close();
   $("sdDelete").onclick = () => { d.close(); askRemove(r); };
@@ -1945,10 +2041,10 @@ function autoCopyOnAck(m) {
   if (!r || String(m.epoch) !== String(r.epoch) || String(m.id) !== String(r.id)) return false;
   clearTimeout(c.timer);
   if (m.result === "added" || m.result === "exists") {
-    if (m.result === "added") c.added++;
     markOnSight(new Set([r.key]), true);
-    c.i++;
-    autoCopyNext();
+    const next = () => { if (autoCopy === c) { c.i++; autoCopyNext(); } };
+    if (m.result === "added") { c.added++; putEndsThen(r, next); }
+    else next();
   } else {
     stopAutoCopy();                              // storage problem: don't hammer the sight
   }
@@ -2063,10 +2159,12 @@ function copyOnAck(m) {
   if (m.result === "added" || m.result === "exists") {
     const r = c && c.queue[c.done];
     if (r) markOnSight(new Set([r.key]), true);
+    const next = () => { if (copyState === c) { c.done++; copyNext(); } };
+    if (m.result === "added" && r) putEndsThen(r, next);
+    else next();
+    return;
   }
-  else { finishCopy("The sight could not store a session. Copying stopped.", true); return; }
-  c.done++;
-  copyNext();
+  finishCopy("The sight could not store a session. Copying stopped.", true);
 }
 
 function finishCopy(text, isErr) {
@@ -2302,6 +2400,12 @@ function renderSettings() {
       st, ["normal", "inverted"], (m) => send("level style " + m)));
   }
   const ledMode = (state.status && state.status.mode) || "auto";
+  const angMode = lv.angle || "auto";
+  sw.appendChild(segRow("Aiming angle",
+    (angMode === "auto" ? "Measured at every shot during a session."
+      : angMode === "on" ? "Measured at every shot, also outside a session."
+      : "Not measured.") + (lv.cal ? "" : " Needs the cant calibration."),
+    angMode, ["off", "auto", "on"], (m) => send("angle " + m)));
   sw.appendChild(segRow("LED",
     (ledMode === "auto" ? "Auto: switched by the light sensor."
       : ledMode === "on" ? "On: always lit." : "Off: stays dark.") +
@@ -2519,6 +2623,9 @@ if (!navigator.bluetooth) {
   $("btnConnect").disabled = true;
 }
 loadTraining();
+setDist(distM);
+$("distMinus").addEventListener("click", () => setDist(distM - 10));
+$("distPlus").addEventListener("click", () => setDist(distM + 10));
 render();
 renderHistory();
 

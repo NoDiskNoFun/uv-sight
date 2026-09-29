@@ -611,11 +611,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 11;
+const PROTO_EXPECTED  = 12;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.4";
+const APP_VERSION     = "4.5";
 
 // ---------------------------------------------------------------------------
 // State
@@ -638,12 +638,25 @@ let awaitTimer = null;
 let confirmOpen = false;
 let lastEnd = null;        // last closed end, for the summary line
 let lastSentScores = null; // scores of the end just sent, kept for the end details
-const DIST_KEY = "uvsight.dist";
-let distM = Number(localStorage.getItem(DIST_KEY)) || 50;   // distance for the next end, 10 m steps
+const DIST_KEY = "uvsight.dist";              // distance of the running session (0 = unknown)
+const DIST_LAST_KEY = "uvsight.distLast";     // last distance set by hand, for the + button
+const DIST_SESSION_KEY = "uvsight.distSession";
+let distM = Number(localStorage.getItem(DIST_KEY)) || 0;
 function setDist(d) {
-  distM = Math.max(10, Math.min(150, d));
-  try { localStorage.setItem(DIST_KEY, String(distM)); } catch {}
+  distM = Math.max(0, Math.min(150, d));
+  try {
+    localStorage.setItem(DIST_KEY, String(distM));
+    if (distM > 0) localStorage.setItem(DIST_LAST_KEY, String(distM));
+  } catch {}
   $("distVal").textContent = `${distM} m`;
+}
+// A new session starts with an unknown distance
+function checkNewSession(m) {
+  if (!m.active || !m.epoch || !m.nextId) return;
+  const key = `${m.epoch}-${m.nextId}`;
+  if (localStorage.getItem(DIST_SESSION_KEY) === key) return;
+  try { localStorage.setItem(DIST_SESSION_KEY, key); } catch {}
+  setDist(0);
 }
 let reconnecting = false;  // Save/Skip/End is re-establishing the connection
 const TRAIN_KEY = "uvsight.training.v1";
@@ -841,10 +854,14 @@ function handleLine(line) {
     case "session":
       state.session = m;
       rememberStart(m);
+      checkNewSession(m);
       break;
     case "level":   state.level   = m; break;
     case "shot":
-      $("lastAng").textContent = typeof m.ang === "number" ? `last shot ${m.ang.toFixed(2)}°` : "";
+      $("lastAng").textContent = [
+        typeof m.ang === "number" ? `angle ${m.ang.toFixed(2)}°` : "",
+        typeof m.cant === "number" ? `cant ${m.cant.toFixed(1)}°` : "",
+      ].filter(Boolean).join(", ");
       if (state.status && typeof m.g === "number") {
         state.status.lastShotG = m.g;
         state.status.lastShotClip = !!m.clip;
@@ -1621,6 +1638,7 @@ function recordEnd(m) {
   const rec = { n: m.n, valid: !!m.valid, arrows: m.arrows };
   if (typeof m.dist === "number") rec.dist = m.dist;
   if (typeof m.ang === "number") { rec.ang = m.ang; rec.angSd = m.angSd; rec.angN = m.angN; }
+  if (typeof m.cant === "number") { rec.cant = m.cant; rec.cantMax = m.cantMax; rec.canted = m.canted; rec.cantN = m.cantN; }
   if (m.valid) {
     rec.sum = m.sum; rec.x = m.x;
     if (lastSentScores && lastSentScores.length === m.arrows) rec.scores = lastSentScores;
@@ -1652,6 +1670,7 @@ function mergeEndRec(m) {
   }
   if (e.dist == null && typeof m.dist === "number") e.dist = m.dist;
   if (e.ang == null && typeof m.ang === "number") { e.ang = m.ang; e.angSd = m.angSd; e.angN = m.angN; }
+  if (e.cant == null && typeof m.cant === "number") { e.cant = m.cant; e.cantMax = m.cantMax; e.canted = m.canted; e.cantN = m.cantN; }
   all[key] = list;
   saveEnds(all);
 }
@@ -1678,8 +1697,11 @@ function putEndNext() {
   const hex = (e.scores || []).map((v) => (v === "X" ? "B" : v === "10" ? "A" : v === "M" ? "0" : v)).join("") || "-";
   const angC = typeof e.ang === "number" ? Math.round(e.ang * 100) : -32768;
   const sdC  = typeof e.angSd === "number" ? Math.round(e.angSd * 100) : 0;
+  const hasCant = typeof e.cant === "number";
+  const cant = hasCant ? `${Math.round(e.cant * 100)} ${Math.round((e.cantMax || 0) * 100)} ${e.cantN || 0} ${e.canted || 0}`
+                       : "0 0 0 0";
   send(`log putend ${p.r.epoch} ${p.r.id} ${e.n} ${e.arrows || 0} ${flags} ${e.sum || 0} ${e.x || 0} ` +
-       `${e.dist || 0} ${angC} ${sdC} ${e.angN || 0} ${hex}`);
+       `${e.dist || 0} ${angC} ${sdC} ${e.angN || 0} ${cant} ${hex}`);
   clearTimeout(p.timer);
   p.timer = setTimeout(() => { const q = endPut; endPut = null; if (q) q.done(); }, 8000);
 }
@@ -1723,11 +1745,14 @@ function sessionEndsSvg(ends) {
 }
 
 function endsTable(ends) {
-  if (!ends.some((e) => e.dist != null || e.ang != null)) return "";
-  const rows = ends.map((e) => `<tr><td>${e.n}</td><td>${e.dist != null ? e.dist + " m" : "–"}</td>` +
+  if (!ends.some((e) => e.dist != null || e.ang != null || e.cant != null)) return "";
+  const rows = ends.map((e) => `<tr><td>${e.n}</td><td>${e.dist ? e.dist + " m" : "–"}</td>` +
     `<td>${e.valid ? e.sum : "invalid"}</td>` +
-    `<td>${e.ang != null ? e.ang.toFixed(2) + "° <small class=\"muted\">±" + Number(e.angSd || 0).toFixed(2) + "</small>" : "–"}</td></tr>`).join("");
-  return `<h4>Ends</h4><table class="endtab"><tr><th>End</th><th>Distance</th><th>Points</th><th>Aiming angle</th></tr>${rows}</table>`;
+    `<td>${e.ang != null ? e.ang.toFixed(2) + "° <small class=\"muted\">±" + Number(e.angSd || 0).toFixed(2) + "</small>" : "–"}</td>` +
+    `<td>${e.cant != null ? Math.abs(e.cant).toFixed(1) + "°" +
+        (e.canted ? ` <small class="muted">${e.canted} over</small>` : "") : "–"}</td></tr>`).join("");
+  return `<h4>Ends</h4><table class="endtab"><tr><th>End</th><th>Distance</th><th>Points</th><th>Aiming angle</th><th>Cant</th></tr>${rows}</table>` +
+    `<p class="bar-note">Cant: average at release; "over" counts arrows outside your cant tolerance.</p>`;
 }
 
 function scoreDistribution(ends) {
@@ -2642,7 +2667,9 @@ if (!navigator.bluetooth) {
 loadTraining();
 setDist(distM);
 $("distMinus").addEventListener("click", () => setDist(distM - 10));
-$("distPlus").addEventListener("click", () => setDist(distM + 10));
+// From 0 m, + jumps to the distance you used last instead of 10 m
+$("distPlus").addEventListener("click", () =>
+  setDist(distM === 0 ? (Number(localStorage.getItem(DIST_LAST_KEY)) || 10) : distM + 10));
 render();
 renderHistory();
 

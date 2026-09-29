@@ -380,6 +380,7 @@
         <li><span class="k">Cant</span><span class="v" id="vTilt">–</span></li>
         <li><span class="k">Last shot</span><span class="v" id="vShotG">–</span></li>
         <li><span class="k">Charging</span><span class="v" id="vCharge">–</span></li>
+        <li><span class="k">Arrow speed</span><span class="v" id="vSpeed">–</span></li>
         <li><span class="k">Runtime with light</span><span class="v" id="vRunLight">–</span></li>
         <li><span class="k">Runtime resting</span><span class="v" id="vRunIdle">–</span></li>
       </ul>
@@ -427,7 +428,7 @@
       <div class="distrow">
         <span class="lbl">Distance</span>
         <button id="distMinus" aria-label="Shorter">−</button>
-        <b id="distVal">50 m</b>
+        <b id="distVal">50 m</b><small class="muted" id="distSrc"></small>
         <button id="distPlus" aria-label="Longer">+</button>
         <span class="ang" id="lastAng"></span>
       </div>
@@ -501,6 +502,13 @@
       </div>
     </div>
 
+    <div class="group" id="setupGroup" hidden>
+      <h3>Setups</h3>
+      <p class="gnote">One per arrow set or bow setting. Each learns its own arrow speed, so switching back needs no new learning.</p>
+      <div id="setupList"></div>
+      <div style="margin:8px 0 12px"><button class="btn secondary" id="btnSetupNew">New setup</button></div>
+    </div>
+
     <div class="group" id="sessGroup">
       <h3>Sessions</h3>
       <div class="switchrow">
@@ -562,6 +570,17 @@
     </div>
   </dialog>
 
+  <dialog id="txtDlg">
+    <h3 id="txtTitle"></h3>
+    <p class="muted" id="txtText"></p>
+    <input id="txtInput" maxlength="18" autocomplete="off"
+      style="width:100%;min-height:44px;border-radius:10px;border:2px solid var(--line);background:var(--paper);color:var(--ink);padding:0 12px;font:inherit;margin-bottom:14px">
+    <div class="row" style="display:flex; gap:10px; justify-content:flex-end">
+      <button class="btn secondary" id="txtNo">Cancel</button>
+      <button class="btn" id="txtYes">OK</button>
+    </div>
+  </dialog>
+
   <dialog id="rmDlg">
     <h3>Remove this session?</h3>
     <p class="muted" id="rmText"></p>
@@ -611,11 +630,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 12;
+const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.6";
+const APP_VERSION     = "5.1";
 
 // ---------------------------------------------------------------------------
 // State
@@ -642,21 +661,59 @@ const DIST_KEY = "uvsight.dist";              // distance of the running session
 const DIST_LAST_KEY = "uvsight.distLast";     // last distance set by hand, for the + button
 const DIST_SESSION_KEY = "uvsight.distSession";
 let distM = Number(localStorage.getItem(DIST_KEY)) || 0;
-function setDist(d) {
+let distAuto = false;                         // shown distance was recognised by the sight
+let distPresetAt = 0;                         // set by hand while no session was running
+const DIST_PRESET_MS = 30 * 60 * 1000;        // ... counts for a session starting within 30 min
+function setDist(d, fromSight) {
   distM = Math.max(0, Math.min(150, d));
+  distAuto = !!fromSight;
+  if (!fromSight) {
+    if (state.conn === "connected" && state.session && state.session.active) send(`dist ${distM}`);
+    else distPresetAt = Date.now();             // applies to the next session
+  }
   try {
     localStorage.setItem(DIST_KEY, String(distM));
     if (distM > 0) localStorage.setItem(DIST_LAST_KEY, String(distM));
   } catch {}
   $("distVal").textContent = `${distM} m`;
+  $("distSrc").textContent = distAuto ? "detected" : "";
 }
 // A new session starts with an unknown distance
 function checkNewSession(m) {
-  if (!m.active || !m.epoch || !m.nextId) return;
+  if (!m.active || !m.epoch || !m.nextId) return false;
   const key = `${m.epoch}-${m.nextId}`;
-  if (localStorage.getItem(DIST_SESSION_KEY) === key) return;
+  if (localStorage.getItem(DIST_SESSION_KEY) === key) return false;
   try { localStorage.setItem(DIST_SESSION_KEY, key); } catch {}
-  setDist(0);
+  if (typeof m.dist === "number" && m.dist > 0) {   // the sight already knows it (e.g. app restarted mid-session)
+    distPresetAt = 0;
+    return false;                               // -> taken over by adoptSightDistance
+  }
+  if (distPresetAt && Date.now() - distPresetAt < DIST_PRESET_MS && distM > 0) {
+    distPresetAt = 0;                           // set just before the start: it counts
+    send(`dist ${distM}`);
+    return true;
+  }
+  distPresetAt = 0;
+  setDist(0, true);
+  distAuto = false;
+  $("distSrc").textContent = "";
+  return true;
+}
+// The sight knows the distance of the running session (set here, or recognised)
+function adoptSightDistance(m) {
+  if (!m.active || typeof m.dist !== "number") return;
+  const auto = m.distSrc === "auto";
+  if (m.dist !== distM && (auto || m.dist > 0)) setDist(m.dist, true);
+  if (m.dist === distM) {
+    distAuto = auto;
+    $("distSrc").textContent = auto ? "detected" : "";
+  }
+}
+function showDistNote() {
+  const rg = state.range;
+  if (distAuto) $("distSrc").textContent = "detected";
+  else if (rg && rg.estimated && distM > 0) $("distSrc").textContent = "not learned yet";
+  else $("distSrc").textContent = "";
 }
 let reconnecting = false;  // Save/Skip/End is re-establishing the connection
 const TRAIN_KEY = "uvsight.training.v1";
@@ -715,15 +772,29 @@ async function openGatt() {
   txChar.addEventListener("characteristicvaluechanged", onData);
   await txChar.startNotifications();
   rxBuffer = "";
-  setConn("connected");
+  // Nothing else may go out before the sight confirmed JSON mode ("hello"):
+  // a score sent too early would be answered in text mode and look lost
+  const hello = waitHello(4000);
   send("app on");
+  await hello;
+  setConn("connected");
   // The sight has no clock: give it the phone's time (and UTC offset for its own printouts)
   send(`time ${Math.floor(Date.now() / 1000)} ${-new Date().getTimezoneOffset()}`);
+  if (distM > 0 && !distAuto && state.session && state.session.active) send(`dist ${distM}`);
   startPolling();
+}
+
+let helloResolve = null;
+function waitHello(ms) {
+  return new Promise((resolve) => {
+    helloResolve = resolve;
+    setTimeout(() => { if (helloResolve === resolve) { helloResolve = null; resolve(false); } }, ms);
+  });
 }
 
 function onDisconnected() {
   rxChar = txChar = null;
+  writeQueue = Promise.resolve();          // drop writes meant for the old connection
   cfgBuf = null; cfgRetries = 0; clearTimeout(cfgRetryTimer);
   setAwaiting(false);
   if (confirmOpen) { $("dlg").close(); confirmOpen = false; }
@@ -830,6 +901,7 @@ function handleLine(line) {
   switch (m.t) {
     case "hello":
       state.hello = m;
+      if (helloResolve) { const r = helloResolve; helloResolve = null; r(true); }
       checkProto();
       setTimeout(autoSync, 1500);                  // after settings and status have arrived
       break;
@@ -854,7 +926,7 @@ function handleLine(line) {
     case "session":
       state.session = m;
       rememberStart(m);
-      checkNewSession(m);
+      if (!checkNewSession(m)) adoptSightDistance(m);
       break;
     case "level":   state.level   = m; break;
     case "shot":
@@ -962,6 +1034,25 @@ function handleLine(line) {
     case "endrec":
       mergeEndRec(m);
       break;
+    case "range":
+      state.range = m;
+      showDistNote();
+      break;
+    case "setupsStart":
+      setupBuf = { active: m.active, list: [] };
+      break;
+    case "setupItem":
+      if (setupBuf) setupBuf.list.push(m);
+      break;
+    case "setupsEnd":
+      if (setupBuf) {
+        state.setups = setupBuf;
+        const names = setupNames();
+        for (const it of setupBuf.list) names[it.id] = it.name;
+        try { localStorage.setItem(SETUP_NAMES_KEY, JSON.stringify(names)); } catch {}
+        setupBuf = null;
+      }
+      break;
     case "bat":
       state.bat = m;
       break;
@@ -973,6 +1064,10 @@ function handleLine(line) {
       }
       if (m.cmd === "save") { cfgDirty = false; toast("Settings saved on the sight"); }
       if (m.cmd === "mode" && state.status) state.status.mode = m.mode;
+      if (m.cmd === "setup" && m.ok && typeof m.id === "number" && pendingUseNew) {
+        pendingUseNew = false;
+        send(`setup use ${m.id}`);
+      }
       if (m.cmd === "put" && !autoCopyOnAck(m)) copyOnAck(m);
       if (m.cmd === "putend") endPutOnAck();
       if (m.cmd === "del") delOnAck(m);
@@ -1050,6 +1145,7 @@ function render() {
   $("view-status").classList.toggle("stale", hasData && state.conn !== "connected");
   renderTraining();
   renderSettings();
+  renderSetups();
   if (!hasData) return;
 
   const s = state.status;
@@ -1105,6 +1201,12 @@ function render() {
   } else {
     $("vShotG").innerHTML = "No shot yet" + thr;
   }
+
+  // Arrow speed from the learned distances
+  const rg = state.range;
+  const setupTxt = rg && rg.name ? rg.name : "";
+  $("vSpeed").innerHTML = rg && rg.kmh ? `about ${rg.kmh} km/h <small>${setupTxt}</small>`
+    : `– <small>${setupTxt ? setupTxt + ", " : ""}still learning</small>`;
 
   // Runtime estimates
   const rt = runtimeEstimates(s);
@@ -1295,7 +1397,8 @@ function sendEnd() {
     const tokens = entries.map((v) => (v === "X" ? "x" : v === "M" ? "0" : v));
     lastSentScores = entries.slice();
     setAwaiting(true);
-    send("score " + tokens.join(" ") + ` @${distM}`);
+    // Only a distance set by hand goes with the score (a recognised one is already on the sight)
+    send("score " + tokens.join(" ") + (distM > 0 && !distAuto ? ` @${distM}` : ""));
     render();
   });
 }
@@ -1369,7 +1472,7 @@ $("btnSkip").addEventListener("click", async () => {
   withConnection(() => {
     entries = [];
     saveTraining();
-    send(`score skip @${distM}`);
+    send("score skip" + (distM > 0 && !distAuto ? ` @${distM}` : ""));
     render();
   });
 });
@@ -1636,7 +1739,8 @@ function recordEnd(m) {
   const all = loadEnds();
   const list = (all[key] || []).filter((e) => e.n !== m.n);
   const rec = { n: m.n, valid: !!m.valid, arrows: m.arrows };
-  if (typeof m.dist === "number") rec.dist = m.dist;
+  if (typeof m.dist === "number") { rec.dist = m.dist; if (m.distSrc === "auto") rec.distAuto = true; }
+  if (typeof m.setup === "number") rec.setup = m.setup;
   if (typeof m.ang === "number") { rec.ang = m.ang; rec.angSd = m.angSd; rec.angN = m.angN; }
   if (typeof m.cant === "number") { rec.cant = m.cant; rec.cantMax = m.cantMax; rec.canted = m.canted; rec.cantN = m.cantN; }
   if (m.valid) {
@@ -1668,7 +1772,8 @@ function mergeEndRec(m) {
     list.push(e);
     list.sort((a, b) => a.n - b.n);
   }
-  if (e.dist == null && typeof m.dist === "number") e.dist = m.dist;
+  if (e.dist == null && typeof m.dist === "number") { e.dist = m.dist; if (m.auto) e.distAuto = true; }
+  if (e.setup == null && typeof m.setup === "number") e.setup = m.setup;
   if (e.ang == null && typeof m.ang === "number") { e.ang = m.ang; e.angSd = m.angSd; e.angN = m.angN; }
   if (e.cant == null && typeof m.cant === "number") { e.cant = m.cant; e.cantMax = m.cantMax; e.canted = m.canted; e.cantN = m.cantN; }
   all[key] = list;
@@ -1693,7 +1798,7 @@ function putEndNext() {
   if (state.conn !== "connected") { endPut = null; return; }
   if (scoringBusy()) { p.wait = setTimeout(putEndNext, 3000); return; }
   const e = p.list[p.i];
-  const flags = (e.valid ? 1 : 0) | (e.reason === "skipped" ? 2 : 0);
+  const flags = (e.valid ? 1 : 0) | (e.reason === "skipped" ? 2 : 0) | (e.dist ? (e.distAuto ? 8 : 4) : 0);
   const hex = (e.scores || []).map((v) => (v === "X" ? "B" : v === "10" ? "A" : v === "M" ? "0" : v)).join("") || "-";
   const angC = typeof e.ang === "number" ? Math.round(e.ang * 100) : -32768;
   const sdC  = typeof e.angSd === "number" ? Math.round(e.angSd * 100) : 0;
@@ -1701,7 +1806,7 @@ function putEndNext() {
   const cant = hasCant ? `${Math.round(e.cant * 100)} ${Math.round((e.cantMax || 0) * 100)} ${e.cantN || 0} ${e.canted || 0}`
                        : "0 0 0 0";
   send(`log putend ${p.r.epoch} ${p.r.id} ${e.n} ${e.arrows || 0} ${flags} ${e.sum || 0} ${e.x || 0} ` +
-       `${e.dist || 0} ${angC} ${sdC} ${e.angN || 0} ${cant} ${hex}`);
+       `${e.dist || 0} ${angC} ${sdC} ${e.angN || 0} ${cant} ${e.setup || 0} ${hex}`);
   clearTimeout(p.timer);
   p.timer = setTimeout(() => { const q = endPut; endPut = null; if (q) q.done(); }, 8000);
 }
@@ -1791,6 +1896,81 @@ function showSession(r) {
   $("sdUnhide").onclick = () => { d.close(); unhideSession(r); };
   d.showModal();
 }
+
+// ---------------------------------------------------------------------------
+// Setups (arrow sets / bow settings), managed on the sight
+// ---------------------------------------------------------------------------
+const SETUP_NAMES_KEY = "uvsight.setupNames";   // id -> name, also for deleted ones (CSV)
+let setupBuf = null;
+function setupNames() { try { return JSON.parse(localStorage.getItem(SETUP_NAMES_KEY)) || {}; } catch { return {}; } }
+function setupNameOf(id) { return setupNames()[id ?? 0] || (id ? `Setup ${Number(id) + 1}` : "Standard"); }
+
+function askText(title, text, value) {
+  return new Promise((resolve) => {
+    const d = $("txtDlg");
+    $("txtTitle").textContent = title;
+    $("txtText").textContent = text;
+    $("txtInput").value = value || "";
+    const done = (v) => { d.close(); resolve(v); };
+    $("txtYes").onclick = () => done($("txtInput").value.trim() || null);
+    $("txtNo").onclick = () => done(null);
+    d.oncancel = (e) => { e.preventDefault(); done(null); };
+    d.showModal();
+    $("txtInput").focus();
+  });
+}
+
+function renderSetups() {
+  const g = $("setupGroup");
+  const st = state.setups;
+  g.hidden = !st || state.conn !== "connected";
+  if (g.hidden) return;
+  const box = $("setupList");
+  box.textContent = "";
+  for (const it of st.list.filter((x) => !x.deleted)) {
+    const row = document.createElement("div");
+    row.className = "switchrow";
+    const active = it.id === st.active;
+    row.innerHTML = `<div><div class="lbl"></div><div class="desc"></div></div><button class="btn secondary">…</button>`;
+    row.querySelector(".lbl").textContent = it.name + (active ? "  ✓" : "");
+    row.querySelector(".desc").textContent = (it.kmh ? `about ${it.kmh} km/h` : "learning") +
+      `, ${it.ends} ${it.ends === 1 ? "end" : "ends"}` + (active ? ", in use" : "");
+    row.querySelector("button").addEventListener("click", () => setupActions(it, active));
+    box.appendChild(row);
+  }
+}
+
+async function setupActions(it, active) {
+  const choice = await dialog({
+    title: it.name,
+    text: active ? "This setup is in use." : "Use this setup from now on?",
+    yes: active ? "Rename" : "Use", no: "Cancel", alt: active ? undefined : "More…",
+  });
+  if (choice === true && !active) { send(`setup use ${it.id}`); return; }
+  if (choice === true && active) { renameSetup(it); return; }
+  if (choice === "alt") {
+    const c2 = await dialog({
+      title: it.name,
+      text: "Deleting keeps its ends in your sessions, under this name. It just can't be chosen any more.",
+      yes: "Rename", no: "Cancel", alt: "Delete", danger: false,
+    });
+    if (c2 === true) renameSetup(it);
+    if (c2 === "alt") send(`setup del ${it.id}`);
+  }
+}
+
+async function renameSetup(it) {
+  const name = await askText("Rename setup", "Up to 18 characters.", it.name);
+  if (name) send(`setup name ${it.id} ${name}`);
+}
+
+$("btnSetupNew").addEventListener("click", async () => {
+  const name = await askText("New setup", "For example the arrow type. Up to 18 characters.", "");
+  if (!name) return;
+  send(`setup new ${name}`);
+  pendingUseNew = true;                                // switch to it once the sight confirms
+});
+let pendingUseNew = false;
 
 // ---------------------------------------------------------------------------
 // Removing sessions: from the phone (preferred) or completely (phone + sight)
@@ -2026,7 +2206,11 @@ function importEndsCsv(rows) {
         e.sum = num(r.points) || 0; e.x = num(r.x_count) || 0;
         if (r.scores) e.scores = r.scores.split(" ").filter(Boolean);
       } else e.reason = r.skipped === "1" ? "skipped" : "no scores";
-      if (num(r.distance_m)) e.dist = num(r.distance_m);
+      if (num(r.distance_m)) { e.dist = num(r.distance_m); if (r.distance_source === "detected") e.distAuto = true; }
+      if (r.setup) {                               // setup name -> its number on this phone
+        const hit = Object.entries(setupNames()).find(([, n]) => n === r.setup);
+        if (hit) e.setup = Number(hit[0]);
+      }
       if (r.angle_deg !== "" && r.angle_deg !== undefined) { e.ang = num(r.angle_deg); e.angSd = num(r.angle_sd_deg); e.angN = num(r.angle_n); }
       if (r.cant_deg !== "" && r.cant_deg !== undefined) { e.cant = num(r.cant_deg); e.cantMax = num(r.cant_max_deg); e.canted = num(r.canted); e.cantN = num(r.cant_n); }
       return e;
@@ -2292,7 +2476,7 @@ const CSV_COLUMNS = ["date", "time", "session", "end", "distance_m", "valid", "s
   "average", "x_count", ...Array.from({ length: CSV_ARROWS }, (_, i) => `a${i + 1}`), "scores",
   "angle_deg", "angle_sd_deg", "angle_n", "cant_deg", "cant_max_deg", "canted", "cant_n",
   "session_ends", "session_arrows", "session_average", "session_x", "session_minutes", "session_shots",
-  "session_invalid_ends", "session_invalid_arrows", "corrected", "ended_by_hand"];
+  "session_invalid_ends", "session_invalid_arrows", "corrected", "ended_by_hand", "distance_source", "setup"];
 
 // RFC 4180: quote a field only if it contains a comma, a quote or a line break
 function csvField(v) {
@@ -2331,6 +2515,8 @@ function exportCsv() {
           angle_deg: fix(e.ang, 2), angle_sd_deg: fix(e.angSd, 2), angle_n: e.ang != null ? e.angN : "",
           cant_deg: fix(e.cant, 1), cant_max_deg: fix(e.cantMax, 1),
           canted: e.cant != null ? e.canted : "", cant_n: e.cant != null ? e.cantN : "",
+          distance_source: e.dist ? (e.distAuto ? "detected" : "set") : "",
+          setup: setupNameOf(e.setup),
         });
         scores.slice(0, CSV_ARROWS).forEach((v, i) => { row[`a${i + 1}`] = arrowValue(v); });
       }
@@ -2530,11 +2716,14 @@ function renderSettings() {
     send(on ? "shots on" : "shots off");
   }));
   const lvMode = lv.mode || "off";
-  sw.appendChild(segRow("Cant indicator",
-    lvMode === "auto" ? "Blinks only during a session."
-    : lvMode === "on" ? "Blinks whenever the bow is in use."
-    : "No blinking.", lvMode, ["off", "auto", "on"], (m) => send("level " + m)));
+  sw.appendChild(segRow("Cant",
+    (lvMode === "auto" ? "Measured during a session."
+      : lvMode === "on" ? "Measured whenever the bow is in use. Switches the aiming angle's On off."
+      : "Not measured.") + " Each end stores how canted you were.",
+    lvMode, ["off", "auto", "on"], (m) => send("level " + m)));
   if (lvMode !== "off") {
+    sw.appendChild(switchRow("Blink when canted", "Off: the cant is still measured and stored, the LED just stays calm.",
+      lv.cantSignal !== false, (on) => send(on ? "level signal on" : "level signal off")));
     const st = lv.style || "normal";
     sw.appendChild(segRow("Cant blinking",
       st === "inverted" ? "Faster the closer you get to level." : "Faster the more the bow is canted.",
@@ -2544,9 +2733,21 @@ function renderSettings() {
   const angMode = lv.angle || "auto";
   sw.appendChild(segRow("Aiming angle",
     (angMode === "auto" ? "Measured at every shot during a session."
-      : angMode === "on" ? "Measured at every shot, also outside a session."
+      : angMode === "on" ? "Measured at every shot, also outside a session (for setting up a sight). Switches the cant's On off."
       : "Not measured.") + (lv.cal ? "" : " Needs the cant calibration."),
     angMode, ["off", "auto", "on"], (m) => send("angle " + m)));
+  if (angMode !== "off") {
+    const rg = state.range || {};
+    const ready = rg.state === "ready";
+    const row = switchRow("Warn if the distance doesn't fit",
+      ready ? "While aiming: double blink = aiming too low (arrow short), triple blink = too high (arrow long). Comes before the cant blinking."
+      : rg.state === "anchor" ? "After a new calibration: shoot one end with the distance set, then this works again."
+      : `Still learning: shoot a few ends at two or more distances with the distance set (${rg.ends || 0} ends so far).`,
+      lv.rangeSignal !== false && ready, (on) => send(on ? "range signal on" : "range signal off"));
+    row.querySelector("input").disabled = !ready;
+    if (!ready) row.style.opacity = ".55";
+    sw.appendChild(row);
+  }
   sw.appendChild(segRow("LED",
     (ledMode === "auto" ? "Auto: switched by the light sensor."
       : ledMode === "on" ? "On: always lit." : "Off: stays dark.") +
@@ -2611,7 +2812,7 @@ function calCard() {
   box.className = "wizard";
   let text, btn = "Measure", cmd = calStep === 1 ? "level cal" : "level cal2";
   if (calStep === 1) text = "Step 1 of 2: Put the bow in a stand, level it with the bubble and aim horizontally. Then tap Measure and keep the bow still.";
-  if (calStep === 2) text = "Step 2 of 2: Keep the bow level, but aim clearly up or down, at least 20 degrees. Then tap Measure and keep it still.";
+  if (calStep === 2) text = "Step 2 of 2: Keep the bow level, but aim clearly up, arrow tip up, at least 20 degrees. Then tap Measure and keep it still.";
   if (calStep === 3) { text = "Calibration saved. Check the cant reading in a session: it should stay near 0° with the bubble centred."; btn = null; }
   if (calBusy) text = "Measuring. Keep the bow still…";
   box.innerHTML = `<p></p>${calError ? '<p class="errtext"></p>' : ""}<div class="row"></div>`;

@@ -226,6 +226,11 @@
   dialog p { margin: 0 0 18px; color: var(--muted); }
   dialog .row { display: flex; gap: 10px; justify-content: flex-end; }
   dialog .danger { background: var(--red); color: #fff; }
+  /* three choices: the two ways to save side by side, "back" below */
+  #dlgRow.three { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  #dlgRow.three #dlgYes { order: 1; }
+  #dlgRow.three #dlgAlt { order: 2; }
+  #dlgRow.three #dlgNo  { order: 3; grid-column: 1 / -1; }
 
   /* History */
   .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
@@ -570,8 +575,9 @@
   <dialog id="dlg">
     <h3 id="dlgTitle"></h3>
     <p id="dlgText"></p>
-    <div class="row">
+    <div class="row" id="dlgRow">
       <button class="btn secondary" id="dlgNo"></button>
+      <button class="btn secondary" id="dlgAlt" hidden></button>
       <button class="btn" id="dlgYes"></button>
     </div>
   </dialog>
@@ -605,11 +611,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 10;
+const PROTO_EXPECTED  = 11;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.3";
+const APP_VERSION     = "4.4";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1279,33 +1285,44 @@ function sendEnd() {
 
 function askMismatch(m) {
   confirmOpen = true;
+  const canSplit = m.split === true || m.entered < m.counted;
+  const rest = m.counted - m.entered;
   dialog({
     title: `End ${m.end}: counts differ`,
     text: `The sight counted ${m.counted} ${m.counted === 1 ? "shot" : "shots"}, ` +
           `you entered ${m.entered} ${m.entered === 1 ? "score" : "scores"}. ` +
-          `Save with your ${m.entered} scores?`,
+          (canSplit
+            ? `Forgot to save the last end? Split saves your ${m.entered} scores as this end ` +
+              `and keeps the other ${rest} ${rest === 1 ? "shot" : "shots"} for the next one.`
+            : `Save with your ${m.entered} scores?`),
     yes: "Save anyway",
     no: "Edit scores",
-  }).then((ok) => {
+    alt: canSplit ? "Split" : undefined,
+  }).then((choice) => {
     confirmOpen = false;
-    if (ok) setAwaiting(true);
-    send(ok ? "yes" : "no");      // "no": sight discards, scores stay here for editing
+    if (choice) setAwaiting(true);
+    send(choice === "alt" ? "split" : choice ? "yes" : "no");   // "no": scores stay here for editing
     render();
   });
 }
 
 // Small promise-based dialog
-function dialog({ title, text, yes, no, danger }) {
+// alt: optional third choice, resolves to "alt"
+function dialog({ title, text, yes, no, danger, alt }) {
   return new Promise((resolve) => {
     const d = $("dlg");
     $("dlgTitle").textContent = title;
     $("dlgText").textContent  = text;
     $("dlgYes").textContent   = yes;
     $("dlgNo").textContent    = no;
+    $("dlgAlt").hidden        = !alt;
+    $("dlgRow").classList.toggle("three", !!alt);
+    $("dlgAlt").textContent   = alt || "";
     $("dlgYes").classList.toggle("danger", !!danger);
     const done = (v) => { d.close(); resolve(v); };
     $("dlgYes").onclick = () => done(true);
     $("dlgNo").onclick  = () => done(false);
+    $("dlgAlt").onclick = () => done("alt");
     d.oncancel = (e) => { e.preventDefault(); done(false); };
     d.showModal();
   });

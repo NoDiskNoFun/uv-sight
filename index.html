@@ -615,7 +615,7 @@ const PROTO_EXPECTED  = 12;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "4.5";
+const APP_VERSION     = "4.6";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1930,11 +1930,28 @@ function exportBackup() {
 }
 
 function parseCsv(text) {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim());
-  if (lines.length < 1) return [];
-  const head = lines[0].split(",").map((h) => h.trim());
-  return lines.slice(1).map((l) => {
-    const v = l.split(",");
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);   // tolerate a BOM
+  const records = [];
+  let row = [], field = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else field += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field); field = "";
+      if (row.some((f) => f.trim() !== "")) records.push(row);
+      row = [];
+    } else field += c;
+  }
+  if (field !== "" || row.length) { row.push(field); if (row.some((f) => f.trim() !== "")) records.push(row); }
+  if (!records.length) return [];
+  const head = records[0].map((h) => h.trim());
+  return records.slice(1).map((v) => {
     const o = {};
     head.forEach((h, i) => { o[h] = (v[i] || "").trim(); });
     return o;
@@ -1980,6 +1997,45 @@ function sessionsFromCsv(rows) {
   });
 }
 
+// Per-end CSV (app 4.6+): group rows by session, rebuild sessions and their ends
+function importEndsCsv(rows) {
+  const num = (v) => (v === "" || v === undefined ? null : Number(v));
+  const bySession = new Map();
+  for (const o of rows) {
+    if (!o.session) continue;
+    if (!bySession.has(o.session)) bySession.set(o.session, []);
+    bySession.get(o.session).push(o);
+  }
+  const sessions = [], ends = {};
+  for (const [key, list] of bySession) {
+    const o = list[0];
+    const [ep, id] = key.split("-").map(Number);
+    const start = o.date ? Date.parse(`${o.date}T${o.time || "00:00"}`) : NaN;
+    const minutes = num(o.session_minutes) || 0;
+    sessions.push({
+      key, epoch: ep > 0 && id > 0 ? ep : null, id: ep > 0 && id > 0 ? id : null,
+      endedAt: isNaN(start) ? null : start + minutes * 60000, importedAt: Date.now(),
+      ends: num(o.session_ends) || 0, shots: num(o.session_shots) || 0, scored: num(o.session_arrows) || 0,
+      avg: num(o.session_average) || 0, x: num(o.session_x) || 0, min: minutes,
+      invalidEnds: num(o.session_invalid_ends) || 0, invalidArrows: num(o.session_invalid_arrows) || 0,
+      mismatch: o.corrected === "1", manual: o.ended_by_hand === "1",
+    });
+    const el = list.filter((r) => r.end !== "").map((r) => {
+      const e = { n: num(r.end), valid: r.valid === "1", arrows: num(r.arrows) || 0 };
+      if (e.valid) {
+        e.sum = num(r.points) || 0; e.x = num(r.x_count) || 0;
+        if (r.scores) e.scores = r.scores.split(" ").filter(Boolean);
+      } else e.reason = r.skipped === "1" ? "skipped" : "no scores";
+      if (num(r.distance_m)) e.dist = num(r.distance_m);
+      if (r.angle_deg !== "" && r.angle_deg !== undefined) { e.ang = num(r.angle_deg); e.angSd = num(r.angle_sd_deg); e.angN = num(r.angle_n); }
+      if (r.cant_deg !== "" && r.cant_deg !== undefined) { e.cant = num(r.cant_deg); e.cantMax = num(r.cant_max_deg); e.canted = num(r.canted); e.cantN = num(r.cant_n); }
+      return e;
+    });
+    if (el.length) ends[key] = el;
+  }
+  return importSessions(sessions, ends);
+}
+
 async function importFile(file) {
   let result, what;
   try {
@@ -1990,7 +2046,10 @@ async function importFile(file) {
       result = importSessions(d.sessions, d.ends || {});
       what = "backup";
     } else {
-      result = importSessions(sessionsFromCsv(parseCsv(text)), null);
+      const rows = parseCsv(text);
+      result = rows.length && rows[0].session !== undefined && rows[0].end !== undefined
+        ? importEndsCsv(rows)                                      // current format
+        : importSessions(sessionsFromCsv(rows), null);             // older per-session exports
       what = "CSV";
     }
   } catch (e) {
@@ -2227,21 +2286,61 @@ $("importFile").addEventListener("change", () => {
 });
 $("btnToSight").addEventListener("click", copyToSight);
 
+// CSV columns: new columns are only ever appended, so existing spreadsheets keep working
+const CSV_ARROWS = 12;
+const CSV_COLUMNS = ["date", "time", "session", "end", "distance_m", "valid", "skipped", "arrows", "points",
+  "average", "x_count", ...Array.from({ length: CSV_ARROWS }, (_, i) => `a${i + 1}`), "scores",
+  "angle_deg", "angle_sd_deg", "angle_n", "cant_deg", "cant_max_deg", "canted", "cant_n",
+  "session_ends", "session_arrows", "session_average", "session_x", "session_minutes", "session_shots",
+  "session_invalid_ends", "session_invalid_arrows", "corrected", "ended_by_hand"];
+
+// RFC 4180: quote a field only if it contains a comma, a quote or a line break
+function csvField(v) {
+  if (v === null || v === undefined) return "";
+  const t = String(v);
+  return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+}
+const pad2 = (n) => String(n).padStart(2, "0");
+const isoDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const isoTime = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+const fix = (v, n) => (typeof v === "number" && isFinite(v) ? v.toFixed(n) : "");
+const arrowValue = (v) => (v === "X" ? 10 : v === "M" ? 0 : Number(v));
+
 function exportCsv() {
-  const list = sortedArchive().filter((r) => !r.hidden);
-  const head = "epoch,id,start,start_known,fetched,ends,shots,scored,average,x,minutes,invalid_ends,invalid_arrows,corrected,ended_by_hand";
-  const rows = list.map((r) => [
-    r.epoch ?? "", r.id ?? "",
-    r.endedAt === null ? "" : new Date(r.endedAt - r.min * 60000).toISOString(),
-    r.endedAt === null ? 0 : 1,
-    new Date(r.importedAt).toISOString(),
-    r.ends, r.shots, r.scored, Number(r.avg).toFixed(2), r.x, r.min,
-    r.invalidEnds, r.invalidArrows, r.mismatch ? 1 : 0, r.manual ? 1 : 0,
-  ].join(","));
-  const blob = new Blob([head + "\n" + rows.join("\n") + "\n"], { type: "text/csv" });
+  const list = sortedArchive().filter((r) => !r.hidden).reverse();   // oldest first
+  const endsStore = loadEnds();
+  const lines = [CSV_COLUMNS.join(",")];
+  for (const r of list) {
+    const start = r.endedAt === null ? null : new Date(r.endedAt - r.min * 60000);
+    const sessionCols = {
+      date: start ? isoDate(start) : "", time: start ? isoTime(start) : "", session: r.key,
+      session_ends: r.ends, session_arrows: r.scored, session_average: fix(Number(r.avg), 2), session_x: r.x,
+      session_minutes: r.min, session_shots: r.shots, session_invalid_ends: r.invalidEnds,
+      session_invalid_arrows: r.invalidArrows, corrected: r.mismatch ? 1 : 0, ended_by_hand: r.manual ? 1 : 0,
+    };
+    const ends = endsStore[r.key] || [];
+    const rows = ends.length ? ends : [null];          // sessions without end details: one row
+    for (const e of rows) {
+      const row = { ...sessionCols };
+      if (e) {
+        const scores = e.scores || [];
+        Object.assign(row, {
+          end: e.n, distance_m: e.dist || "", valid: e.valid ? 1 : 0, skipped: e.reason === "skipped" ? 1 : 0,
+          arrows: e.arrows, points: e.valid ? e.sum : "", average: e.valid && e.arrows ? fix(e.sum / e.arrows, 2) : "",
+          x_count: e.valid ? e.x : "", scores: scores.join(" "),
+          angle_deg: fix(e.ang, 2), angle_sd_deg: fix(e.angSd, 2), angle_n: e.ang != null ? e.angN : "",
+          cant_deg: fix(e.cant, 1), cant_max_deg: fix(e.cantMax, 1),
+          canted: e.cant != null ? e.canted : "", cant_n: e.cant != null ? e.cantN : "",
+        });
+        scores.slice(0, CSV_ARROWS).forEach((v, i) => { row[`a${i + 1}`] = arrowValue(v); });
+      }
+      lines.push(CSV_COLUMNS.map((c) => csvField(row[c])).join(","));
+    }
+  }
+  const blob = new Blob([lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `uv-sight-sessions-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `uv-sight-ends-${new Date().toISOString().slice(0, 10)}.csv`;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }

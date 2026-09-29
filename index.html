@@ -634,7 +634,7 @@ const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.2";
+const APP_VERSION     = "5.3";
 
 // ---------------------------------------------------------------------------
 // State
@@ -2661,7 +2661,7 @@ function checkDistRow(rg, ready) {
     ? "Works once the sight has learned your distances."
     : d === 0 ? "Choose the distance of the target you aim at."
     : rg.estimated ? "Not learned yet at this distance: no warning here."
-    : "Aim at it: double blink = sight set too low, triple = too high, calm = right.";
+    : "Aim at it. Pulsing: right. Double blink: sight set too low. Triple blink: too high. Calm: almost (2–3 m off).";
   row.querySelector("b").textContent = `${d} m`;
   const setTo = (v) => {
     v = Math.max(0, Math.min(150, v));

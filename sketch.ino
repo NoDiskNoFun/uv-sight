@@ -179,8 +179,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "3.6";
-const uint8_t  PROTO_VERSION     = 9;
+const char*    FW_VERSION        = "4.1";
+const uint8_t  PROTO_VERSION     = 11;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -335,6 +335,34 @@ struct __attribute__((packed, aligned(4))) LogRec {
 static_assert(sizeof(LogRec) == 64, "LogRec must be 64 bytes");
 typedef bool (*LogVisitor)(const LogRec&);   // callback for logForEach()
 
+// One end of a session, written when the end is closed. Same size and ring as
+// the session records, told apart by the magic; the session key (epoch + id)
+// links it to its session.
+const uint32_t END_MAGIC = 0x31444E45;       // "END1"
+#define END_VALID   0x01
+#define END_SKIPPED 0x02
+const int16_t  ANGLE_NONE = -32768;          // no angle measured
+struct __attribute__((packed, aligned(4))) EndRec {
+  uint32_t magic;          // END_MAGIC
+  uint32_t seq;
+  uint32_t epoch;          // session key
+  uint32_t id;
+  uint16_t n;              // end number within the session
+  uint8_t  arrows;
+  uint8_t  flags;          // END_VALID / END_SKIPPED
+  uint16_t sum;
+  uint8_t  x;
+  uint8_t  distM;          // distance in m, 0 = not given
+  int16_t  angleC;         // mean aiming angle up/down, 1/100 degree (ANGLE_NONE = none)
+  uint16_t angleSdC;       // spread of the arrows' angles, 1/100 degree
+  uint8_t  angleN;         // arrows with an angle
+  uint8_t  pad;
+  uint8_t  scores[20];     // 4 bits per arrow: 0-10, 11 = X, 15 = none
+  uint8_t  reserved[10];
+  uint32_t crc;
+};
+static_assert(sizeof(EndRec) == 64, "EndRec must be 64 bytes");
+
 const uint32_t REC_MAGIC       = 0x31565531;              // "1UV1"
 const uint32_t QF_SIZE         = 2UL * 1024UL * 1024UL;   // P25Q16H: 2 MB
 const uint32_t QF_SECTOR       = 4096;
@@ -475,7 +503,7 @@ struct LevelState {
   uint8_t  on;        // LEVEL_OFF / LEVEL_AUTO / LEVEL_ON
   uint8_t  calibrated;
   uint8_t  style;     // 0 = normal (faster when more tilted), 1 = inverted
-  uint8_t  pad;
+  uint8_t  angleMode; // aiming angle: 0 = auto (during sessions), 1 = off, 2 = on
   float    L[3];   // lateral axis (aiming up/down rotates around this axis)
   float    D[3];   // gravity direction with the bow level and horizontal
 };
@@ -582,6 +610,20 @@ uint32_t lastSensorMs      = 0;
 uint32_t lastReportMs      = 0;
 uint32_t ignoreMotionUntil = 0;
 uint32_t awakeUntil        = 0;   // app hold: stay reachable until then ("awake <s>")
+
+// Aiming angle (up/down) history, sampled in the fast loop
+const uint8_t  PITCH_SAMPLES   = 64;
+const uint32_t PITCH_FROM_MS   = 1200;   // average from this long before the release ...
+const uint32_t PITCH_TO_MS     = 150;    // ... up to this long before it (the bow moves at release)
+float    pitchBuf[PITCH_SAMPLES];
+uint32_t pitchMs[PITCH_SAMPLES];
+uint8_t  pitchHead = 0, pitchFill = 0;
+// Angles of the arrows in the open end
+const float NO_ANGLE = 1000.0f;          // marks a shot without aiming angle
+float    endShotAng[MAX_SCORES_LINE];   // aiming angle per shot of the open end (NO_ANGLE = none)
+uint8_t  endShotN = 0;                  // shots in that list
+uint8_t  endDistM = 0;            // distance given with the last score line (sticky)
+uint32_t sessionId = 0;           // log id of the running session, reserved at its start
 const char* awakeReason    = "";  // "usb", "app" or "" (for the status)
 float    lastShotG         = -1;      // peak of the last counted shot in g (-1 = none yet)
 bool     lastShotClip      = false;   // the peak hit the +-16 g limit
@@ -1033,14 +1075,15 @@ uint32_t crc32(const void* data, size_t len) {
   return ~c;
 }
 
+bool recKnown(const LogRec& r) { return r.magic == REC_MAGIC || r.magic == END_MAGIC; }
 bool recValid(const LogRec& r) {
-  return r.magic == REC_MAGIC && r.seq != 0 && r.crc == crc32(&r, 60);
+  return recKnown(r) && r.seq != 0 && r.crc == crc32(&r, 60);
 }
 
 // A deleted record: its CRC word was programmed to 0 (flash can clear bits
 // without an erase). It keeps its place, so the seq numbers stay gapless.
 bool recDeleted(const LogRec& r) {
-  return r.magic == REC_MAGIC && r.seq != 0 && r.crc == 0;
+  return recKnown(r) && r.seq != 0 && r.crc == 0;
 }
 bool recUsed(const LogRec& r) { return recValid(r) || recDeleted(r); }
 
@@ -1109,8 +1152,10 @@ bool logAppend(LogRec& r, bool justSaved) {
       if (!qfEraseSector(logHeadAddr)) break;
       logRecount();
     }
-    memset(r.reserved, 0xFF, sizeof(r.reserved));
-    r.magic = REC_MAGIC;
+    if (r.magic != END_MAGIC) {                // end records bring their own layout
+      memset(r.reserved, 0xFF, sizeof(r.reserved));
+      r.magic = REC_MAGIC;
+    }
     r.seq   = logLastSeq + 1;
     r.crc   = crc32(&r, 60);
     LogRec check;
@@ -1140,7 +1185,12 @@ bool logAppend(LogRec& r, bool justSaved) {
 // Call fn for every record with seq > since, oldest first. Stops when fn returns false.
 uint32_t logVisitAddr = 0;   // flash address of the record passed to the visitor
 
-void logForEach(uint32_t since, LogVisitor fn) {
+#define LOG_SESSIONS 0x01
+#define LOG_ENDS     0x02
+void logForEachKind(uint32_t since, LogVisitor fn, uint8_t kinds);
+void logForEach(uint32_t since, LogVisitor fn) { logForEachKind(since, fn, LOG_SESSIONS); }
+
+void logForEachKind(uint32_t since, LogVisitor fn, uint8_t kinds) {
   if (since < shotState.clearedSeq) since = shotState.clearedSeq;   // "log clear"
   if (!qfOk || logCount == 0 || !qspiOpen()) return;
   const uint16_t headSec = (logHeadAddr / QF_SECTOR + QF_SECTORS - (logHeadAddr % QF_SECTOR == 0 ? 1 : 0)) % QF_SECTORS;
@@ -1155,6 +1205,7 @@ void logForEach(uint32_t since, LogVisitor fn) {
       const uint32_t addr = (uint32_t)s * QF_SECTOR + i * sizeof(LogRec);
       if (!qfRead(addr, r) || !recUsed(r)) break;
       if (recDeleted(r) || r.seq <= since) continue;
+      if (!(kinds & (r.magic == END_MAGIC ? LOG_ENDS : LOG_SESSIONS))) continue;
       logVisitAddr = addr;
       go = fn(r);
     }
@@ -1198,6 +1249,26 @@ void logDelete(String args) {
          nrfx_qspi_write(&r.crc, 4, delAddr + offsetof(LogRec, crc)) == NRFX_SUCCESS &&
          qspiWaitReady(50) && qfRead(delAddr, r) && recDeleted(r);
     qspiClose();
+  }
+  if (ok) {                                           // its ends go as well
+    static uint32_t endAddrs[64];
+    static uint8_t  endN;
+    endN = 0;
+    logForEachKind(0, [](const LogRec& r) {
+      const EndRec& e = *(const EndRec*)&r;
+      if (e.epoch == delEpoch && e.id == delId && endN < 64) endAddrs[endN++] = logVisitAddr;
+      return true;
+    }, LOG_ENDS);
+    if (endN && qspiOpen()) {
+      for (uint8_t k = 0; k < endN; k++) {
+        LogRec z;
+        z.crc = 0;
+        qspiWaitReady(400);
+        nrfx_qspi_write(&z.crc, 4, endAddrs[k] + offsetof(LogRec, crc));
+        qspiWaitReady(50);
+      }
+      qspiClose();
+    }
   }
   say(ok ? "Session " + String(delEpoch) + "-" + String(delId) + " deleted from the sight."
          : String("ERROR: could not delete the session."),
@@ -1902,10 +1973,67 @@ bool levelActive() {
 
 // Compute the cant: component of gravity along the lateral axis.
 // Aiming up/down rotates around the lateral axis and does not change the value.
+void updateTiltFrom(const float a[3]);   // below
+
+// Aiming angle up (+) or down (-) in degrees from one accelerometer reading.
+// Forward axis = lateral x level-gravity (both from the cant calibration).
+float pitchFrom(const float a[3]) {
+  float F[3] = {
+    lvl.L[1] * lvl.D[2] - lvl.L[2] * lvl.D[1],
+    lvl.L[2] * lvl.D[0] - lvl.L[0] * lvl.D[2],
+    lvl.L[0] * lvl.D[1] - lvl.L[1] * lvl.D[0]
+  };
+  if (!vnorm(F)) return 0;
+  return atan2f(vdot(a, F), vdot(a, lvl.D)) * 57.29578f;
+}
+
+// Aiming angle measurement: off / auto (during a session) / on
+bool angleActive() {
+  if (!lvl.calibrated || !imuOk) return false;
+  if (lvl.angleMode == 2) return true;
+  if (lvl.angleMode == 0) return sessionActive;
+  return false;
+}
+const char* angleModeText() {
+  return lvl.angleMode == 2 ? "on" : (lvl.angleMode == 1 ? "off" : "auto");
+}
+
+// Mean angle over the aiming phase before a shot; false if too few samples
+bool aimingAngle(uint32_t shotMs, float& mean, float& sd) {
+  float s = 0, q = 0; uint8_t n = 0;
+  for (uint8_t k = 0; k < pitchFill; k++) {
+    const uint8_t i = (pitchHead + PITCH_SAMPLES - 1 - k) % PITCH_SAMPLES;
+    const int32_t before = (int32_t)(shotMs - pitchMs[i]);
+    if (before < (int32_t)PITCH_TO_MS || before > (int32_t)PITCH_FROM_MS) continue;
+    s += pitchBuf[i]; q += pitchBuf[i] * pitchBuf[i]; n++;
+  }
+  if (n < 10) return false;
+  mean = s / n;
+  const float v = q / n - mean * mean;
+  sd = v > 0 ? sqrtf(v) : 0;
+  return true;
+}
+
+// One accelerometer reading feeds the cant indicator and the angle history
+void updateOrientation(bool tiltOn, bool angleOn) {
+  float a[3];
+  if (!readAccel(a)) return;
+  if (angleOn) {
+    pitchBuf[pitchHead] = pitchFrom(a);
+    pitchMs[pitchHead]  = millis();
+    pitchHead = (pitchHead + 1) % PITCH_SAMPLES;
+    if (pitchFill < PITCH_SAMPLES) pitchFill++;
+  }
+  if (tiltOn) updateTiltFrom(a);
+}
+
 void updateTilt() {
   float a[3];
   if (!readAccel(a)) return;
+  updateTiltFrom(a);
+}
 
+void updateTiltFrom(const float a[3]) {
   if (!tiltFilterOk) {
     for (uint8_t i = 0; i < 3; i++) tiltF[i] = a[i];
     tiltFilterOk = true;
@@ -1949,7 +2077,7 @@ bool sampleGravity(float g[3]) {
 String levelJson() {
   return String("{\"t\":\"level\",\"mode\":\"") + levelModeText() + "\",\"on\":" + jbool(lvl.on != LEVEL_OFF) +
          ",\"style\":\"" + String(lvl.style == 1 ? "inverted" : "normal") + "\"" +
-         ",\"cal\":" + jbool(lvl.calibrated) +
+         ",\"cal\":" + jbool(lvl.calibrated) + ",\"angle\":\"" + angleModeText() + "\"" +
          ",\"tol\":" + String(cfg.levelTol, 1) + ",\"active\":" + jbool(levelActive()) +
          ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) + "}";
 }
@@ -2022,6 +2150,19 @@ void setLevelMode(uint8_t mode, const char* text) {
   if (!levelSave()) { err("ERROR while saving!"); return; }
   say(String(text) + (lvl.calibrated || mode == LEVEL_OFF ? "" : " Note: not calibrated yet ('level cal')."),
       levelJson());
+}
+
+// "angle off|auto|on": measure the aiming angle at every shot
+void handleAngle(const String& arg) {
+  if (arg == "off" || arg == "auto" || arg == "on") {
+    lvl.angleMode = arg == "off" ? 1 : (arg == "on" ? 2 : 0);
+    if (!levelSave()) { err("ERROR while saving!"); return; }
+    say("Aiming angle measurement: " + arg + (lvl.calibrated ? "." : ". Note: needs the cant calibration ('level cal')."),
+        levelJson());
+  } else if (arg == "") {
+    say(String("Aiming angle measurement: ") + angleModeText() + (angleActive() ? ", active now" : ", inactive now"),
+        levelJson());
+  } else err("Unknown. Possible: angle, angle off|auto|on");
 }
 
 void handleLevel(const String& arg) {
@@ -2113,7 +2254,7 @@ String sessionJson() {
   if (sessionActive) {
     // epoch + nextId = the key this session will get in the log, so the app
     // can remember its start time even if the board restarts before import
-    j += ",\"epoch\":" + String(shotState.epoch) + ",\"nextId\":" + String(shotState.lastId + 1) +
+    j += ",\"epoch\":" + String(shotState.epoch) + ",\"nextId\":" + String(sessionId) +
          ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
          ",\"ends\":" + String(endCount) + ",\"invalidEnds\":" + String(invalidEnds) +
          ",\"shots\":" + String(shotCount) + ",\"scored\":" + String(scoreCount) +
@@ -2126,7 +2267,10 @@ String sessionJson() {
 }
 
 void startSession(uint32_t now) {
-  ensureLogEpoch();                 // the session's future log key must be known now
+  ensureLogEpoch();                 // the session's log key must be known now
+  sessionId = ++shotState.lastId;   // reserved: its ends are stored under this key
+  stateSave();
+  endShotN = 0;
   sessionActive     = true;
   sessionStartMs    = now;
   sessionLastShotMs = now;
@@ -2160,27 +2304,80 @@ void registerShot(uint32_t now, float g, bool clipped) {
   shotCount++;
   endShots++;
   sessionLastShotMs = now;
+  float ang = 0, angSd = 0;
+  const bool hasAng = angleActive() && aimingAngle(now, ang, angSd);
+  if (endShotN < MAX_SCORES_LINE) endShotAng[endShotN++] = hasAng ? ang : NO_ANGLE;
   say("Shot detected (end " + String(endCount + 1) + ": " + String(endShots) + ")" +
-      (g >= 0 ? ", " + shotGText() : String("")),
+      (g >= 0 ? ", " + shotGText() : String("")) + (hasAng ? ", angle " + String(ang, 2) + " deg" : String("")),
       "{\"t\":\"shot\",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
       ",\"total\":" + String(shotCount) +
-      ",\"g\":" + (g >= 0 ? String(g, 1) : String("null")) + ",\"clip\":" + jbool(clipped) + "}");
+      ",\"g\":" + (g >= 0 ? String(g, 1) : String("null")) + ",\"clip\":" + jbool(clipped) +
+      ",\"ang\":" + (hasAng ? String(ang, 2) : String("null")) + "}");
 }
 
-// Close an end with scores
-void closeEndValid(const uint8_t* vals, uint8_t n, uint8_t xn) {
+// Write the closed end to the log flash (vals: 0-10, 11 = X; NULL for invalid ends)
+bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t sum, uint8_t xn,
+              uint8_t take, float& angOut, float& sdOut, uint8_t& angNOut) {
+  EndRec e;
+  memset(&e, 0, sizeof(e));
+  e.magic = END_MAGIC;
+  e.epoch = shotState.epoch;  e.id = sessionId;  e.n = endCount;
+  e.arrows = n;  e.flags = (valid ? END_VALID : 0) | (skipped ? END_SKIPPED : 0);
+  e.sum = sum;  e.x = xn;  e.distM = endDistM;
+  // Angles of the shots that belong to this end: the first `take` ones
+  if (take > endShotN) take = endShotN;
+  float as = 0, aq = 0; uint8_t an = 0;
+  for (uint8_t k = 0; k < take; k++) {
+    if (endShotAng[k] >= NO_ANGLE) continue;
+    as += endShotAng[k]; aq += endShotAng[k] * endShotAng[k]; an++;
+  }
+  for (uint8_t k = take; k < endShotN; k++) endShotAng[k - take] = endShotAng[k];   // keep the rest
+  endShotN -= take;
+  angNOut = an;
+  if (an) {
+    angOut = as / an;
+    const float v = aq / an - angOut * angOut;
+    sdOut = v > 0 ? sqrtf(v) : 0;
+    e.angleC = (int16_t)lroundf(angOut * 100);  e.angleSdC = (uint16_t)lroundf(sdOut * 100);  e.angleN = an;
+  } else {
+    e.angleC = ANGLE_NONE;
+  }
+  memset(e.scores, 0xFF, sizeof(e.scores));
+  for (uint8_t k = 0; vals && k < n && k < 40; k++) {
+    const uint8_t v = vals[k] & 0x0F;
+    e.scores[k / 2] = (k & 1) ? ((e.scores[k / 2] & 0x0F) | (v << 4)) : ((e.scores[k / 2] & 0xF0) | v);
+  }
+  memset(e.reserved, 0xFF, sizeof(e.reserved));
+  LogRec raw;
+  memcpy(&raw, &e, sizeof(raw));
+  return logAppend(raw, false);
+}
+
+String endAngleJson(float ang, float sd, uint8_t angN) {
+  return ",\"dist\":" + (endDistM ? String(endDistM) : String("null")) +
+         ",\"ang\":" + (angN ? String(ang, 2) : String("null")) +
+         ",\"angSd\":" + (angN ? String(sd, 2) : String("null")) + ",\"angN\":" + String(angN);
+}
+
+// Close an end with scores. keepShots: counted shots that stay in the open end
+// (split: the scores were for the first n shots only)
+void closeEndValid(const uint8_t* vals, uint8_t n, uint8_t xn, uint8_t keepShots) {
   uint16_t sum = 0;
-  for (uint8_t k = 0; k < n; k++) sum += vals[k];
+  for (uint8_t k = 0; k < n; k++) sum += vals[k] > 10 ? 10 : vals[k];   // 11 = X counts 10
   scoreSum   += sum;
   scoreCount += n;
   xCount     += xn;
   endCount++;
-  endShots = 0;
+  const uint8_t take = endShotN > keepShots ? endShotN - keepShots : 0;
+  endShots = keepShots;
+  float ang = 0, sd = 0; uint8_t angN = 0;
+  const bool stored = storeEnd(true, false, vals, n, sum, xn, take, ang, sd, angN);
   say("End " + String(endCount) + " scored: " + String(n) + " arrows, " + String(sum) +
       " points (avg " + fmtAvg(sum, n) + ", " + String(xn) + " X). Session: " + String(scoreCount) +
       " scored, avg " + fmtAvg(scoreSum, scoreCount) + ", " + String(xCount) + " X",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":true,\"arrows\":" + String(n) +
-      ",\"sum\":" + String(sum) + ",\"x\":" + String(xn) + ",\"avg\":" + fmtAvg(sum, n) + "}");
+      ",\"sum\":" + String(sum) + ",\"x\":" + String(xn) + ",\"avg\":" + fmtAvg(sum, n) +
+      endAngleJson(ang, sd, angN) + ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
 }
 
@@ -2190,10 +2387,12 @@ void closeEndInvalid(uint16_t arrows, const String& reason) {
   invalidEnds++;
   invalidArrows += arrows;
   endShots = 0;
+  float ang = 0, sd = 0; uint8_t angN = 0;
+  const bool stored = storeEnd(false, reason == "skipped", NULL, arrows, 0, 0, endShotN, ang, sd, angN);
   say("End " + String(endCount) + " invalid (" + reason + "): " + String(arrows) +
       " arrows stored with 0 points, not included in the overall average.",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":false,\"arrows\":" + String(arrows) +
-      ",\"reason\":" + jstr(reason) + "}");
+      ",\"reason\":" + jstr(reason) + endAngleJson(ang, sd, angN) + ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
 }
 
@@ -2264,7 +2463,7 @@ void finishSession(bool manual) {
 
   ensureLogEpoch();
   s.epoch = shotState.epoch;
-  s.id    = ++shotState.lastId;
+  s.id    = sessionId;
   s.start = unixAt(sessionStartMs);
   stateSave();                         // session number must never repeat
   const bool ok = logAppend(s, true);
@@ -2299,6 +2498,52 @@ String logInfoJson() {
          ",\"initErr\":" + String(qspiInitErr) + ",\"resets\":" + String(qspiRecoveries) + "}";
 }
 
+String scoresText(const EndRec& e) {
+  String t;
+  for (uint8_t k = 0; k < e.arrows && k < 40; k++) {
+    const uint8_t v = (k & 1) ? (e.scores[k / 2] >> 4) : (e.scores[k / 2] & 0x0F);
+    if (v == 15) break;
+    if (t.length()) t += ' ';
+    t += v == 11 ? String("X") : String(v);
+  }
+  return t;
+}
+
+String endJson(const EndRec& e) {
+  const bool a = e.angleC != ANGLE_NONE;
+  return "{\"t\":\"endrec\",\"seq\":" + String(e.seq) + ",\"epoch\":" + String(e.epoch) + ",\"id\":" + String(e.id) +
+         ",\"n\":" + String(e.n) + ",\"valid\":" + jbool(e.flags & END_VALID) + ",\"skipped\":" + jbool(e.flags & END_SKIPPED) +
+         ",\"arrows\":" + String(e.arrows) + ",\"sum\":" + String(e.sum) + ",\"x\":" + String(e.x) +
+         ",\"dist\":" + (e.distM ? String(e.distM) : String("null")) +
+         ",\"ang\":" + (a ? String(e.angleC / 100.0f, 2) : String("null")) +
+         ",\"angSd\":" + (a ? String(e.angleSdC / 100.0f, 2) : String("null")) + ",\"angN\":" + String(e.angleN) +
+         ",\"scores\":\"" + scoresText(e) + "\"}";
+}
+
+String endLine(const EndRec& e) {
+  String l = "  End " + String(e.n) + ": ";
+  l += (e.flags & END_VALID) ? String(e.sum) + " (" + scoresText(e) + ")" : String("invalid, ") + String(e.arrows) + " arrows";
+  if (e.distM) l += ", " + String(e.distM) + " m";
+  if (e.angleC != ANGLE_NONE) l += ", angle " + String(e.angleC / 100.0f, 2) + " +/- " + String(e.angleSdC / 100.0f, 2) + " deg";
+  return l;
+}
+
+// Terminal: "log ends <epoch> <id>"
+static uint32_t lsEpoch, lsId;
+void printEnds(String args) {
+  args.trim();
+  const int sp = args.indexOf(' ');
+  lsEpoch = (uint32_t)strtoul((sp < 0 ? args : args.substring(0, sp)).c_str(), nullptr, 10);
+  lsId    = sp < 0 ? 0 : (uint32_t)strtoul(args.substring(sp + 1).c_str(), nullptr, 10);
+  if (!lsEpoch || !lsId) { err("Format: log ends <epoch> <id>"); return; }
+  out("--- Ends of session " + String(lsEpoch) + "-" + String(lsId) + " ---");
+  logForEachKind(0, [](const LogRec& r) {
+    const EndRec& e = *(const EndRec*)&r;
+    if (e.epoch == lsEpoch && e.id == lsId) out(endLine(e));
+    return true;
+  }, LOG_ENDS);
+}
+
 void printLogInfo() {
   if (appMode) { sendLine(logInfoJson()); return; }
   char jed[8];
@@ -2325,7 +2570,10 @@ void printLog(uint32_t since, bool all) {
   if (appMode) {
     sendLine("{\"t\":\"logStart\",\"since\":" + String(since) + ",\"last\":" + String(logLastSeq) +
              ",\"total\":" + String(logVisibleCount()) + ",\"epoch\":" + String(shotState.epoch) + "}");
-    logForEach(since, [](const LogRec& r) { sendLine(slotJson(r)); return true; });
+    logForEachKind(since, [](const LogRec& r) {
+      sendLine(r.magic == END_MAGIC ? endJson(*(const EndRec*)&r) : slotJson(r));
+      return true;
+    }, LOG_SESSIONS | LOG_ENDS);
     sendLine("{\"t\":\"logEnd\",\"last\":" + String(logLastSeq) + "}");
     return;
   }
@@ -2380,6 +2628,17 @@ void handleScore(String args) {
   if (!sessionActive) { err("No session started"); return; }
   args.trim();
 
+  // Distance "@NN" anywhere in the line (sticky for the following ends)
+  const int at = args.indexOf('@');
+  if (at >= 0) {
+    int e = args.indexOf(' ', at);
+    const long d = args.substring(at + 1, e < 0 ? args.length() : e).toInt();
+    if (d < 0 || d > 250) { err("Invalid distance (0-250 m)."); return; }
+    endDistM = (uint8_t)d;
+    args = args.substring(0, at) + (e < 0 ? String("") : args.substring(e));
+    args.trim();
+  }
+
   // Close an end without scores (arrow count from the sensor)
   if (args == "skip") {
     if (endShots == 0) { err("Open end has no shots, nothing to skip."); return; }
@@ -2421,7 +2680,7 @@ void handleScore(String args) {
       err("Too many values in one line (max. " + String(MAX_SCORES_LINE) + "). Nothing stored.");
       return;
     }
-    vals[n++] = (uint8_t)v;
+    vals[n++] = isX ? 11 : (uint8_t)v;      // 11 = X (10 points, counted separately)
     if (isX) xn++;
   }
 
@@ -2433,13 +2692,16 @@ void handleScore(String args) {
     pendingN = n;
     pendingX = xn;
     memcpy(pendingVals, vals, n);
+    const bool canSplit = n < endShots;
     say("End " + String(endCount + 1) + ": " + String(endShots) + " shots counted, " +
-        String(n) + " values entered - save anyway? (yes/no)",
+        String(n) + " values entered - save anyway? (yes/no" + (canSplit ? String("/split") : String("")) + ")" +
+        (canSplit ? String(" split = save these as one end, keep the other ") + String(endShots - n) +
+                    " shots for the next end" : String("")),
         "{\"t\":\"confirm\",\"end\":" + String(endCount + 1) + ",\"counted\":" + String(endShots) +
-        ",\"entered\":" + String(n) + "}");
+        ",\"entered\":" + String(n) + ",\"split\":" + jbool(canSplit) + "}");
     return;
   }
-  closeEndValid(vals, n, xn);
+  closeEndValid(vals, n, xn, 0);
 }
 
 // ============================================================================
@@ -2522,13 +2784,15 @@ void printHelp() {
   out("shots             counter status + running session");
   out("shots on|off      shot counter on/off");
   out("shots start|stop  start/end a session manually");
-  out("score 9 x 7 0     score an end (0-10, x = inner ten)");
+  out("score 9 x 7 0     score an end (0-10, x = inner ten); add @50 for the distance");
   out("score skip        end without scores (invalid)");
   out("log               newest sessions (log all: all)");
   out("log since <n>     sessions after #n");
   out("log info          log flash, number of sessions, clock");
   out("log put ...       write a session from a backup (used by the app)");
   out("log test          check the log flash step by step");
+  out("log ends <e> <id> ends of one session (scores, distance, angle)");
+  out("angle off|auto|on measure the aiming angle at every shot");
   out("log del <e> <id>  delete one session on the sight");
   out("log clear         delete all sessions on the sight (asks first)");
   out("level             tilt indicator status");
@@ -2627,6 +2891,58 @@ void logPut(String args) {
       key + (ok ? "\"added\",\"seq\":" + String(r.seq) + "}" : String("\"error\"}")));
 }
 
+// Is this end already stored?
+static uint32_t feEpoch, feId; static uint16_t feN; static bool feHit;
+bool endHasKey(uint32_t epoch, uint32_t id, uint16_t n) {
+  feEpoch = epoch; feId = id; feN = n; feHit = false;
+  logForEachKind(0, [](const LogRec& r) {
+    const EndRec& e = *(const EndRec*)&r;
+    if (e.epoch == feEpoch && e.id == feId && e.n == feN) { feHit = true; return false; }
+    return true;
+  }, LOG_ENDS);
+  return feHit;
+}
+
+// "log putend <epoch> <id> <n> <arrows> <flags> <sum> <x> <dist> <angleC> <angleSdC> <angleN> <scores>"
+// scores: one hex digit per arrow (0-9, A = 10, B = X), "-" for none
+void logPutEnd(String args) {
+  uint32_t v[11]; uint8_t n = 0;
+  String scores = "-";
+  args.trim();
+  while (args.length() && n < 12) {
+    const int sp = args.indexOf(' ');
+    const String tok = sp < 0 ? args : args.substring(0, sp);
+    if (n < 11) v[n] = (uint32_t)strtol(tok.c_str(), nullptr, 10); else scores = tok;
+    n++;
+    args = sp < 0 ? String("") : args.substring(sp + 1);
+    args.trim();
+  }
+  const String key = "{\"t\":\"ack\",\"cmd\":\"putend\",\"epoch\":" + String(n > 0 ? v[0] : 0) +
+                     ",\"id\":" + String(n > 1 ? v[1] : 0) + ",\"n\":" + String(n > 2 ? v[2] : 0) + ",\"result\":";
+  if (n != 12 || !v[0] || !v[1] || !v[2]) { say("Format: log putend <epoch> <id> <n> ... <scores>", key + "\"error\"}"); return; }
+  if (!qfOk) { say("Log flash not available.", key + "\"error\"}"); return; }
+  if ((int32_t)(awakeUntil - (millis() + AWAKE_PUT_MS)) < 0) awakeUntil = millis() + AWAKE_PUT_MS;
+  if (endHasKey(v[0], v[1], v[2])) { say("End already stored.", key + "\"exists\"}"); return; }
+  EndRec e;
+  memset(&e, 0, sizeof(e));
+  e.magic = END_MAGIC;
+  e.epoch = v[0]; e.id = v[1]; e.n = v[2]; e.arrows = v[3]; e.flags = v[4] & (END_VALID | END_SKIPPED);
+  e.sum = v[5]; e.x = v[6]; e.distM = v[7];
+  e.angleC = (int16_t)(int32_t)v[8]; e.angleSdC = v[9]; e.angleN = v[10];
+  memset(e.scores, 0xFF, sizeof(e.scores));
+  for (uint8_t k = 0; scores != "-" && k < scores.length() && k < 40; k++) {
+    const char c = scores[k];
+    const uint8_t d = (c >= '0' && c <= '9') ? c - '0' : ((c == 'a' || c == 'A') ? 10 : ((c == 'b' || c == 'B') ? 11 : 15));
+    e.scores[k / 2] = (k & 1) ? ((e.scores[k / 2] & 0x0F) | (d << 4)) : ((e.scores[k / 2] & 0xF0) | d);
+  }
+  memset(e.reserved, 0xFF, sizeof(e.reserved));
+  LogRec raw;
+  memcpy(&raw, &e, sizeof(raw));
+  const bool ok = logAppend(raw, false);
+  say(ok ? String("End added.") : String("ERROR: could not write to the log flash!"),
+      key + (ok ? "\"added\"}" : "\"error\"}"));
+}
+
 // "awake <seconds>": stay reachable (Bluetooth, readings) without movement, e.g.
 // while the app copies sessions. 0 releases the hold. Bow functions still sleep.
 void setAwake(String args) {
@@ -2675,7 +2991,14 @@ void handleCommand(String line) {
       // The entered arrow count wins over the sensor count
       shotCount = shotCount - endShots + pendingN;
       mismatchAccepted = true;
-      closeEndValid(pendingVals, pendingN, pendingX);
+      closeEndValid(pendingVals, pendingN, pendingX, 0);
+      return;
+    }
+    if (line == "split" && pendingN < endShots) {
+      // Two ends were shot without saving in between: these scores are the first
+      // end, the remaining shots stay counted for the next one. Counts match, so
+      // this is no mismatch.
+      closeEndValid(pendingVals, pendingN, pendingX, endShots - pendingN);
       return;
     }
     say("Input discarded, end " + String(endCount + 1) +
@@ -2723,6 +3046,10 @@ void handleCommand(String line) {
   else if (line == "bat")                 printBat();
   else if (line == "bat reset")           bhReset();
   else if (line.startsWith("log put "))   logPut(line.substring(8));
+  else if (line.startsWith("log putend ")) logPutEnd(line.substring(11));
+  else if (line.startsWith("log ends "))  printEnds(line.substring(9));
+  else if (line == "angle")               handleAngle("");
+  else if (line.startsWith("angle "))     { String a = line.substring(6); a.trim(); handleAngle(a); }
   else if (line == "level")               handleLevel("");
   else if (line.startsWith("level "))     { String a = line.substring(6); a.trim(); handleLevel(a); }
   else if (line.startsWith("set "))       handleSet(line.substring(4));
@@ -3047,7 +3374,9 @@ void loop() {
   }
 
   const bool lvlOn = levelActive();
-  if (lvlOn) updateTilt();
+  const bool angOn = angleActive();
+  if (lvlOn || angOn) updateOrientation(lvlOn, angOn);
+  if (!angOn) pitchFill = 0;                  // no stale angles into the next session
   updateLed(millis());
 
   // Periodic status report, only when connected
@@ -3056,5 +3385,5 @@ void loop() {
     lastReportMs = now;
   }
 
-  delay(lvlOn ? LEVEL_LOOP_MS : ACTIVE_POLL_MS);
+  delay((lvlOn || angOn) ? LEVEL_LOOP_MS : ACTIVE_POLL_MS);
 }

@@ -634,7 +634,7 @@ const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.1";
+const APP_VERSION     = "5.2";
 
 // ---------------------------------------------------------------------------
 // State
@@ -2649,6 +2649,33 @@ function settingRow(it) {
   return div;
 }
 
+// Distance to check while setting up a sight (aiming angle "on", no session needed)
+function checkDistRow(rg, ready) {
+  const row = document.createElement("div");
+  row.className = "switchrow";
+  const d = rg.dist || 0;
+  row.innerHTML = `<div><div class="lbl">Distance to check</div><div class="desc"></div></div>
+    <div class="distrow" style="margin:0">
+      <button aria-label="Shorter">−</button><b></b><button aria-label="Longer">+</button></div>`;
+  row.querySelector(".desc").textContent = !ready
+    ? "Works once the sight has learned your distances."
+    : d === 0 ? "Choose the distance of the target you aim at."
+    : rg.estimated ? "Not learned yet at this distance: no warning here."
+    : "Aim at it: double blink = sight set too low, triple = too high, calm = right.";
+  row.querySelector("b").textContent = `${d} m`;
+  const setTo = (v) => {
+    v = Math.max(0, Math.min(150, v));
+    if (state.range) state.range.dist = v;          // show it right away
+    send(`dist ${v}`);
+    render();
+  };
+  const [minus, plus] = row.querySelectorAll("button");
+  minus.addEventListener("click", () => setTo(d - 10));
+  plus.addEventListener("click", () => setTo(d === 0 ? (Number(localStorage.getItem(DIST_LAST_KEY)) || 10) : d + 10));
+  if (!ready) { minus.disabled = plus.disabled = true; row.style.opacity = ".55"; }
+  return row;
+}
+
 // Row with a segmented control, e.g. Off / Auto / On
 function segRow(label, desc, current, modes, onPick) {
   const row = document.createElement("div");
@@ -2747,6 +2774,8 @@ function renderSettings() {
     row.querySelector("input").disabled = !ready;
     if (!ready) row.style.opacity = ".55";
     sw.appendChild(row);
+    // "On" is for setting up a sight: choose the distance you aim at right here
+    if (angMode === "on") sw.appendChild(checkDistRow(rg, ready));
   }
   sw.appendChild(segRow("LED",
     (ledMode === "auto" ? "Auto: switched by the light sensor."

@@ -10,11 +10,11 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > |---|---|
 > | Model | Claude Opus 5.5 (Anthropic) |
 > | Interface | claude.ai, chat with code execution and web search |
-> | Period | 23 September 2026, finished on 25 September 2026 |
+> | Period | 23 September 2026, finished on 25 September 2026; reviewed and extended on 30 September 2026 |
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
-> | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, browser tests of the app with simulated data. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 1.9, protocol 4, app 1.8 |
+> | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
+> | Firmware / protocol / app | Firmware 5.7, protocol 15, app 5.10 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -42,13 +42,14 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 ## Features
 
 - **Automatic illumination:** The UV LED lights the sight's fluorescent fibre when it is dark and the bow is in use. Brightness is set in percent, either fixed or fading in with the dusk. It is held steady over the whole battery discharge via PWM.
-- **Motion-based power management:** When the bow lies still, LED, light sensor and Bluetooth switch off and the board sleeps. Picking the bow up wakes it within about half a second.
+- **Motion-based power management:** When the bow lies still, LED, light sensor and Bluetooth switch off, the accelerometer drops to 12.5 Hz and the board sleeps until the IMU reports motion on its interrupt line. Picking the bow up wakes it at once.
 - **Cant indicator:** The LED blinks when the bow is canted sideways, faster the more it is tilted, or inverted: faster the closer to level. Aiming up or down does not count. Modes: off, auto (during a session) and on (always).
 - **Shot counter:** Detects every shot through the impact on the riser (IMU tap detection via hardware interrupt). Shots are grouped into ends and training sessions.
-- **Scoring:** Enter the scores of each end (0–10, X, M). Each end is checked against the counted shots. The last 32 sessions are stored on the device.
+- **Scoring:** Enter the scores of each end (0–10, X, M). Each end is checked against the counted shots. Sessions and their ends are stored on the board's 2 MB flash (room for about 32,000 records).
 - **Battery:** USB-C charging at a fixed 50 mA, charge status, battery percentage and a deep-discharge cutoff for the LED.
 - **Bluetooth:** Everything can be read and configured over Bluetooth LE (Nordic UART Service), either with a serial terminal app or with the included web app.
-- **Web app (PWA):** Status, training keypad, history with chart and CSV export, settings with guided calibration. Works offline once installed.
+- **Web app (PWA):** Status, training keypad, history with chart, CSV export, backup and import, settings with guided calibration, automatic sync of sessions in both directions. Works offline once installed.
+- **Aiming range (optional):** With the distance set per end, the sight learns which aiming angle belongs to which distance and can warn when the aim does not fit the distance. Several arrow/bow setups can be kept.
 - **Update mode:** Reboot into the UF2 bootloader from the app, no double click on the reset button needed.
 
 ---
@@ -195,13 +196,17 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 
 ### What is stored in flash
 
-| File | Content | Saved |
-|---|---|---|
-| `/uvcfg.bin` | Settings | With `save` |
-| `/shots.bin` | Shot counter on/off, session log (32 slots) | Automatically |
-| `/level.bin` | Cant indicator mode and calibration | Automatically |
+| File | Where | Content | Saved |
+|---|---|---|---|
+| `/uvcfg.bin` | internal | Settings | With `save` |
+| `/shotstate.bin` | internal | Shot counter on/off, log epoch, last session number | Automatically |
+| `/level.bin` | internal | Cant indicator mode, calibration, LED switch, signals | Automatically |
+| `/setups.bin` | internal | Arrow/bow setups | Automatically |
+| `/bathist.bin` | internal | Battery history for the runtime estimate | Automatically |
+| session log | external 2 MB QSPI flash | Sessions and ends as 64-byte records with CRC, ring buffer | Automatically |
+| `/shots.old` | internal | Backup of the log format of firmware 1.2 to 2.1 after the migration | Once |
 
-When a firmware update changes the layout of a file, that file starts over with defaults. The log has been reset like this several times during development. Export your history from the app before updating.
+When a firmware update changes the layout of an internal file, that file starts over with defaults. The session log on the external flash keeps its format. Export a backup from the app before updating anyway.
 
 ---
 
@@ -210,7 +215,7 @@ When a firmware update changes the layout of a file, that file starts over with 
 ### Active and idle
 
 - **Active:** The bow was moved within the timeout (default 5 min). LED logic, light sensor and Bluetooth run.
-- **Idle:** The bow lies still. Everything is off, the board wakes every 0.5 s briefly to check the IMU. A Bluetooth connection is dropped when the board goes idle; a connection alone does not keep it awake.
+- **Idle:** The bow lies still. Everything is off. The IMU's interrupt line wakes the board when the bow moves; without motion it only wakes every 5 s for housekeeping. A Bluetooth connection is dropped when the board goes idle; a connection alone does not keep it awake. USB power or an `awake` hold from the app keep Bluetooth reachable without movement.
 - A running session survives idle phases. It is only ended by `session_end` minutes without a shot, by `shots stop`, or by a restart of the board.
 
 ### Illumination
@@ -258,12 +263,12 @@ Each step waits 3 s, then measures for about 0.6 s. If the two positions differ 
 - **Shot detection:** The IMU reports impacts above `tap_ths` via interrupt. After a shot further impacts are ignored for `lockout`. Setting the bow down at the end often counts as a shot; this is handled below.
 - **Ends:** Each `score` line closes an end and is compared with the shots counted since the last entry.
   - Match: the end is saved.
-  - Mismatch: the device asks `save anyway? (yes/no)`. `yes` saves your values and your arrow count wins over the sensor count. `no` discards the input and the end stays open. Any other command also discards the input.
+  - Mismatch: the device asks `save anyway? (yes/no/split)`. `yes` saves your values and your arrow count wins over the sensor count. `split` (offered when fewer values than shots were entered) saves the values as one end and keeps the remaining shots for the next end. `no` discards the input and the end stays open. Any command that changes the session or a setting also discards the input; commands that only read (`status`, `log …`, `level`, …) and the sync commands of the app leave the question open.
   - `score skip` closes an end without scores: it is stored as invalid, the sensor's arrow count is used, all arrows count 0 points and are left out of the average.
 - **Scores:** `0`–`10` and `x` (inner ten: 10 points, counted separately). Several values per line, for example `score x 10 9 9 8 7`. If one value is invalid, the whole line is rejected. The app shows 0 as M (miss).
 - **Session end:** automatically after `session_end` minutes (default 60) without a shot, or with `shots stop`. An open last end with exactly 1 shot is ignored (bow set down); with more shots it is stored as invalid. Sessions without any end are discarded.
 - **Stored per session:** ends, shots, scored arrows, average, X count, duration in minutes, invalid ends and arrows, flags (corrected by hand, ended by hand). There is no clock on the board; the app derives the date.
-- The log holds 32 sessions and overwrites the oldest one when full.
+- The log lives on the external flash and holds about 32,000 records; the oldest are overwritten when it is full. The app can delete single sessions or the whole log on the sight.
 
 ---
 
@@ -320,6 +325,17 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `level off` / `auto` / `on` | Cant indicator mode | Immediately |
 | `level style normal` / `inverted` | Blink faster when tilted / when close to level | Immediately |
 | `level cal` / `level cal2` | Calibration step 1 / 2 | After step 2 |
+| `level signal on` / `off` | Blink when canted (measuring continues) | Immediately |
+| `angle off` / `auto` / `on` | Measure the aiming angle at every shot | Immediately |
+| `dist <m>` | Distance of the running session (0 = unknown); `score … @50` also sets it | With the session |
+| `range`, `range signal on` / `off` | Learned distances and arrow speed; warning when the aim does not fit | Immediately |
+| `setup`, `setup use` / `new` / `name` / `del` | Arrow/bow setups, each learns its own speed | Immediately |
+| `log all`, `log since <n>`, `log ends <e> <id>`, `log info`, `log test` | Whole log, records after #n, ends of a session, flash status, flash self-test | – |
+| `log put …`, `log putend …` | Write a session / end from a backup (used by the app) | Yes |
+| `log del <e> <id>`, `log clear confirm` | Delete one session / all sessions on the sight | Yes |
+| `bat`, `bat reset` | Runtime estimate and measured current draw; clear the battery history | – / Yes |
+| `time <unix> [tz]` | Set the clock (the app does this on every connect) | Until reboot |
+| `awake <s>` | Stay reachable without movement, max 900 s | No |
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
 | `dfu` | Reboot into update mode (USB needed) | – |
 
@@ -353,8 +369,9 @@ Change with `set <name> <value>`, keep with `save`. Out-of-range values are reje
 | `ths` | Wake-up motion threshold | × 125 mg | 1 | 1 | 63 |
 | `lockout` | After a shot: no counting, cant indicator paused | ms | 1500 | 200 | 5000 |
 | `timeout` | Time without movement until idle | s | 300 | 10 | 3600 |
-| `report` | Automatic status while connected, 0 = off | s | 10 | 0 or 2 | 600 |
+| `report` | Automatic status while connected, 0 = off. A status the app asks for restarts this timer, so polling and reports do not double up | s | 10 | 0 or 2 | 600 |
 | `tx_power` | Bluetooth transmit power, rounded to −20, −16, −12, −8, −4, 0, 2…8 | dBm | 0 | −20 | 8 |
+| `bat_mah` | Battery capacity, for the runtime estimate | mAh | 85 | 10 | 5000 |
 
 **Calibrating the light thresholds:** at dusk send `live on`, watch the `Light=` value, set `dark_on` where the fibre no longer glows by itself and `dark_off` about 300 higher. Then `live off` and `save`.
 
@@ -368,7 +385,6 @@ These are set at the top of the sketch and need a rebuild.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `SLOT_COUNT` | 32 | Stored sessions (1–255). Changing it resets the log. |
 | `BRIGHT_MAX_MA` | 15 mA | LED current at 100 % |
 | `BRIGHT_GAMMA` | 2.2 | Perceptual curve from percent to current |
 | `PWM_BITS` | 12 | PWM resolution for fine steps at low brightness |
@@ -377,7 +393,9 @@ These are set at the top of the sketch and need a rebuild.
 | `CAL_MIN_ANGLE_DEG` | 15° | Minimum angle between the calibration steps |
 | `CAL_COUNTDOWN_MS` | 3000 ms | Wait before a calibration measurement |
 | `SENSOR_INTERVAL_MS` | 2000 ms | Light and battery reading interval |
-| `ACTIVE_POLL_MS` / `LEVEL_LOOP_MS` / `IDLE_POLL_MS` | 250 / 30 / 500 ms | Loop interval active / with cant indicator / idle |
+| `ACTIVE_POLL_MS` / `LEVEL_LOOP_MS` | 250 / 30 ms | Loop interval active / with cant indicator or aiming angle |
+| `IDLE_WAKE_MAX_MS` / `IDLE_POLL_MS` | 5000 / 500 ms | Idle: longest sleep between housekeeping passes (the IMU interrupt ends it earlier) / poll interval if the board package has no INT1 pin |
+| `TWIM_ANOMALY_89` | 1 | Switch the I2C peripheral off between loop passes and toggle its power (nRF52840 erratum 89, otherwise up to 0.4 mA extra) |
 | `ADV_FAST_INTERVAL` / `ADV_SLOW_INTERVAL` | 100 ms / ~1 s | Advertising for the first 10 s / afterwards |
 | `CONN_INT_MIN` / `CONN_INT_MAX` | 200 / 400 ms | Requested connection interval |
 | `BLE_NAME` | `UV-Sight` | Bluetooth name |
@@ -428,36 +446,42 @@ The archive is stored in Chrome's site data. Clearing Chrome's site data deletes
 
 ---
 
-## JSON protocol (version 4)
+## JSON protocol (version 15)
 
 After `app on` the device sends **only JSON, one object per line**, until `app off` or disconnect. Commands stay the same text commands. Every object has a type field `t`. Lines that do not start with `{` (for example the greeting before `app on`) can be ignored.
 
-On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `cfgEnd`), `status`, `session` and `level`.
+On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `cfgEnd`), `status`, `session`, `level`, `loginfo`, `range` and the setups (`setupsStart`, `setupItem` …, `setupsEnd`).
 
 | Type | Fields | Sent |
 |---|---|---|
-| `hello` | `proto`, `fw`, `name`, `imu` | On `app on` |
-| `status` | `light`, `dark`, `vbat`, `pct`, `chg` (`charging`/`full`/`no USB`), `led` (`on`/`off`/`blinking`), `duty` (0–4095), `bright` (%), `mode`, `lowbat`, `tilt` (degrees or `null`), `session`, `end`, `endShots` | On `status`, with `live on` every 2 s, every `report` s |
+| `hello` | `proto`, `fw`, `name`, `imu`, `log` | On `app on` |
+| `status` | `light`, `dark`, `vbat`, `pct`, `chg` (`charging`/`full`/`no USB`), `led` (`on`/`off`/`blinking`/`warning`/`pulsing`), `duty` (0–4095), `bright` (%), `mode`, `lowbat`, `tilt` (degrees or `null`), `session`, `awake`, `rwarn`, `lastShotG`, `lastShotClip`, `end`, `endShots` | On `status`, with `live on` every 2 s, every `report` s |
+| `bat` | `light`, `rest` (hours), `full` (minutes or `null`), `src` (`measured`/`estimate`), `idleMa`, `activeMa`, `ledK`, `cap` | With every status |
 | `cfgStart` | `n` | Start of the settings list |
 | `cfgItem` | `k`, `v`, `def`, `min`, `max`, `dec`, `zero`, `unit`, `d` | One per setting |
 | `cfgEnd` | – | End of the settings list |
-| `session` | `counter`, `active`; if active also `epoch`, `nextId`, `end`, `endShots`, `ends`, `invalidEnds`, `shots`, `scored`, `sum`, `x`, `avg`, `min`, `pending` | On `shots`, after every change |
-| `shot` | `end`, `endShots`, `total` | Every detected shot |
-| `end` | `n`, `valid`; valid: `arrows`, `sum`, `x`, `avg`; invalid: `arrows`, `reason` | An end was closed |
-| `confirm` | `end`, `counted`, `entered` | Mismatch, answer with `yes` or `no` |
+| `session` | `counter`, `active`; if active also `epoch`, `nextId`, `dist`, `distSrc`, `end`, `endShots`, `ends`, `invalidEnds`, `shots`, `scored`, `sum`, `x`, `avg`, `min`, `pending` | On `shots`, after every change |
+| `shot` | `end`, `endShots`, `total`, `g`, `clip`, `ang`, `cant` | Every detected shot |
+| `end` | `n`, `valid`, `arrows`, `dist`, `distSrc`, `setup`, `ang`, `angSd`, `angN`, `cant`, `cantMax`, `canted`, `cantN`, `stored`; valid: `sum`, `x`, `avg`; invalid: `reason` | An end was closed |
+| `confirm` | `end`, `counted`, `entered`, `split` | Mismatch, answer with `yes`, `no` or `split` |
 | `discarded` | `end` | Input discarded, end still open |
-| `sessionEnd` | `manual`, `stored`, `epoch`, `slot` | Session ended (`stored:false` for empty sessions) |
-| `logStart` | `count`, `epoch` | Start of the log |
-| `slot` | `i`, `id`, `ago`, `ends`, `shots`, `scored`, `avg`, `x`, `min`, `invalidEnds`, `invalidArrows`, `mismatch`, `manual` | One per stored session |
-| `logEnd` | – | End of the log |
-| `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `on`, `cal`, `tol`, `active`, `tilt` | On `level`, after changes |
+| `sessionEnd` | `manual`, `stored`, `epoch`, `id`, `seq` (0 if not stored), `error` | Session ended (`stored:false` for empty sessions or a flash error); a `slot` line with the details follows |
+| `logStart` | `since`, `last`, `total`, `epoch` | Start of a log answer |
+| `slot` | `seq`, `epoch`, `id`, `start`, `ago`, `ends`, `shots`, `scored`, `avg`, `x`, `min`, `invalidEnds`, `invalidArrows`, `mismatch`, `manual` | One per stored session |
+| `endrec` | `seq`, `epoch`, `id`, `n`, `valid`, `arrows`, `skipped`, `sum`, `x`, `dist`, `auto`, `setup`, `ang`, `angSd`, `angN`, `cant`, `cantMax`, `canted`, `cantN`, `scores` | One per stored end |
+| `logEnd` | `last`, `n` (records sent in this answer) | End of a log answer. The app compares `n` with what it received and asks again if a line was lost |
+| `loginfo` | `ok`, `jedec`, `count`, `capacity`, `last`, `clock`, `migrated`, `error`, `initErr`, `resets` | On `log info` and `app on` |
+| `range` | `setup`, `name`, `state` (`learning`/`anchor`/`ready`), `ends`, `dists`, `min`, `max`, `speed`, `kmh`, `drag`, `dist`, `distSrc`, `estimated`, `signal`, `warn`, `ok` | On `range`, after changes |
+| `setupsStart` / `setupItem` / `setupsEnd` | `active`; per item `id`, `name`, `deleted`, `state`, `ends`, `kmh`, `min`, `max` | On `setup`, after changes |
+| `logtest` | `step`, `ok`, `detail` | During `log test` |
+| `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `cal`, `angle` (`off`/`auto`/`on`), `cantSignal`, `rangeSignal` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
 | `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`) | Device events |
-| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu` | Confirmation of a command |
+| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`) | Confirmation of a command |
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |
 
-**Session identity:** `epoch` is a random number of the log, newly created whenever the log starts empty. `id` is a running session number. `epoch` + `id` identify a session uniquely. A running session already reports the key it will get (`epoch` + `nextId`). `ago` is the number of minutes since the session was saved, or `null` after a reboot of the board.
+**Session identity:** `epoch` is a random number of the log, newly created whenever the log starts empty. `id` is a running session number. `epoch` + `id` identify a session uniquely. A running session already reports the key it will get (`epoch` + `nextId`). `seq` is the write number of a record on the flash; the app remembers the newest `seq` it has and asks for `log since <seq>`. `start` is the unix time of the session start if the app had set the clock, `ago` the number of minutes since the session was saved, or `null` after a reboot of the board.
 
 **Why short lines:** long lines (about 1,500 characters) were lost or corrupted over Bluetooth in practice. The settings are therefore sent as one short line per item. No line is longer than about 350 characters.
 
@@ -473,6 +497,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | Settings tab says "Loading settings…" for long | Lines got lost. The app retries three times; move closer and tap *Try again*. |
 | Protocol warning in the app | Firmware and app versions do not match. Update both. |
 | Status reports keep coming after `live off` | That is the periodic `report`. Set `report 0` to switch it off. |
+| Linker error about `GPIOTE_IRQHandler` | The sketch owns the GPIOTE interrupt for the IMU line. Nothing else in the sketch may call `attachInterrupt`. |
 | LED switches nervously at dusk | Raise `confirm` or widen the gap between `dark_on` and `dark_off`. |
 | Fibre too bright in full darkness | Lower `bright`; in auto mode it applies from `dark_on` down. |
 | Shots are not counted | Check `shots` is on and the housing is screwed rigidly. Lower `tap_ths`. |
@@ -495,4 +520,4 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 - **Cold:** below 0 °C LiPo capacity drops noticeably; runtime will be shorter than estimated.
 - **Estimates:** runtimes and some thresholds are estimates and were not measured by the author of the code.
 - **Web Bluetooth:** only Chrome on Android is supported; iPhone browsers do not support Web Bluetooth.
-- **Possible current bug of the chip:** a documented nRF52840 erratum can add up to about 0.4 mA while I2C and pin interrupts are used together. This only applies while the shot counter is on and the bow is active.
+- **Erratum 89 of the chip:** a documented nRF52840 erratum adds up to about 0.4 mA while the I2C peripheral stays enabled next to GPIOTE. The firmware works around it by switching the I2C peripheral off between loop passes (`TWIM_ANOMALY_89`). Whether the workaround is complete has not been measured on hardware.

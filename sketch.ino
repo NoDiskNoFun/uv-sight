@@ -179,8 +179,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "4.1";
-const uint8_t  PROTO_VERSION     = 11;
+const char*    FW_VERSION        = "5.6";
+const uint8_t  PROTO_VERSION     = 14;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -339,8 +339,10 @@ typedef bool (*LogVisitor)(const LogRec&);   // callback for logForEach()
 // the session records, told apart by the magic; the session key (epoch + id)
 // links it to its session.
 const uint32_t END_MAGIC = 0x31444E45;       // "END1"
-#define END_VALID   0x01
-#define END_SKIPPED 0x02
+#define END_VALID       0x01
+#define END_SKIPPED     0x02
+#define END_DIST_MANUAL 0x04   // distance set by hand (only these teach the range model)
+#define END_DIST_AUTO   0x08   // distance recognised from the aiming angle
 const int16_t  ANGLE_NONE = -32768;          // no angle measured
 struct __attribute__((packed, aligned(4))) EndRec {
   uint32_t magic;          // END_MAGIC
@@ -358,7 +360,13 @@ struct __attribute__((packed, aligned(4))) EndRec {
   uint8_t  angleN;         // arrows with an angle
   uint8_t  pad;
   uint8_t  scores[20];     // 4 bits per arrow: 0-10, 11 = X, 15 = none
-  uint8_t  reserved[10];
+  int16_t  cantC;          // mean cant at release, 1/100 degree (signed: left/right)
+  uint16_t cantMaxC;       // largest cant of an arrow, 1/100 degree
+  uint8_t  cantN;          // arrows with a cant reading (0xFF in records before firmware 4.2)
+  uint8_t  cantedN;        // arrows released outside the cant tolerance
+  uint8_t  calGen;         // calibration number the angles were measured with (0xFF before 5.0)
+  uint8_t  setup;          // arrow/bow setup (0 = default; 0xFF before 5.0)
+  uint8_t  reserved[2];
   uint32_t crc;
 };
 static_assert(sizeof(EndRec) == 64, "EndRec must be 64 bytes");
@@ -506,6 +514,11 @@ struct LevelState {
   uint8_t  angleMode; // aiming angle: 0 = auto (during sessions), 1 = off, 2 = on
   float    L[3];   // lateral axis (aiming up/down rotates around this axis)
   float    D[3];   // gravity direction with the bow level and horizontal
+  // appended in firmware 5.0 (older files load with the defaults below)
+  uint8_t  calGen;      // calibration number, +1 with every new calibration
+  uint8_t  cantSignal;  // 1 = the LED blinks when canted (measuring is lvl.on)
+  uint8_t  rangeSignal; // 1 = the LED double-blinks when the aiming angle doesn't fit the distance
+  uint8_t  ledMode;     // LED switch (MODE_AUTO / MODE_ON / MODE_OFF), kept over restarts
 };
 
 const uint32_t LEVEL_MAGIC = 0x4C564C01;
@@ -581,7 +594,7 @@ BLEUart bleuart;
 // State
 // ============================================================================
 enum LedMode  { MODE_AUTO, MODE_ON, MODE_OFF };
-enum LedState { LS_OFF, LS_ON, LS_BLINK };
+enum LedState { LS_OFF, LS_ON, LS_BLINK, LS_WARN, LS_PULSE };
 
 bool     imuOk             = false;
 bool     imuFast           = false;
@@ -616,14 +629,72 @@ const uint8_t  PITCH_SAMPLES   = 64;
 const uint32_t PITCH_FROM_MS   = 1200;   // average from this long before the release ...
 const uint32_t PITCH_TO_MS     = 150;    // ... up to this long before it (the bow moves at release)
 float    pitchBuf[PITCH_SAMPLES];
+float    cantBuf[PITCH_SAMPLES];        // signed cant at the same moments
 uint32_t pitchMs[PITCH_SAMPLES];
 uint8_t  pitchHead = 0, pitchFill = 0;
 // Angles of the arrows in the open end
 const float NO_ANGLE = 1000.0f;          // marks a shot without aiming angle
 float    endShotAng[MAX_SCORES_LINE];   // aiming angle per shot of the open end (NO_ANGLE = none)
+float    endShotCant[MAX_SCORES_LINE];  // cant per shot of the open end (NO_ANGLE = none)
 uint8_t  endShotN = 0;                  // shots in that list
+float    lastCant = 0, lastCantMax = 0;  // cant statistics of the end just closed (for the messages)
+uint8_t  lastCantN = 0, lastCanted = 0;
 uint8_t  endDistM = 0;            // distance given with the last score line (sticky)
 uint32_t sessionId = 0;           // log id of the running session, reserved at its start
+uint8_t  distSrc = 0;             // distance of the session: 0 = unknown, 1 = set by hand, 2 = recognised
+
+// Range model (physics): aiming angle = zero point of the calibration
+//   + launch angle from a flat trajectory with drag + height difference arrow/target.
+//   Per setup: s = g / v0^2 (arrow speed) and k (drag, 1/m). Shared: zero points, h.
+const uint8_t  RANGE_MAX_ROWS   = 240;    // most recent ends used for learning
+const uint8_t  RANGE_MAX_GENS   = 6;      // calibrations with their own zero point
+const uint8_t  RANGE_MIN_ARROWS = 3;      // an end needs this many angles to count
+const uint8_t  SETUP_MAX        = 8;      // arrow/bow setups (ids 0..7, never reused)
+const float    K_PRIOR          = 0.0015f;   // typical drag of an arrow, 1/m
+const float    K_PRIOR_SD       = 0.0008f;
+const float    H_PRIOR_SD       = 0.3f;      // height difference arrow/target, m
+const float    ANGLE_SD         = 0.13f;     // typical spread of one arrow's aiming angle, deg
+const uint8_t  RANGE_EXTRA_M    = 20;        // recognise/warn up to 20 m beyond what was learned
+struct RangeRow { float d; float th; float w; uint8_t gen; uint8_t setup; };
+RangeRow rangeRows[RANGE_MAX_ROWS];
+uint8_t  rangeRowN = 0, rangeRowNext = 0;
+struct SetupModel {
+  uint8_t  state;          // 0 = learning, 1 = needs one end (new calibration), 2 = ready
+  float    s, k;           // g / v0^2 and drag
+  float    speed;          // v0, m/s
+  uint16_t ends;
+  uint8_t  dists, minD, maxD;
+};
+SetupModel sm[SETUP_MAX];
+uint8_t  genIds[RANGE_MAX_GENS]; float genOffset[RANGE_MAX_GENS]; uint8_t genN = 0;
+float    hShared = 0;
+// Active setup's view (used by the rest of the sketch)
+uint8_t  rngState = 0;
+float    rngOffset = 0, rngSpeed = 0;
+uint16_t rngEnds = 0; uint8_t rngDists = 0;
+
+// Setups, stored in internal flash
+struct SetupEntry { uint8_t used; char name[19]; };     // used: 0 = free, 1 = in use, 2 = deleted (name kept)
+struct SetupTable {
+  uint32_t   magic;
+  uint8_t    active;
+  uint8_t    pad[3];
+  SetupEntry s[SETUP_MAX];
+};
+const uint32_t SETUP_MAGIC = 0x31505453;   // "STP1"
+const char*    SETUP_FILE  = "/setups.bin";
+SetupTable setups;
+int8_t   rangeWarnDir = 0;       // -1 = aiming too low (arrow short), +1 = too high (arrow long)
+uint8_t  warnFlashes = 2;        // flashes of the running warning cycle (fixed until it ends)
+bool     rangeOk = false;        // aiming angle "on": aim fits the distance (LED pulses)
+uint32_t rangeOkSince = 0;
+float    sessOffset = 0;                  // zero drift of this session (temperature)
+float    sessResSum = 0, sessResW = 0;
+bool     rangeWarn = false;
+uint32_t rangeBadSince = 0, rangeGoodSince = 0;
+float    sessD[MAX_SCORES_LINE], sessTh[MAX_SCORES_LINE], sessW[MAX_SCORES_LINE];
+uint8_t  sessSetup[MAX_SCORES_LINE];
+uint8_t  sessRowN = 0;                    // this session's ends with a distance set by hand
 const char* awakeReason    = "";  // "usb", "app" or "" (for the status)
 float    lastShotG         = -1;      // peak of the last counted shot in g (-1 = none yet)
 bool     lastShotClip      = false;   // the peak hit the +-16 g limit
@@ -1404,10 +1475,16 @@ void logInit() {
 void levelLoad() {
   memset(&lvl, 0, sizeof(lvl));
   lvl.magic = LEVEL_MAGIC;
+  lvl.cantSignal = 1; lvl.rangeSignal = 1;
   File f(InternalFS);
   if (f.open(LEVEL_FILE, FILE_O_READ)) {
     LevelState tmp;
-    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == LEVEL_MAGIC) {
+    memset(&tmp, 0, sizeof(tmp));
+    const int n = f.read(&tmp, sizeof(tmp));
+    if (n >= (int)offsetof(LevelState, calGen) && tmp.magic == LEVEL_MAGIC) {
+      if (n < (int)sizeof(tmp)) {             // file from before firmware 5.0
+        tmp.calGen = 0; tmp.cantSignal = 1; tmp.rangeSignal = 1; tmp.ledMode = MODE_AUTO;
+      }
       lvl = tmp;
     }
     f.close();
@@ -1974,6 +2051,8 @@ bool levelActive() {
 // Compute the cant: component of gravity along the lateral axis.
 // Aiming up/down rotates around the lateral axis and does not change the value.
 void updateTiltFrom(const float a[3]);   // below
+void rangeFit();                         // below (range model)
+const char* distSrcText();               // below
 
 // Aiming angle up (+) or down (-) in degrees from one accelerometer reading.
 // Forward axis = lateral x level-gravity (both from the cant calibration).
@@ -1987,6 +2066,11 @@ float pitchFrom(const float a[3]) {
   return atan2f(vdot(a, F), vdot(a, lvl.D)) * 57.29578f;
 }
 
+// Signed cant in degrees from one accelerometer reading (lateral axis from the calibration)
+float cantFrom(const float a[3]) {
+  return atan2f(vdot(a, lvl.L), vdot(a, lvl.D)) * 57.29578f;
+}
+
 // Aiming angle measurement: off / auto (during a session) / on
 bool angleActive() {
   if (!lvl.calibrated || !imuOk) return false;
@@ -1998,14 +2082,14 @@ const char* angleModeText() {
   return lvl.angleMode == 2 ? "on" : (lvl.angleMode == 1 ? "off" : "auto");
 }
 
-// Mean angle over the aiming phase before a shot; false if too few samples
-bool aimingAngle(uint32_t shotMs, float& mean, float& sd) {
+// Mean over the aiming phase before a shot (buf = pitchBuf or cantBuf); false if too few samples
+bool aimingMean(const float* buf, uint32_t shotMs, float& mean, float& sd) {
   float s = 0, q = 0; uint8_t n = 0;
   for (uint8_t k = 0; k < pitchFill; k++) {
     const uint8_t i = (pitchHead + PITCH_SAMPLES - 1 - k) % PITCH_SAMPLES;
     const int32_t before = (int32_t)(shotMs - pitchMs[i]);
     if (before < (int32_t)PITCH_TO_MS || before > (int32_t)PITCH_FROM_MS) continue;
-    s += pitchBuf[i]; q += pitchBuf[i] * pitchBuf[i]; n++;
+    s += buf[i]; q += buf[i] * buf[i]; n++;
   }
   if (n < 10) return false;
   mean = s / n;
@@ -2018,8 +2102,9 @@ bool aimingAngle(uint32_t shotMs, float& mean, float& sd) {
 void updateOrientation(bool tiltOn, bool angleOn) {
   float a[3];
   if (!readAccel(a)) return;
-  if (angleOn) {
+  if (angleOn || tiltOn) {                   // history for the aiming angle and the cant at release
     pitchBuf[pitchHead] = pitchFrom(a);
+    cantBuf[pitchHead]  = cantFrom(a);
     pitchMs[pitchHead]  = millis();
     pitchHead = (pitchHead + 1) % PITCH_SAMPLES;
     if (pitchFill < PITCH_SAMPLES) pitchFill++;
@@ -2074,12 +2159,12 @@ bool sampleGravity(float g[3]) {
   return true;
 }
 
+// Kept short (one Bluetooth packet even with a small MTU): only what the app uses
 String levelJson() {
-  return String("{\"t\":\"level\",\"mode\":\"") + levelModeText() + "\",\"on\":" + jbool(lvl.on != LEVEL_OFF) +
+  return String("{\"t\":\"level\",\"mode\":\"") + levelModeText() + "\"" +
          ",\"style\":\"" + String(lvl.style == 1 ? "inverted" : "normal") + "\"" +
          ",\"cal\":" + jbool(lvl.calibrated) + ",\"angle\":\"" + angleModeText() + "\"" +
-         ",\"tol\":" + String(cfg.levelTol, 1) + ",\"active\":" + jbool(levelActive()) +
-         ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) + "}";
+         ",\"cantSignal\":" + jbool(lvl.cantSignal) + ",\"rangeSignal\":" + jbool(lvl.rangeSignal) + "}";
 }
 
 String calJson(uint8_t step, const char* state, const String& text) {
@@ -2101,7 +2186,7 @@ void levelCal1() {
     return;
   }
   calHaveG0 = true;
-  const String txt = "Step 1 ok. Now keep the bow LEVEL but aim clearly up or down "
+  const String txt = "Step 1 ok. Now keep the bow LEVEL but aim clearly UP, arrow tip up "
                      "(at least 20 degrees), then send 'level cal2'.";
   say(txt, calJson(1, "ok", txt));
 }
@@ -2136,9 +2221,11 @@ void levelCal2() {
 
   for (uint8_t i = 0; i < 3; i++) { lvl.L[i] = L[i]; lvl.D[i] = calG0[i]; }
   lvl.calibrated = 1;
+  lvl.calGen = lvl.calGen >= 250 ? 1 : lvl.calGen + 1;   // new zero point for the range model
   calHaveG0 = false;
   tiltReset();
   const bool ok = levelSave();
+  rangeFit();
   say(ok ? "Calibration saved." : "ERROR while saving!",
       calJson(2, ok ? "ok" : "error", ok ? "Calibration saved." : "ERROR while saving!"));
   emit(levelJson());
@@ -2146,6 +2233,7 @@ void levelCal2() {
 
 void setLevelMode(uint8_t mode, const char* text) {
   lvl.on = mode;
+  if (mode == LEVEL_ON && lvl.angleMode == 2) lvl.angleMode = 1;   // cant "on" switches the range "on" off
   if (mode == LEVEL_OFF) tiltReset();
   if (!levelSave()) { err("ERROR while saving!"); return; }
   say(String(text) + (lvl.calibrated || mode == LEVEL_OFF ? "" : " Note: not calibrated yet ('level cal')."),
@@ -2156,6 +2244,7 @@ void setLevelMode(uint8_t mode, const char* text) {
 void handleAngle(const String& arg) {
   if (arg == "off" || arg == "auto" || arg == "on") {
     lvl.angleMode = arg == "off" ? 1 : (arg == "on" ? 2 : 0);
+    if (lvl.angleMode == 2 && lvl.on == LEVEL_ON) { lvl.on = LEVEL_OFF; tiltReset(); }   // and the other way round
     if (!levelSave()) { err("ERROR while saving!"); return; }
     say("Aiming angle measurement: " + arg + (lvl.calibrated ? "." : ". Note: needs the cant calibration ('level cal')."),
         levelJson());
@@ -2179,6 +2268,12 @@ void handleLevel(const String& arg) {
   else if (arg == "on")   setLevelMode(LEVEL_ON,   "Tilt indicator on (always).");
   else if (arg == "auto") setLevelMode(LEVEL_AUTO, "Tilt indicator auto (during sessions).");
   else if (arg == "off")  setLevelMode(LEVEL_OFF,  "Tilt indicator off.");
+  else if (arg == "signal on" || arg == "signal off") {
+    lvl.cantSignal = arg == "signal on";
+    if (!lvl.cantSignal) tilted = false;
+    if (!levelSave()) { err("ERROR while saving!"); return; }
+    say(String("Cant signal ") + (lvl.cantSignal ? "on." : "off (still measured and stored)."), levelJson());
+  }
   else if (arg == "style normal" || arg == "style inverted") {
     lvl.style = (arg == "style inverted") ? 1 : 0;
     if (!levelSave()) { err("ERROR while saving!"); return; }
@@ -2193,23 +2288,47 @@ void handleLevel(const String& arg) {
 // ============================================================================
 // LED output (runs on every loop pass)
 // ============================================================================
+// Length of the running pattern cycle (0 = steady state)
+uint32_t ledCycleMs() {
+  switch (ledState) {
+    case LS_BLINK: return blinkPeriodMs;
+    case LS_WARN:  return warnFlashes * 240UL + 600;
+    case LS_PULSE: return 1000;
+    default:       return 0;
+  }
+}
+bool ledPatternRunning(uint32_t now) {
+  const uint32_t c = ledCycleMs();
+  return c && (now - blinkCycleStart) < c;
+}
+
 void updateLed(uint32_t now) {
   // After a shot the arrow is gone: pause the tilt indicator for the lockout time
   const bool tiltPause = (int32_t)(now - lastShotMs) < (int32_t)cfg.lockoutMs;
 
   // The cant indicator works in every LED mode; the mode only decides
   // what the LED does while the bow is level (or the indicator is off).
+  // Priority: wrong distance (safety: could shoot over the target) before cant
   LedState st;
   if (lowBatLock)                                 st = LS_OFF;
-  else if (levelActive() && tilted && !tiltPause) st = LS_BLINK;
+  else if (rangeWarn && !tiltPause)               st = LS_WARN;
+  else if (rangeOk && !tiltPause)                 st = LS_PULSE;   // setting up a sight: aim is right
+  else if (levelActive() && lvl.cantSignal && tilted && !tiltPause) st = LS_BLINK;
   else if (ledMode == MODE_ON)                    st = LS_ON;
   else if (ledMode == MODE_OFF)                   st = LS_OFF;
   else if (isDark)                                st = LS_ON;    // auto: light sensor
   else                                            st = LS_OFF;
 
+  // A started pattern (cant blink, double/triple blink, pulse) always plays its
+  // cycle to the end before the LED shows anything else - also a change of the
+  // warning's direction waits. Only a shot (arrow gone) or an empty battery cut it off.
+  if (!lowBatLock && !tiltPause && ledPatternRunning(now) && st != ledState) st = ledState;
+
   // Model current for the battery history (blinking is lit half the time)
   const float ma = st == LS_ON    ? percentToMa(brightNow < 0 ? brightTarget() : brightNow)
-                 : st == LS_BLINK ? percentToMa(tiltBrightness()) * 0.5f : 0.0f;
+                 : st == LS_BLINK ? percentToMa(tiltBrightness()) * 0.5f
+                 : st == LS_WARN  ? percentToMa(tiltBrightness()) * 0.25f
+                 : st == LS_PULSE ? percentToMa(tiltBrightness()) * 0.6f : 0.0f;
   if (ledMaNow == 0 && ma > 0) {
     if ((millis() - unloadedMs) < 10000) bhPoint(BP_LED_ON, unloadedMv, false);   // voltage before the load
   } else if (ledMaNow > 0 && ma == 0) {
@@ -2236,6 +2355,26 @@ void updateLed(uint32_t now) {
       uvWrite(phaseOn ? dutyTilt : 0);
       break;
     }
+    case LS_PULSE: {
+      // Soft swelling, about once per second (15 % to 100 % of the blink brightness)
+      if (ledState != LS_PULSE || (now - blinkCycleStart) >= 1000) blinkCycleStart = now;
+      const float ph = (now - blinkCycleStart) / 1000.0f;
+      const float lvlF = 0.15f + 0.85f * (0.5f - 0.5f * cosf(ph * 6.2831853f));
+      uvWrite((uint16_t)(dutyTilt * lvlF));
+      break;
+    }
+    case LS_WARN: {
+      // Aiming too low (arrow short): double blink. Too high (arrow long): triple blink.
+      // Flashes of 120 ms with 120 ms gaps, then 600 ms pause.
+      // The number of flashes is fixed at the start of each cycle
+      if (ledState != LS_WARN || (now - blinkCycleStart) >= warnFlashes * 240UL + 600) {
+        blinkCycleStart = now;
+        warnFlashes = rangeWarnDir < 0 ? 2 : 3;
+      }
+      const uint32_t ph = now - blinkCycleStart;
+      uvWrite((ph < warnFlashes * 240UL && (ph % 240) < 120) ? dutyTilt : 0);
+      break;
+    }
   }
   ledState = st;
 }
@@ -2255,6 +2394,7 @@ String sessionJson() {
     // epoch + nextId = the key this session will get in the log, so the app
     // can remember its start time even if the board restarts before import
     j += ",\"epoch\":" + String(shotState.epoch) + ",\"nextId\":" + String(sessionId) +
+         ",\"dist\":" + String(endDistM) + ",\"distSrc\":\"" + distSrcText() + "\"" +
          ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
          ",\"ends\":" + String(endCount) + ",\"invalidEnds\":" + String(invalidEnds) +
          ",\"shots\":" + String(shotCount) + ",\"scored\":" + String(scoreCount) +
@@ -2271,6 +2411,10 @@ void startSession(uint32_t now) {
   sessionId = ++shotState.lastId;   // reserved: its ends are stored under this key
   stateSave();
   endShotN = 0;
+  endDistM = 0;                     // distance unknown until it is set or recognised
+  distSrc = 0;
+  sessRowN = 0; sessOffset = 0;
+  rangeWarn = false; rangeBadSince = rangeGoodSince = 0;
   sessionActive     = true;
   sessionStartMs    = now;
   sessionLastShotMs = now;
@@ -2305,14 +2449,333 @@ void registerShot(uint32_t now, float g, bool clipped) {
   endShots++;
   sessionLastShotMs = now;
   float ang = 0, angSd = 0;
-  const bool hasAng = angleActive() && aimingAngle(now, ang, angSd);
-  if (endShotN < MAX_SCORES_LINE) endShotAng[endShotN++] = hasAng ? ang : NO_ANGLE;
+  const bool hasAng = angleActive() && aimingMean(pitchBuf, now, ang, angSd);
+  float cant = 0, cantSd = 0;
+  const bool hasCant = (angleActive() || levelActive()) && aimingMean(cantBuf, now, cant, cantSd);
+  if (endShotN < MAX_SCORES_LINE) {
+    endShotAng[endShotN]  = hasAng ? ang : NO_ANGLE;
+    endShotCant[endShotN] = hasCant ? cant : NO_ANGLE;
+    endShotN++;
+  }
   say("Shot detected (end " + String(endCount + 1) + ": " + String(endShots) + ")" +
-      (g >= 0 ? ", " + shotGText() : String("")) + (hasAng ? ", angle " + String(ang, 2) + " deg" : String("")),
+      (g >= 0 ? ", " + shotGText() : String("")) + (hasAng ? ", angle " + String(ang, 2) + " deg" : String("")) +
+      (hasCant ? ", cant " + String(cant, 1) + " deg" : String("")),
       "{\"t\":\"shot\",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots) +
       ",\"total\":" + String(shotCount) +
       ",\"g\":" + (g >= 0 ? String(g, 1) : String("null")) + ",\"clip\":" + jbool(clipped) +
-      ",\"ang\":" + (hasAng ? String(ang, 2) : String("null")) + "}");
+      ",\"ang\":" + (hasAng ? String(ang, 2) : String("null")) +
+      ",\"cant\":" + (hasCant ? String(cant, 1) : String("null")) + "}");
+}
+
+// ============================================================================
+// Range model: learns which aiming angle belongs to which distance
+// ============================================================================
+// Solve A x = b (n <= 16) by Gauss elimination with pivoting; false if singular
+bool solveN(float A[][16], float* b, float* x, uint8_t n) {
+  for (uint8_t c = 0; c < n; c++) {
+    uint8_t piv = c;
+    for (uint8_t r = c + 1; r < n; r++) if (fabsf(A[r][c]) > fabsf(A[piv][c])) piv = r;
+    if (fabsf(A[piv][c]) < 1e-12f) return false;
+    for (uint8_t k = 0; k < n; k++) { float t = A[c][k]; A[c][k] = A[piv][k]; A[piv][k] = t; }
+    float t = b[c]; b[c] = b[piv]; b[piv] = t;
+    for (uint8_t r = 0; r < n; r++) {
+      if (r == c) continue;
+      const float f = A[r][c] / A[c][c];
+      for (uint8_t k = 0; k < n; k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  for (uint8_t c = 0; c < n; c++) x[c] = b[c] / A[c][c];
+  return true;
+}
+
+// Flat trajectory with drag (v = v0 * e^(-k x)): launch angle (rad) = s * A(d, k) + h / d
+float trajA(float d, float k) {
+  const float u = k * d;
+  if (u < 1e-3f) return d * 0.5f + k * d * d / 3.0f;              // series for small drag
+  return ((expf(2 * u) - 1) / (4 * k * k) - d / (2 * k)) / d;
+}
+const float RAD2DEG = 57.29578f;
+
+float setupAngle(uint8_t id, float distM, float offset) {
+  return offset + RAD2DEG * (sm[id].s * trajA(distM, sm[id].k) + hShared / distM);
+}
+
+// Expected aiming angle for a distance, active setup (includes this session's drift)
+float rangeAngleFor(float distM) {
+  return setupAngle(setups.active, distM, rngOffset + sessOffset);
+}
+
+// Distance for an aiming angle, active setup (the angle rises with the distance)
+float rangeDistFor(float th) {
+  float lo = 5, hi = 200;
+  for (uint8_t i = 0; i < 30; i++) {
+    const float mid = (lo + hi) / 2;
+    if (rangeAngleFor(mid) < th) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+// Distances in which recognition and warnings are trusted for the active setup
+bool rangeCovers(float distM) {
+  const SetupModel& m = sm[setups.active];
+  return distM >= (int)m.minD - RANGE_EXTRA_M && distM <= (int)m.maxD + RANGE_EXTRA_M;
+}
+
+// ---- fitting ----
+static uint8_t fitSetupOf[SETUP_MAX];     // setup id -> column of its s (0xFF = none)
+static float   fitK[SETUP_MAX];
+static float   fitX[16];
+static uint8_t fitG, fitJ;
+
+// Linear least squares for fixed drag values; returns the cost (lower = better)
+float rangeSolve() {
+  static float A[16][16]; float b[16];
+  const uint8_t n = fitG + 1 + fitJ;                          // offsets, h, s per setup
+  for (uint8_t i = 0; i < n; i++) { b[i] = 0; for (uint8_t k = 0; k < n; k++) A[i][k] = 0; }
+  const float wf = 1.0f / (ANGLE_SD * ANGLE_SD);
+  for (uint8_t r = 0; r < rangeRowN; r++) {
+    const RangeRow& row = rangeRows[r];
+    int8_t gi = -1;
+    for (uint8_t i = 0; i < fitG; i++) if (genIds[i] == row.gen) gi = i;
+    if (gi < 0 || fitSetupOf[row.setup] == 0xFF) continue;
+    float v[16] = {0};
+    v[gi] = 1;
+    v[fitG] = RAD2DEG / row.d;
+    v[fitG + 1 + fitSetupOf[row.setup]] = RAD2DEG * trajA(row.d, fitK[row.setup]);
+    const float w = row.w * wf;
+    for (uint8_t i = 0; i < n; i++) { b[i] += w * v[i] * row.th; for (uint8_t k = 0; k < n; k++) A[i][k] += w * v[i] * v[k]; }
+  }
+  for (uint8_t i = 0; i < n; i++) A[i][i] += 1e-6f;
+  A[fitG][fitG] += 1.0f / (H_PRIOR_SD * H_PRIOR_SD);          // h near 0 unless the data says otherwise
+  if (!solveN(A, b, fitX, n)) return 1e30f;
+  float cost = (fitX[fitG] / H_PRIOR_SD) * (fitX[fitG] / H_PRIOR_SD);
+  for (uint8_t j = 0; j < SETUP_MAX; j++)
+    if (fitSetupOf[j] != 0xFF) cost += ((fitK[j] - K_PRIOR) / K_PRIOR_SD) * ((fitK[j] - K_PRIOR) / K_PRIOR_SD);
+  for (uint8_t r = 0; r < rangeRowN; r++) {
+    const RangeRow& row = rangeRows[r];
+    int8_t gi = -1;
+    for (uint8_t i = 0; i < fitG; i++) if (genIds[i] == row.gen) gi = i;
+    if (gi < 0 || fitSetupOf[row.setup] == 0xFF) continue;
+    const float pred = fitX[gi] + RAD2DEG * (fitX[fitG + 1 + fitSetupOf[row.setup]] * trajA(row.d, fitK[row.setup]) + fitX[fitG] / row.d);
+    cost += row.w * wf * (row.th - pred) * (row.th - pred);
+  }
+  return cost;
+}
+
+// Learn from all ends with a distance set by hand
+static uint8_t rfD[SETUP_MAX][16], rfDE[SETUP_MAX][16], rfDN[SETUP_MAX];
+void rangeFit() {
+  rangeRowN = 0; rangeRowNext = 0;
+  logForEachKind(0, [](const LogRec& r) {
+    const EndRec& e = *(const EndRec*)&r;
+    if (e.angleC == ANGLE_NONE || e.angleN < RANGE_MIN_ARROWS || !e.distM) return true;
+    if (e.flags & END_DIST_AUTO) return true;            // recognised distances would only confirm themselves
+    RangeRow& row = rangeRows[rangeRowNext];
+    row.d = e.distM;  row.th = e.angleC / 100.0f;  row.w = e.angleN;
+    row.gen   = e.calGen == 0xFF ? 0 : e.calGen;          // before 5.0: the calibration of that time (0)
+    row.setup = (e.setup == 0xFF || e.setup >= SETUP_MAX) ? 0 : e.setup;
+    rangeRowNext = (rangeRowNext + 1) % RANGE_MAX_ROWS;
+    if (rangeRowN < RANGE_MAX_ROWS) rangeRowN++;
+    return true;
+  }, LOG_ENDS);
+
+  // Calibrations, newest first (the current one always gets a slot)
+  genN = 0;
+  genIds[genN++] = lvl.calGen;
+  for (int16_t k = rangeRowN - 1; k >= 0 && genN < RANGE_MAX_GENS; k--) {
+    const uint8_t g = rangeRows[(rangeRowNext + RANGE_MAX_ROWS - rangeRowN + k) % RANGE_MAX_ROWS].gen;
+    bool known = false;
+    for (uint8_t i = 0; i < genN; i++) if (genIds[i] == g) known = true;
+    if (!known) genIds[genN++] = g;
+  }
+  bool curGenData = false;
+
+  // Per setup: ends, distances (with 2+ ends), range
+  for (uint8_t j = 0; j < SETUP_MAX; j++) { sm[j].ends = 0; sm[j].minD = 255; sm[j].maxD = 0; rfDN[j] = 0; }
+  for (uint8_t r = 0; r < rangeRowN; r++) {
+    const RangeRow& row = rangeRows[r];
+    SetupModel& m = sm[row.setup];
+    m.ends++;
+    if (row.gen == lvl.calGen) curGenData = true;
+    const uint8_t dm = (uint8_t)row.d;
+    if (dm < m.minD) m.minD = dm;
+    if (dm > m.maxD) m.maxD = dm;
+    uint8_t di = 0;
+    while (di < rfDN[row.setup] && rfD[row.setup][di] != dm) di++;
+    if (di == rfDN[row.setup] && di < 16) { rfD[row.setup][di] = dm; rfDE[row.setup][di] = 0; rfDN[row.setup]++; }
+    if (di < 16) rfDE[row.setup][di]++;
+  }
+  uint8_t fullSetups = 0;
+  fitJ = 0;
+  for (uint8_t j = 0; j < SETUP_MAX; j++) {
+    uint8_t dists = 0;
+    for (uint8_t i = 0; i < rfDN[j]; i++) if (rfDE[j][i] >= 2) dists++;
+    sm[j].dists = dists;
+    fitSetupOf[j] = dists >= 1 ? fitJ++ : 0xFF;
+    fitK[j] = K_PRIOR;
+    if (dists >= 2) fullSetups++;
+  }
+  fitG = genN;
+
+  if (fitJ && fullSetups) {
+    // Drag only where 3+ distances show the curvature; coordinate search, 2 passes
+    float best = rangeSolve();
+    for (uint8_t pass = 0; pass < 2; pass++) {
+      for (uint8_t j = 0; j < SETUP_MAX; j++) {
+        if (fitSetupOf[j] == 0xFF || sm[j].dists < 3) continue;
+        float bestK = fitK[j];
+        for (uint8_t i = 0; i <= 20; i++) {
+          fitK[j] = i * 0.0002f;
+          const float c = rangeSolve();
+          if (c < best) { best = c; bestK = fitK[j]; }
+        }
+        fitK[j] = bestK;
+      }
+    }
+    rangeSolve();                                             // final values
+    for (uint8_t i = 0; i < genN; i++) genOffset[i] = fitX[i];
+    hShared = fitX[fitG];
+  }
+
+  for (uint8_t j = 0; j < SETUP_MAX; j++) {
+    SetupModel& m = sm[j];
+    m.state = 0;
+    if (fitSetupOf[j] == 0xFF || !fullSetups) continue;
+    m.s = fitX[fitG + 1 + fitSetupOf[j]];
+    m.k = fitK[j];
+    // One distance is enough once another setup fixed the zero point
+    const bool learned = m.s > 0 && (m.dists >= 2 || (m.dists >= 1 && fullSetups > (m.dists >= 2 ? 1 : 0)));
+    if (!learned) continue;
+    m.speed = sqrtf(9.81f / m.s);
+    if (m.speed < 20 || m.speed > 200) continue;             // nonsense: keep learning
+    m.state = curGenData ? 2 : 1;
+  }
+
+  const SetupModel& a = sm[setups.active];
+  rngState = a.state; rngSpeed = a.speed; rngEnds = a.ends; rngDists = a.dists;
+  rngOffset = genOffset[0];                                    // current calibration
+
+  // Zero drift of the running session: mean residual of its ends set by hand
+  sessResSum = sessResW = 0;
+  for (uint8_t k = 0; k < sessRowN; k++) {
+    if (sm[sessSetup[k]].state != 2) continue;
+    sessResSum += sessW[k] * (sessTh[k] - setupAngle(sessSetup[k], sessD[k], rngOffset));
+    sessResW   += sessW[k];
+  }
+  sessOffset = sessResW > 0 ? sessResSum / sessResW : 0;
+}
+
+const char* rangeStateText() {
+  return rngState == 2 ? "ready" : (rngState == 1 ? "anchor" : "learning");
+}
+const char* distSrcText() {
+  return distSrc == 1 ? "manual" : (distSrc == 2 ? "auto" : "none");
+}
+
+String setupName(uint8_t id) {
+  if (id >= SETUP_MAX || !setups.s[id].used) return "Setup " + String(id + 1);
+  return String(setups.s[id].name);
+}
+
+String rangeJson() {
+  const SetupModel& m = sm[setups.active];
+  String j = "{\"t\":\"range\",\"setup\":" + String(setups.active) + ",\"name\":" + jstr(setupName(setups.active)) +
+             ",\"state\":\"" + String(rangeStateText()) + "\",\"ends\":" + String(m.ends) + ",\"dists\":" + String(m.dists);
+  if (m.state) {
+    j += ",\"min\":" + String(m.minD) + ",\"max\":" + String(m.maxD) +
+         ",\"speed\":" + String(m.speed, 1) + ",\"kmh\":" + String((int)lroundf(m.speed * 3.6f)) +
+         ",\"drag\":" + String(m.k * 1000, 2);
+  }
+  j += ",\"dist\":" + String(endDistM) + ",\"distSrc\":\"" + distSrcText() + "\"" +
+       (m.state && endDistM && !rangeCovers(endDistM) ? String(",\"estimated\":true") : String("")) +
+       ",\"signal\":" + jbool(lvl.rangeSignal) +
+       ",\"warn\":\"" + (rangeWarn ? (rangeWarnDir < 0 ? "low" : "high") : "") + "\",\"ok\":" + jbool(rangeOk) + "}";
+  return j;
+}
+
+void printRange() {
+  if (appMode) { sendLine(rangeJson()); return; }
+  const SetupModel& m = sm[setups.active];
+  out("Setup: " + setupName(setups.active));
+  if (m.state == 0) {
+    out("Range: learning (" + String(m.ends) + " ends with a distance set by hand, " + String(m.dists) +
+        " distances with 2+ ends; needs 2 distances, or 1 once another setup is learned).");
+  } else {
+    out(String("Range: ") + (m.state == 2 ? "ready" : "needs one end at a known distance (new calibration)") +
+        ", learned " + String(m.minD) + "-" + String(m.maxD) + " m, used up to " + String(m.maxD + RANGE_EXTRA_M) + " m");
+    out("Arrow speed about " + String((int)lroundf(m.speed * 3.6f)) + " km/h (" + String(m.speed, 1) +
+        " m/s), drag " + String(m.k * 1000, 2) + "/km, height " + String(hShared, 2) + " m, drift " + String(sessOffset, 2) + " deg");
+    String t = "Angles:";
+    for (uint8_t d = 30; d <= 90; d += 10) t += " " + String(d) + "m " + String(rangeAngleFor(d), 2);
+    out(t);
+  }
+  out("Distance now: " + String(endDistM) + " m (" + distSrcText() + "), signal " + (lvl.rangeSignal ? "on" : "off"));
+}
+
+// Called every loop pass while aiming: double-blink if the steady aiming angle
+// belongs to another distance than the one set (more than half a 10 m step off)
+// Called every loop pass while aiming. Training ("auto"): warn when the aim fits
+// another 10 m step (more than 5 m off), after about 0.8 s of steady aiming.
+// Setting up a sight ("on"): quicker (about 0.45 s) and finer: warn beyond 3 m,
+// pulse below 2 m, calm in between. Finer than about +/-1.5 m the model can't tell.
+void rangeWarnUpdate(uint32_t now) {
+  const bool setupMode = lvl.angleMode == 2;
+  const uint8_t  nSamples = setupMode ? 10 : 16;
+  const uint32_t holdMs   = setupMode ? 150 : 300;
+  const float    warnM    = setupMode ? 3.0f : 5.0f;
+  const float    backM    = setupMode ? 2.5f : 4.0f;       // hysteresis
+  bool bad = false, good = false;
+  float dev = 0;
+  if (angleActive() && lvl.rangeSignal && rngState == 2 && endDistM > 0 && rangeCovers(endDistM) && pitchFill >= nSamples) {
+    const uint8_t last = (pitchHead + PITCH_SAMPLES - 1) % PITCH_SAMPLES;
+    if ((now - pitchMs[last]) < 200) {
+      float s = 0, q = 0;
+      for (uint8_t k = 0; k < nSamples; k++) {
+        const float v = pitchBuf[(pitchHead + PITCH_SAMPLES - 1 - k) % PITCH_SAMPLES];
+        s += v; q += v * v;
+      }
+      const float mean = s / nSamples, var = q / nSamples - mean * mean;
+      if (var < 0.04f) {                                       // steady: spread below 0.2 deg
+        dev  = rangeDistFor(mean) - endDistM;                  // < 0: aiming for a shorter distance
+        bad  = fabsf(dev) > (rangeWarn ? backM : warnM);
+        good = setupMode && fabsf(dev) < 2.0f;
+      }
+    }
+  }
+  if (bad) {
+    rangeGoodSince = 0;
+    if (!rangeBadSince) rangeBadSince = now;
+    if (!rangeWarn && (now - rangeBadSince) >= holdMs) rangeWarn = true;
+    if (rangeWarn) rangeWarnDir = dev < 0 ? -1 : 1;
+  } else {
+    rangeBadSince = 0;
+    if (rangeWarn) {
+      if (!rangeGoodSince) rangeGoodSince = now;
+      if ((now - rangeGoodSince) >= holdMs) rangeWarn = false;
+    }
+  }
+  // "Right" needs the same short hold, so a bow swinging through doesn't pulse
+  if (good && !rangeWarn) {
+    if (!rangeOkSince) rangeOkSince = now;
+    rangeOk = (now - rangeOkSince) >= holdMs;
+  } else {
+    rangeOkSince = 0;
+    rangeOk = false;
+  }
+}
+
+// "dist <m>": distance of the running session, set by hand (0 = unknown).
+// Does not touch an open score question.
+void handleDist(String args) {
+  args.trim();
+  if (args == "") { say("Distance: " + String(endDistM) + " m (" + distSrcText() + ")", rangeJson()); return; }
+  const long d = args.toInt();
+  if (d < 0 || d > 250) { err("Distance 0-250 m."); return; }
+  endDistM = (uint8_t)d;
+  distSrc = d ? 1 : 0;
+  rangeWarn = false; rangeBadSince = rangeGoodSince = 0;
+  say("Distance " + String(d) + " m.", "{\"t\":\"ack\",\"cmd\":\"dist\",\"dist\":" + String(d) + "}");
 }
 
 // Write the closed end to the log flash (vals: 0-10, 11 = X; NULL for invalid ends)
@@ -2323,7 +2786,7 @@ bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t
   e.magic = END_MAGIC;
   e.epoch = shotState.epoch;  e.id = sessionId;  e.n = endCount;
   e.arrows = n;  e.flags = (valid ? END_VALID : 0) | (skipped ? END_SKIPPED : 0);
-  e.sum = sum;  e.x = xn;  e.distM = endDistM;
+  e.sum = sum;  e.x = xn;
   // Angles of the shots that belong to this end: the first `take` ones
   if (take > endShotN) take = endShotN;
   float as = 0, aq = 0; uint8_t an = 0;
@@ -2331,7 +2794,35 @@ bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t
     if (endShotAng[k] >= NO_ANGLE) continue;
     as += endShotAng[k]; aq += endShotAng[k] * endShotAng[k]; an++;
   }
-  for (uint8_t k = take; k < endShotN; k++) endShotAng[k - take] = endShotAng[k];   // keep the rest
+  // Cant of the same shots
+  float cs = 0, cmax = 0; uint8_t cn = 0, canted = 0;
+  for (uint8_t k = 0; k < take; k++) {
+    const float c = endShotCant[k];
+    if (c >= NO_ANGLE) continue;
+    cs += c; cn++;
+    if (fabsf(c) > cmax) cmax = fabsf(c);
+    if (fabsf(c) > cfg.levelTol) canted++;
+  }
+  e.cantN = cn;  e.cantedN = canted;
+  // No distance yet: recognise it from the aiming angle (then it holds for the session)
+  if (endDistM == 0 && an >= RANGE_MIN_ARROWS && rngState == 2) {
+    const long d = lroundf(rangeDistFor(as / an) / 10.0f) * 10;   // mean aiming angle of this end
+    if (d >= 10 && d <= 150 && rangeCovers(d)) {                 // only where the model can be trusted
+      endDistM = (uint8_t)d;
+      distSrc = 2;
+    }
+  }
+  e.distM  = endDistM;
+  e.flags |= distSrc == 1 ? END_DIST_MANUAL : (distSrc == 2 ? END_DIST_AUTO : 0);
+  e.calGen = lvl.calGen;
+  e.setup  = setups.active;
+  e.cantC = cn ? (int16_t)lroundf(cs / cn * 100) : 0;
+  e.cantMaxC = (uint16_t)lroundf(cmax * 100);
+  lastCant = cn ? cs / cn : 0; lastCantMax = cmax; lastCantN = cn; lastCanted = canted;
+  for (uint8_t k = take; k < endShotN; k++) {                                        // keep the rest
+    endShotAng[k - take]  = endShotAng[k];
+    endShotCant[k - take] = endShotCant[k];
+  }
   endShotN -= take;
   angNOut = an;
   if (an) {
@@ -2350,11 +2841,27 @@ bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t
   memset(e.reserved, 0xFF, sizeof(e.reserved));
   LogRec raw;
   memcpy(&raw, &e, sizeof(raw));
-  return logAppend(raw, false);
+  const bool ok = logAppend(raw, false);
+  // An end at a distance set by hand teaches the range model
+  if (ok && distSrc == 1 && an >= RANGE_MIN_ARROWS && endDistM) {
+    if (sessRowN < MAX_SCORES_LINE) {
+      sessD[sessRowN] = endDistM; sessTh[sessRowN] = as / an; sessW[sessRowN] = an; sessSetup[sessRowN] = setups.active; sessRowN++;
+    }
+    rangeFit();
+    emit(rangeJson());
+  }
+  return ok;
+}
+
+String endCantJson() {
+  return ",\"cant\":" + (lastCantN ? String(lastCant, 1) : String("null")) +
+         ",\"cantMax\":" + (lastCantN ? String(lastCantMax, 1) : String("null")) +
+         ",\"canted\":" + String(lastCanted) + ",\"cantN\":" + String(lastCantN);
 }
 
 String endAngleJson(float ang, float sd, uint8_t angN) {
-  return ",\"dist\":" + (endDistM ? String(endDistM) : String("null")) +
+  return ",\"dist\":" + (endDistM ? String(endDistM) : String("null")) + ",\"distSrc\":\"" + distSrcText() + "\"" +
+         ",\"setup\":" + String(setups.active) +
          ",\"ang\":" + (angN ? String(ang, 2) : String("null")) +
          ",\"angSd\":" + (angN ? String(sd, 2) : String("null")) + ",\"angN\":" + String(angN);
 }
@@ -2377,7 +2884,7 @@ void closeEndValid(const uint8_t* vals, uint8_t n, uint8_t xn, uint8_t keepShots
       " scored, avg " + fmtAvg(scoreSum, scoreCount) + ", " + String(xCount) + " X",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":true,\"arrows\":" + String(n) +
       ",\"sum\":" + String(sum) + ",\"x\":" + String(xn) + ",\"avg\":" + fmtAvg(sum, n) +
-      endAngleJson(ang, sd, angN) + ",\"stored\":" + jbool(stored) + "}");
+      endAngleJson(ang, sd, angN) + endCantJson() + ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
 }
 
@@ -2392,7 +2899,7 @@ void closeEndInvalid(uint16_t arrows, const String& reason) {
   say("End " + String(endCount) + " invalid (" + reason + "): " + String(arrows) +
       " arrows stored with 0 points, not included in the overall average.",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":false,\"arrows\":" + String(arrows) +
-      ",\"reason\":" + jstr(reason) + endAngleJson(ang, sd, angN) + ",\"stored\":" + jbool(stored) + "}");
+      ",\"reason\":" + jstr(reason) + endAngleJson(ang, sd, angN) + endCantJson() + ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
 }
 
@@ -2441,6 +2948,12 @@ void finishSession(bool manual) {
 
   sessionActive = false;
   tiltReset();   // tilt indicator ends with the session
+  // The distance belongs to the session: outside one (aiming angle "on", setting up
+  // a sight) no old value may be used, it has to be set anew with "dist"
+  endDistM = 0; distSrc = 0;
+  rangeWarn = false; rangeBadSince = rangeGoodSince = 0;
+  rangeOk = false; rangeOkSince = 0;
+  emit(rangeJson());
 
   if (endCount == 0) {
     say("Empty session discarded (nothing stored).",
@@ -2509,15 +3022,22 @@ String scoresText(const EndRec& e) {
   return t;
 }
 
+// Only the fields that carry information, so long ends still fit one Bluetooth packet
 String endJson(const EndRec& e) {
-  const bool a = e.angleC != ANGLE_NONE;
-  return "{\"t\":\"endrec\",\"seq\":" + String(e.seq) + ",\"epoch\":" + String(e.epoch) + ",\"id\":" + String(e.id) +
-         ",\"n\":" + String(e.n) + ",\"valid\":" + jbool(e.flags & END_VALID) + ",\"skipped\":" + jbool(e.flags & END_SKIPPED) +
-         ",\"arrows\":" + String(e.arrows) + ",\"sum\":" + String(e.sum) + ",\"x\":" + String(e.x) +
-         ",\"dist\":" + (e.distM ? String(e.distM) : String("null")) +
-         ",\"ang\":" + (a ? String(e.angleC / 100.0f, 2) : String("null")) +
-         ",\"angSd\":" + (a ? String(e.angleSdC / 100.0f, 2) : String("null")) + ",\"angN\":" + String(e.angleN) +
-         ",\"scores\":\"" + scoresText(e) + "\"}";
+  String j = "{\"t\":\"endrec\",\"seq\":" + String(e.seq) + ",\"epoch\":" + String(e.epoch) + ",\"id\":" + String(e.id) +
+             ",\"n\":" + String(e.n) + ",\"valid\":" + jbool(e.flags & END_VALID) +
+             ",\"arrows\":" + String(e.arrows);
+  if (e.flags & END_SKIPPED) j += ",\"skipped\":true";
+  if (e.flags & END_VALID)   j += ",\"sum\":" + String(e.sum) + ",\"x\":" + String(e.x);
+  if (e.distM)               j += ",\"dist\":" + String(e.distM) + ((e.flags & END_DIST_AUTO) ? ",\"auto\":true" : "");
+  if (e.setup != 0xFF && e.setup != 0) j += ",\"setup\":" + String(e.setup);
+  if (e.angleC != ANGLE_NONE)
+    j += ",\"ang\":" + String(e.angleC / 100.0f, 2) + ",\"angSd\":" + String(e.angleSdC / 100.0f, 2) + ",\"angN\":" + String(e.angleN);
+  if (e.cantN != 0xFF && e.cantN)
+    j += ",\"cant\":" + String(e.cantC / 100.0f, 1) + ",\"cantMax\":" + String(e.cantMaxC / 100.0f, 1) +
+         ",\"canted\":" + String(e.cantedN) + ",\"cantN\":" + String(e.cantN);
+  if (e.flags & END_VALID)   j += ",\"scores\":\"" + scoresText(e) + "\"";
+  return j + "}";
 }
 
 String endLine(const EndRec& e) {
@@ -2525,6 +3045,8 @@ String endLine(const EndRec& e) {
   l += (e.flags & END_VALID) ? String(e.sum) + " (" + scoresText(e) + ")" : String("invalid, ") + String(e.arrows) + " arrows";
   if (e.distM) l += ", " + String(e.distM) + " m";
   if (e.angleC != ANGLE_NONE) l += ", angle " + String(e.angleC / 100.0f, 2) + " +/- " + String(e.angleSdC / 100.0f, 2) + " deg";
+  if (e.cantN != 0xFF && e.cantN) l += ", cant " + String(e.cantC / 100.0f, 1) + " deg (max " + String(e.cantMaxC / 100.0f, 1) +
+                                        ", " + String(e.cantedN) + " canted)";
   return l;
 }
 
@@ -2635,6 +3157,7 @@ void handleScore(String args) {
     const long d = args.substring(at + 1, e < 0 ? args.length() : e).toInt();
     if (d < 0 || d > 250) { err("Invalid distance (0-250 m)."); return; }
     endDistM = (uint8_t)d;
+    distSrc = d ? 1 : 0;
     args = args.substring(0, at) + (e < 0 ? String("") : args.substring(e));
     args.trim();
   }
@@ -2733,6 +3256,7 @@ String statusJson() {
              ",\"lowbat\":" + jbool(lowBatLock) +
              ",\"tilt\":" + ((levelActive() && tiltFilterOk) ? String(tiltDeg, 1) : String("null")) +
              ",\"session\":" + jbool(sessionActive) + ",\"awake\":\"" + awakeReason + "\"" +
+             ",\"rwarn\":" + jbool(rangeWarn) +
              ",\"lastShotG\":" + (lastShotG >= 0 ? String(lastShotG, 1) : String("null")) +
              ",\"lastShotClip\":" + jbool(lastShotClip);
   if (sessionActive) j += ",\"end\":" + String(endCount + 1) + ",\"endShots\":" + String(endShots);
@@ -2791,8 +3315,12 @@ void printHelp() {
   out("log info          log flash, number of sessions, clock");
   out("log put ...       write a session from a backup (used by the app)");
   out("log test          check the log flash step by step");
-  out("log ends <e> <id> ends of one session (scores, distance, angle)");
+  out("log ends <e> <id> ends of one session (scores, distance, angle, cant)");
   out("angle off|auto|on measure the aiming angle at every shot");
+  out("dist <m>          distance of the session (0 = unknown); keeps an open question");
+  out("range             learned distances, arrow speed; range signal on|off");
+  out("setup [use|new|name|del] arrow/bow setups (each learns its own speed)");
+  out("level signal on|off  blink when canted (measuring continues)");
   out("log del <e> <id>  delete one session on the sight");
   out("log clear         delete all sessions on the sight (asks first)");
   out("level             tilt indicator status");
@@ -2903,23 +3431,27 @@ bool endHasKey(uint32_t epoch, uint32_t id, uint16_t n) {
   return feHit;
 }
 
-// "log putend <epoch> <id> <n> <arrows> <flags> <sum> <x> <dist> <angleC> <angleSdC> <angleN> <scores>"
+// "log putend <epoch> <id> <n> <arrows> <flags> <sum> <x> <dist> <angleC> <angleSdC> <angleN>
+//              <cantC> <cantMaxC> <cantN> <cantedN> <scores>"
 // scores: one hex digit per arrow (0-9, A = 10, B = X), "-" for none
 void logPutEnd(String args) {
-  uint32_t v[11]; uint8_t n = 0;
-  String scores = "-";
+  // 15 numbers [+ setup] + scores (16 or 17 tokens)
+  String tok[17]; uint8_t n = 0;
   args.trim();
-  while (args.length() && n < 12) {
+  while (args.length() && n < 17) {
     const int sp = args.indexOf(' ');
-    const String tok = sp < 0 ? args : args.substring(0, sp);
-    if (n < 11) v[n] = (uint32_t)strtol(tok.c_str(), nullptr, 10); else scores = tok;
-    n++;
+    tok[n++] = sp < 0 ? args : args.substring(0, sp);
     args = sp < 0 ? String("") : args.substring(sp + 1);
     args.trim();
   }
+  uint32_t v[16] = {0};
+  for (uint8_t i = 0; i + 1 < n && i < 16; i++) v[i] = (uint32_t)strtol(tok[i].c_str(), nullptr, 10);
+  const String scores = n ? tok[n - 1] : String("-");
+  const uint8_t putSetup = n == 17 ? (uint8_t)v[15] : 0;
+  if (n == 17) n = 16;
   const String key = "{\"t\":\"ack\",\"cmd\":\"putend\",\"epoch\":" + String(n > 0 ? v[0] : 0) +
                      ",\"id\":" + String(n > 1 ? v[1] : 0) + ",\"n\":" + String(n > 2 ? v[2] : 0) + ",\"result\":";
-  if (n != 12 || !v[0] || !v[1] || !v[2]) { say("Format: log putend <epoch> <id> <n> ... <scores>", key + "\"error\"}"); return; }
+  if (n != 16 || !v[0] || !v[1] || !v[2]) { say("Format: log putend <epoch> <id> <n> ... <scores>", key + "\"error\"}"); return; }
   if (!qfOk) { say("Log flash not available.", key + "\"error\"}"); return; }
   if ((int32_t)(awakeUntil - (millis() + AWAKE_PUT_MS)) < 0) awakeUntil = millis() + AWAKE_PUT_MS;
   if (endHasKey(v[0], v[1], v[2])) { say("End already stored.", key + "\"exists\"}"); return; }
@@ -2928,7 +3460,11 @@ void logPutEnd(String args) {
   e.magic = END_MAGIC;
   e.epoch = v[0]; e.id = v[1]; e.n = v[2]; e.arrows = v[3]; e.flags = v[4] & (END_VALID | END_SKIPPED);
   e.sum = v[5]; e.x = v[6]; e.distM = v[7];
+  e.flags = v[4] & (END_VALID | END_SKIPPED | END_DIST_MANUAL | END_DIST_AUTO);
   e.angleC = (int16_t)(int32_t)v[8]; e.angleSdC = v[9]; e.angleN = v[10];
+  e.cantC = (int16_t)(int32_t)v[11]; e.cantMaxC = v[12]; e.cantN = v[13]; e.cantedN = v[14];
+  e.setup = putSetup < SETUP_MAX ? putSetup : 0;
+  e.calGen = 0xFF;                               // measured with an unknown calibration
   memset(e.scores, 0xFF, sizeof(e.scores));
   for (uint8_t k = 0; scores != "-" && k < scores.length() && k < 40; k++) {
     const char c = scores[k];
@@ -2941,6 +3477,160 @@ void logPutEnd(String args) {
   const bool ok = logAppend(raw, false);
   say(ok ? String("End added.") : String("ERROR: could not write to the log flash!"),
       key + (ok ? "\"added\"}" : "\"error\"}"));
+}
+
+// ============================================================================
+// Setups (arrows / bow settings), each with its own learned speed and drag
+// ============================================================================
+bool setupsSave() {
+  InternalFS.remove(SETUP_FILE);
+  File f(InternalFS);
+  if (!f.open(SETUP_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)&setups, sizeof(setups));
+  f.close();
+  return true;
+}
+
+void setupsLoad() {
+  memset(&setups, 0, sizeof(setups));
+  File f(InternalFS);
+  if (f.open(SETUP_FILE, FILE_O_READ)) {
+    SetupTable tmp;
+    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == SETUP_MAGIC) setups = tmp;
+    f.close();
+  }
+  if (setups.magic != SETUP_MAGIC || setups.active >= SETUP_MAX || setups.s[setups.active].used != 1) {
+    memset(&setups, 0, sizeof(setups));        // the first setup is always there
+    setups.magic = SETUP_MAGIC;
+    setups.active = 0;
+    setups.s[0].used = 1;
+    strncpy(setups.s[0].name, "Standard", sizeof(setups.s[0].name) - 1);
+    setupsSave();
+  }
+}
+
+// Printable name, at most 18 bytes, never cut inside a UTF-8 character
+void setName(uint8_t id, String name) {
+  name.trim();
+  String clean;
+  for (unsigned int i = 0; i < name.length(); i++) {
+    const char c = name[i];
+    if ((uint8_t)c < 0x20 || c == '"' || c == '\\') continue;
+    clean += c;
+  }
+  uint8_t len = clean.length() > 18 ? 18 : clean.length();
+  while (len > 0 && len < clean.length() && ((uint8_t)clean[len] & 0xC0) == 0x80) len--;   // continuation byte
+  memset(setups.s[id].name, 0, sizeof(setups.s[id].name));
+  memcpy(setups.s[id].name, clean.c_str(), len);
+  if (!len) strncpy(setups.s[id].name, ("Setup " + String(id + 1)).c_str(), sizeof(setups.s[id].name) - 1);
+}
+
+String setupItemJson(uint8_t id) {
+  const SetupModel& m = sm[id];
+  String j = "{\"t\":\"setupItem\",\"id\":" + String(id) + ",\"name\":" + jstr(setupName(id)) +
+             ",\"deleted\":" + jbool(setups.s[id].used == 2) + ",\"state\":\"" +
+             String(m.state == 2 ? "ready" : (m.state == 1 ? "anchor" : "learning")) + "\",\"ends\":" + String(m.ends);
+  if (m.state) j += ",\"kmh\":" + String((int)lroundf(m.speed * 3.6f)) + ",\"min\":" + String(m.minD) + ",\"max\":" + String(m.maxD);
+  return j + "}";
+}
+
+void printSetups() {
+  if (appMode) {
+    sendLine("{\"t\":\"setupsStart\",\"active\":" + String(setups.active) + "}");
+    for (uint8_t i = 0; i < SETUP_MAX; i++) if (setups.s[i].used) sendLine(setupItemJson(i));
+    sendLine("{\"t\":\"setupsEnd\"}");
+    return;
+  }
+  out("--- Setups ---");
+  for (uint8_t i = 0; i < SETUP_MAX; i++) {
+    if (!setups.s[i].used) continue;
+    const SetupModel& m = sm[i];
+    out(String(i == setups.active ? "* " : "  ") + String(i) + ": " + setupName(i) +
+        (setups.s[i].used == 2 ? " (deleted)" : "") +
+        (m.state ? ", about " + String((int)lroundf(m.speed * 3.6f)) + " km/h" : String(", learning")) +
+        ", " + String(m.ends) + " ends");
+  }
+}
+
+// setup | setup use <id> | setup new <name> | setup name <id> <name> | setup del <id>
+void handleSetup(const String& arg, const String& rawArg) {
+  const String ack = "{\"t\":\"ack\",\"cmd\":\"setup\",\"ok\":";
+  if (arg == "") { printSetups(); return; }
+  if (arg.startsWith("use ")) {
+    const int id = arg.substring(4).toInt();
+    if (id < 0 || id >= SETUP_MAX || setups.s[id].used != 1) { err("Unknown setup."); return; }
+    setups.active = id;
+    setupsSave();
+    sessOffset = 0;
+    rangeFit();
+    rangeWarn = false;
+    say("Setup: " + setupName(id), ack + "true}");
+    printSetups(); emit(rangeJson());
+    return;
+  }
+  if (arg.startsWith("new ")) {
+    int id = -1;
+    for (uint8_t i = 0; i < SETUP_MAX && id < 0; i++) if (!setups.s[i].used) id = i;
+    if (id < 0) { err("All 8 setups are used."); return; }
+    setups.s[id].used = 1;
+    setName(id, rawArg.substring(4));
+    setupsSave();
+    say("New setup " + String(id) + ": " + setupName(id), ack + "true,\"id\":" + String(id) + "}");
+    printSetups();
+    return;
+  }
+  if (arg.startsWith("name ")) {
+    String rest = arg.substring(5); rest.trim();
+    const int sp = rest.indexOf(' ');
+    const int id = (sp < 0 ? rest : rest.substring(0, sp)).toInt();
+    if (sp < 0 || id < 0 || id >= SETUP_MAX || setups.s[id].used != 1) { err("Format: setup name <id> <name>"); return; }
+    String rawRest = rawArg.substring(5); rawRest.trim();
+    setName(id, rawRest.substring(rawRest.indexOf(' ') + 1));
+    setupsSave();
+    say("Setup " + String(id) + ": " + setupName(id), ack + "true}");
+    printSetups(); emit(rangeJson());
+    return;
+  }
+  if (arg.startsWith("del ")) {
+    const int id = arg.substring(4).toInt();
+    if (id < 0 || id >= SETUP_MAX || setups.s[id].used != 1) { err("Unknown setup."); return; }
+    if (id == setups.active) { err("Choose another setup first."); return; }
+    setups.s[id].used = 2;                       // name kept for the stored ends
+    setupsSave();
+    say("Setup " + setupName(id) + " deleted. Its ends stay in the sessions.", ack + "true}");
+    printSetups();
+    return;
+  }
+  err("Possible: setup, setup use <id>, setup new <name>, setup name <id> <name>, setup del <id>");
+}
+
+// A session cut off by a restart (empty battery): its ends are on the chip, but
+// the session record is missing. Build it from the ends, so nothing is lost.
+static uint16_t orEnds, orInvEnds, orInvArrows, orScored, orX, orShots;
+static uint32_t orSum;
+static uint8_t  orSetupFlags;
+void finishOrphanSession() {
+  if (!qfOk || !shotState.epoch || !shotState.lastId) return;
+  if (logHasKey(shotState.epoch, shotState.lastId)) return;       // it was finished normally
+  orEnds = orInvEnds = orInvArrows = orScored = orX = orShots = 0; orSum = 0;
+  logForEachKind(0, [](const LogRec& r) {
+    const EndRec& e = *(const EndRec*)&r;
+    if (e.epoch != shotState.epoch || e.id != shotState.lastId) return true;
+    orEnds++;
+    orShots += e.arrows;
+    if (e.flags & END_VALID) { orScored += e.arrows; orSum += e.sum; orX += e.x; }
+    else { orInvEnds++; orInvArrows += e.arrows; }
+    return true;
+  }, LOG_ENDS);
+  if (!orEnds) return;                                            // started, but nothing scored
+  LogRec s;
+  memset(&s, 0, sizeof(s));
+  s.epoch = shotState.epoch;  s.id = shotState.lastId;  s.start = 0;
+  s.ends = orEnds;  s.shots = orShots;  s.scores = orScored;  s.xCount = orX;
+  s.avgX100 = orScored ? (uint16_t)((orSum * 100 + orScored / 2) / orScored) : 0;
+  s.invalidEnds = orInvEnds;  s.invalidArrows = orInvArrows;  s.minutes = 0;
+  s.flags = orInvEnds ? SLOT_MISMATCH : 0;                        // ended by the restart, not by hand
+  logAppend(s, false);
 }
 
 // "awake <seconds>": stay reachable (Bluetooth, readings) without movement, e.g.
@@ -2977,12 +3667,18 @@ void appOn() {
   sendLine(sessionJson());
   sendLine(levelJson());
   sendLine(logInfoJson());
+  sendLine(rangeJson());
+  printSetups();
 }
 
 void handleCommand(String line) {
   line.trim();
+  const String raw = line;                        // original case (setup names)
   line.toLowerCase();
   if (line.length() == 0) return;
+
+  // Setting the distance must not discard an open score question
+  if (line == "dist" || line.startsWith("dist ")) { handleDist(line.substring(4)); return; }
 
   // Pending confirmation for a mismatching end
   if (pendingScore) {
@@ -3027,9 +3723,9 @@ void handleCommand(String line) {
   else if (line == "app off")   { appMode = false; out("App mode off, human-readable output."); }
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
   else if (line == "live off")  { liveMode = false; say("Live output off.", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":false}"); }
-  else if (line == "mode auto") { ledMode = MODE_AUTO; say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
-  else if (line == "mode on")   { ledMode = MODE_ON;   say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
-  else if (line == "mode off")  { ledMode = MODE_OFF;  say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
+  else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
+  else if (line == "mode on")   { ledMode = MODE_ON;   lvl.ledMode = ledMode; levelSave(); say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
+  else if (line == "mode off")  { ledMode = MODE_OFF;  lvl.ledMode = ledMode; levelSave(); say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
   else if (line == "shots")               handleShots("");
   else if (line.startsWith("shots "))     { String a = line.substring(6); a.trim(); handleShots(a); }
   else if (line == "score")               handleScore("");
@@ -3048,6 +3744,15 @@ void handleCommand(String line) {
   else if (line.startsWith("log put "))   logPut(line.substring(8));
   else if (line.startsWith("log putend ")) logPutEnd(line.substring(11));
   else if (line.startsWith("log ends "))  printEnds(line.substring(9));
+  else if (line == "range")               printRange();
+  else if (line == "setup")               handleSetup("", "");
+  else if (line.startsWith("setup "))     handleSetup(line.substring(6), raw.substring(6));
+  else if (line == "range signal on" || line == "range signal off") {
+    lvl.rangeSignal = line == "range signal on";
+    if (!lvl.rangeSignal) rangeWarn = false;
+    if (!levelSave()) { err("ERROR while saving!"); return; }
+    say(String("Range signal ") + (lvl.rangeSignal ? "on." : "off."), rangeJson());
+  }
   else if (line == "angle")               handleAngle("");
   else if (line.startsWith("angle "))     { String a = line.substring(6); a.trim(); handleAngle(a); }
   else if (line == "level")               handleLevel("");
@@ -3237,6 +3942,11 @@ void setup() {
   lastCharge = readCharge();
   bhLoad();
   bhFit();
+  setupsLoad();
+  finishOrphanSession();
+  rangeFit();
+  // LED switch exactly as it was set
+  ledMode = lvl.ledMode <= MODE_OFF ? (LedMode)lvl.ledMode : MODE_AUTO;
   bhTickMs = millis();
   bhPrevUsb = usbPresent();
   unloadedMv = (uint16_t)(readVbat() * 1000); unloadedMs = millis();
@@ -3254,6 +3964,10 @@ void loop() {
   const bool connected = Bluefruit.connected();
 
   if (!connected) { liveMode = false; welcomed = false; appMode = false; }
+  // A command cut off by a lost connection must not be glued to the first one
+  // of the next connection: start every connection with an empty line buffer
+  static bool wasConnected = false;
+  if (connected != wasConnected) { rxBuf = ""; wasConnected = connected; }
 
   // Only movement keeps the board active (a connection does not)
   if (imuMotionSinceLastCheck()) lastMotionMs = now;
@@ -3376,7 +4090,8 @@ void loop() {
   const bool lvlOn = levelActive();
   const bool angOn = angleActive();
   if (lvlOn || angOn) updateOrientation(lvlOn, angOn);
-  if (!angOn) pitchFill = 0;                  // no stale angles into the next session
+  if (!angOn && !lvlOn) pitchFill = 0;        // no stale readings into the next session
+  rangeWarnUpdate(millis());
   updateLed(millis());
 
   // Periodic status report, only when connected

@@ -639,7 +639,7 @@ const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.5";
+const APP_VERSION     = "5.7";
 
 // ---------------------------------------------------------------------------
 // State
@@ -2720,28 +2720,37 @@ function setLevel(cmd, patch) {
 }
 
 // Switches of the "Cant and aiming range" group
+// Main switches (top card): cant and aiming angle, Off / Auto / On
+function cantModeRow(lv) {
+  const lvMode = lv.mode || "off";
+  return segRow("Cant",
+    (lvMode === "auto" ? "Measured during a session."
+      : lvMode === "on" ? "Measured whenever the bow is in use. Switches the aiming angle's On off."
+      : "Not measured.") + " Each end stores how canted you were." + (lv.cal ? "" : " Needs the calibration."),
+    lvMode, ["off", "auto", "on"], (m) => setLevel("level " + m, { mode: m }));
+}
+function angleModeRow(lv) {
+  const angMode = lv.angle || "auto";
+  return segRow("Aiming angle",
+    (angMode === "auto" ? "Measured at every shot during a session."
+      : angMode === "on" ? "Measured at every shot, also outside a session (for setting up a sight). Switches the cant's On off."
+      : "Not measured.") + (lv.cal ? "" : " Needs the calibration."),
+    angMode, ["off", "auto", "on"], (m) => setLevel("angle " + m, { angle: m }));
+}
+
+// Options of the "Cant and aiming range" group (the main switches are in the top card)
 function cantRows(lv) {
   const cw = document.createDocumentFragment();
   const lvMode = lv.mode || "off";
-  cw.appendChild(segRow("Cant",
-    (lvMode === "auto" ? "Measured during a session."
-      : lvMode === "on" ? "Measured whenever the bow is in use. Switches the aiming angle's On off."
-      : "Not measured.") + " Each end stores how canted you were.",
-    lvMode, ["off", "auto", "on"], (m) => setLevel("level " + m, { mode: m })));
   if (lvMode !== "off") {
     cw.appendChild(switchRow("Blink when canted", "Off: the cant is still measured and stored, the LED just stays calm.",
       lv.cantSignal !== false, (on) => setLevel(on ? "level signal on" : "level signal off", { cantSignal: on })));
     const st = lv.style || "normal";
-    cw.appendChild(segRow("Cant blinking",
+    cw.appendChild(segRow("Cant blinking mode",
       st === "inverted" ? "Faster the closer you get to level." : "Faster the more the bow is canted.",
       st, ["normal", "inverted"], (m) => setLevel("level style " + m, { style: m })));
   }
   const angMode = lv.angle || "auto";
-  cw.appendChild(segRow("Aiming angle",
-    (angMode === "auto" ? "Measured at every shot during a session."
-      : angMode === "on" ? "Measured at every shot, also outside a session (for setting up a sight). Switches the cant's On off."
-      : "Not measured.") + (lv.cal ? "" : " Needs the cant calibration."),
-    angMode, ["off", "auto", "on"], (m) => setLevel("angle " + m, { angle: m })));
   if (angMode !== "off") {
     const rg = state.range || {};
     const ready = rg.state === "ready";
@@ -2753,8 +2762,6 @@ function cantRows(lv) {
     row.querySelector("input").disabled = !ready;
     if (!ready) row.style.opacity = ".55";
     cw.appendChild(row);
-    // "On" is for setting up a sight: choose the distance you aim at right here
-    if (angMode === "on") cw.appendChild(checkDistRow(rg, ready));
   }
   return cw;
 }
@@ -2825,6 +2832,13 @@ function renderSettings() {
     if (!on && ses.active) { cb.checked = true; toast("End the running session first.", true); return; }
     send(on ? "shots on" : "shots off");
   }));
+  sw.appendChild(cantModeRow(lv));
+  sw.appendChild(angleModeRow(lv));
+  // "On" is for setting up a sight: the distance to check goes right under it
+  if ((lv.angle || "auto") === "on") {
+    const rg = state.range || {};
+    sw.appendChild(checkDistRow(rg, rg.state === "ready"));
+  }
   const ledMode = (state.status && state.status.mode) || "auto";
   sw.appendChild(segRow("LED",
     (ledMode === "auto" ? "Auto: switched by the light sensor."
@@ -2849,17 +2863,29 @@ function renderSettings() {
     if (g.light) {
       const n = document.createElement("p"); n.className = "gnote"; n.id = "liveLight"; box.appendChild(n);
     }
-    if (g.cal) { box.appendChild(cantRows(lv)); box.appendChild(calCard()); }
+    let target = box;
+    if (g.cal) {
+      box.appendChild(calCard());                   // nothing below works without it
+      const rest = document.createElement("div");
+      if (!lv.cal) {
+        rest.inert = true;                          // greyed and locked until calibrated
+        rest.style.opacity = ".45";
+        rest.setAttribute("aria-disabled", "true");
+      }
+      rest.appendChild(cantRows(lv));
+      box.appendChild(rest);
+      target = rest;
+    }
     items.forEach((it) => {
       if (it.k === "bright_mode") {
-        box.appendChild(segRow("Brightness mode",
+        target.appendChild(segRow("Brightness mode",
           autoMode ? "Auto: fades in from Bright above and reaches full brightness at Dark below."
                    : "Fixed: one brightness, switched at Dark below / Bright above.",
           autoMode ? "auto" : "fixed", ["fixed", "auto"], (m) => sendSet("bright_mode", m === "auto" ? 1 : 0)));
         return;
       }
       if ((it.k === "bright_min" || it.k === "fade") && !autoMode) return;
-      box.appendChild(settingRow(it));
+      target.appendChild(settingRow(it));
     });
     host.appendChild(box);
   };
@@ -2887,7 +2913,7 @@ function calCard() {
     box.className = "switchrow";
     box.innerHTML = `<div><div class="lbl">Calibration</div><div class="desc"></div></div>
                      <button class="btn secondary">Calibrate</button>`;
-    box.querySelector(".desc").textContent = lv.cal ? "Calibrated." : "Not calibrated yet. Needed for the cant indicator.";
+    box.querySelector(".desc").textContent = lv.cal ? "Calibrated." : "Not calibrated yet. Everything in this group needs it.";
     box.querySelector("button").addEventListener("click", () => { calStep = 1; calError = ""; render(); });
     return box;
   }

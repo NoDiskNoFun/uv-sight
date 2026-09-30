@@ -530,6 +530,11 @@
 
     <div class="group" id="fwGroup">
       <h3>App and firmware</h3>
+      <div class="switchrow">
+        <div><div class="lbl">Show console</div>
+          <div class="desc">A tab with the raw messages of the sight, for troubleshooting.</div></div>
+        <label class="switch"><input type="checkbox" id="consoleCb" aria-label="Show console"><span></span></label>
+      </div>
       <div class="switchrow" id="installRow" hidden>
         <div><div class="lbl">Install app</div>
           <div class="desc">Adds UV-Sight to your home screen. It then also works without internet.</div></div>
@@ -616,7 +621,7 @@
   <button role="tab" aria-selected="false" data-view="training">Training</button>
   <button role="tab" aria-selected="false" data-view="history">History</button>
   <button role="tab" aria-selected="false" data-view="settings">Settings</button>
-  <button role="tab" aria-selected="false" data-view="console">Console</button>
+  <button role="tab" aria-selected="false" data-view="console" id="tabConsole" hidden>Console</button>
 </nav>
 
 <div class="toast" id="toast" role="status"></div>
@@ -634,7 +639,7 @@ const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.3";
+const APP_VERSION     = "5.5";
 
 // ---------------------------------------------------------------------------
 // State
@@ -978,6 +983,7 @@ function handleLine(line) {
       syncEpoch = m.epoch;
       syncCount = 0;
       syncSeen = new Set();
+      endsSeen = new Set();
       // The sight's log is behind what we fetched: its flash was replaced or cleared
       syncResync = typeof m.last === "number" && m.last < loadLogSeq();
       break;
@@ -1000,6 +1006,14 @@ function handleLine(line) {
     case "logEnd":
       syncEpoch = null;
       if (syncSeen) { markOnSight(syncSeen, true); }
+      if (fullScan && localStorage.getItem(ENDS_BACKFILL_KEY) !== "1") {
+        // Sessions on the sight whose end details only this phone has (from before firmware 4.0)
+        const store = loadEnds();
+        backfill = loadArchive().filter((r) => syncSeen && syncSeen.has(r.key) && store[r.key] &&
+                                               store[r.key].length && !(endsSeen && endsSeen.has(r.key)));
+        try { localStorage.setItem(ENDS_BACKFILL_KEY, "1"); } catch {}
+      }
+      endsSeen = null;
       if (fullScan) {
         // Everything not in this complete answer is not on the sight
         const all = new Set(loadArchive().map((r) => r.key));
@@ -1027,11 +1041,13 @@ function handleLine(line) {
       else if (!autoCopyOn()) toast("Everything is already on this phone");
       renderHistory();
       startAutoCopy();                             // then send back what the sight is missing
+      if (!autoCopy) runBackfill();
       break;
     case "loginfo":
       state.loginfo = m;
       break;
     case "endrec":
+      if (endsSeen) endsSeen.add(`${m.epoch}-${m.id}`);
       mergeEndRec(m);
       break;
     case "range":
@@ -2256,6 +2272,8 @@ const AUTOCOPY_KEY = "uvsight.autocopy";          // "off" disables copying to t
 const ONSIGHT_INIT_KEY = "uvsight.onsight.init";  // "1" once every record knows if it is on the sight
 const autoCopyOn = () => localStorage.getItem(AUTOCOPY_KEY) !== "off";
 let syncSeen = null;        // keys seen in the current log answer
+let endsSeen = null;        // sessions of which the sight sent ends in that answer
+const ENDS_BACKFILL_KEY = "uvsight.endsBackfill.v1";
 let fullScan = false;       // a "log since 0" to learn which sessions the sight has
 let autoCopy = null;        // { queue, i, added, timer, wait }
 
@@ -2268,9 +2286,18 @@ function markOnSight(keys, value) {
 }
 
 // Called once the app is connected and the sight speaks JSON
+let backfill = [];           // sessions whose end details go to the sight
+function runBackfill() {
+  if (!backfill.length || autoCopy || copyState || endPut) return;
+  if (syncBlocked()) { setTimeout(runBackfill, 3000); return; }
+  const r = backfill.shift();
+  setSyncLine(`Adding end details to the sight: ${backfill.length + 1} left`);
+  putEndsThen(r, () => { if (backfill.length) runBackfill(); else { setSyncLine(""); send("log info"); } });
+}
+
 function autoSync() {
   if (!autoCopyOn() || state.conn !== "connected" || copyState) return;
-  if (localStorage.getItem(ONSIGHT_INIT_KEY) !== "1") {
+  if (localStorage.getItem(ONSIGHT_INIT_KEY) !== "1" || localStorage.getItem(ENDS_BACKFILL_KEY) !== "1") {
     fullScan = true;                              // first time: learn what the sight has
     send("log since 0");
   } else {
@@ -2307,6 +2334,7 @@ function autoCopyNext() {
     if (c.added) toast(`${c.added} ${c.added === 1 ? "session" : "sessions"} copied to the sight`);
     stopAutoCopy();
     send("log info");
+    runBackfill();
     return;
   }
   const r = c.queue[c.i];
@@ -2559,7 +2587,7 @@ let calBusy = false, calError = "";
 const GROUPS = [
   { title: "Light sensor", keys: ["dark_on", "dark_off", "confirm"], light: true },
   { title: "UV light",     keys: ["bright_mode", "bright", "bright_min", "fade", "vf"] },
-  { title: "Cant",         keys: ["level_tol", "tilt_offset", "tilt_full", "blink_min", "blink_max", "tilt_smooth"], cal: true },
+  { title: "Cant and aiming range", keys: ["level_tol", "tilt_offset", "tilt_full", "blink_min", "blink_max", "tilt_smooth"], cal: true },
   { title: "Shot detection and sessions", keys: ["tap_ths", "lockout", "session_end"] },
   { title: "Battery",      keys: ["cutoff", "bat_mah"] },
   { title: "Power and Bluetooth", keys: ["ths", "timeout", "report", "tx_power"] },
@@ -2676,6 +2704,61 @@ function checkDistRow(rg, ready) {
   return row;
 }
 
+// Change a cant / aiming-range setting: show it at once (including the rule that
+// "On" of one switches the "On" of the other off), then ask the sight again, so a
+// lost answer can't leave an old state on screen
+let levelResync = null;
+function setLevel(cmd, patch) {
+  const lv = state.level || (state.level = {});
+  Object.assign(lv, patch);
+  if (patch.mode === "on" && lv.angle === "on") lv.angle = "off";
+  if (patch.angle === "on" && lv.mode === "on") lv.mode = "off";
+  render();
+  send(cmd);
+  clearTimeout(levelResync);
+  levelResync = setTimeout(() => { if (state.conn === "connected") send("level"); }, 800);
+}
+
+// Switches of the "Cant and aiming range" group
+function cantRows(lv) {
+  const cw = document.createDocumentFragment();
+  const lvMode = lv.mode || "off";
+  cw.appendChild(segRow("Cant",
+    (lvMode === "auto" ? "Measured during a session."
+      : lvMode === "on" ? "Measured whenever the bow is in use. Switches the aiming angle's On off."
+      : "Not measured.") + " Each end stores how canted you were.",
+    lvMode, ["off", "auto", "on"], (m) => setLevel("level " + m, { mode: m })));
+  if (lvMode !== "off") {
+    cw.appendChild(switchRow("Blink when canted", "Off: the cant is still measured and stored, the LED just stays calm.",
+      lv.cantSignal !== false, (on) => setLevel(on ? "level signal on" : "level signal off", { cantSignal: on })));
+    const st = lv.style || "normal";
+    cw.appendChild(segRow("Cant blinking",
+      st === "inverted" ? "Faster the closer you get to level." : "Faster the more the bow is canted.",
+      st, ["normal", "inverted"], (m) => setLevel("level style " + m, { style: m })));
+  }
+  const angMode = lv.angle || "auto";
+  cw.appendChild(segRow("Aiming angle",
+    (angMode === "auto" ? "Measured at every shot during a session."
+      : angMode === "on" ? "Measured at every shot, also outside a session (for setting up a sight). Switches the cant's On off."
+      : "Not measured.") + (lv.cal ? "" : " Needs the cant calibration."),
+    angMode, ["off", "auto", "on"], (m) => setLevel("angle " + m, { angle: m })));
+  if (angMode !== "off") {
+    const rg = state.range || {};
+    const ready = rg.state === "ready";
+    const row = switchRow("Warn if the distance doesn't fit",
+      ready ? "While aiming: double blink = aiming too low (arrow short), triple blink = too high (arrow long). Comes before the cant blinking."
+      : rg.state === "anchor" ? "After a new calibration: shoot one end with the distance set, then this works again."
+      : `Still learning: shoot a few ends at two or more distances with the distance set (${rg.ends || 0} ends so far).`,
+      lv.rangeSignal !== false && ready, (on) => setLevel(on ? "range signal on" : "range signal off", { rangeSignal: on }));
+    row.querySelector("input").disabled = !ready;
+    if (!ready) row.style.opacity = ".55";
+    cw.appendChild(row);
+    // "On" is for setting up a sight: choose the distance you aim at right here
+    if (angMode === "on") cw.appendChild(checkDistRow(rg, ready));
+  }
+  return cw;
+}
+
 // Row with a segmented control, e.g. Off / Auto / On
 function segRow(label, desc, current, modes, onPick) {
   const row = document.createElement("div");
@@ -2742,46 +2825,16 @@ function renderSettings() {
     if (!on && ses.active) { cb.checked = true; toast("End the running session first.", true); return; }
     send(on ? "shots on" : "shots off");
   }));
-  const lvMode = lv.mode || "off";
-  sw.appendChild(segRow("Cant",
-    (lvMode === "auto" ? "Measured during a session."
-      : lvMode === "on" ? "Measured whenever the bow is in use. Switches the aiming angle's On off."
-      : "Not measured.") + " Each end stores how canted you were.",
-    lvMode, ["off", "auto", "on"], (m) => send("level " + m)));
-  if (lvMode !== "off") {
-    sw.appendChild(switchRow("Blink when canted", "Off: the cant is still measured and stored, the LED just stays calm.",
-      lv.cantSignal !== false, (on) => send(on ? "level signal on" : "level signal off")));
-    const st = lv.style || "normal";
-    sw.appendChild(segRow("Cant blinking",
-      st === "inverted" ? "Faster the closer you get to level." : "Faster the more the bow is canted.",
-      st, ["normal", "inverted"], (m) => send("level style " + m)));
-  }
   const ledMode = (state.status && state.status.mode) || "auto";
-  const angMode = lv.angle || "auto";
-  sw.appendChild(segRow("Aiming angle",
-    (angMode === "auto" ? "Measured at every shot during a session."
-      : angMode === "on" ? "Measured at every shot, also outside a session (for setting up a sight). Switches the cant's On off."
-      : "Not measured.") + (lv.cal ? "" : " Needs the cant calibration."),
-    angMode, ["off", "auto", "on"], (m) => send("angle " + m)));
-  if (angMode !== "off") {
-    const rg = state.range || {};
-    const ready = rg.state === "ready";
-    const row = switchRow("Warn if the distance doesn't fit",
-      ready ? "While aiming: double blink = aiming too low (arrow short), triple blink = too high (arrow long). Comes before the cant blinking."
-      : rg.state === "anchor" ? "After a new calibration: shoot one end with the distance set, then this works again."
-      : `Still learning: shoot a few ends at two or more distances with the distance set (${rg.ends || 0} ends so far).`,
-      lv.rangeSignal !== false && ready, (on) => send(on ? "range signal on" : "range signal off"));
-    row.querySelector("input").disabled = !ready;
-    if (!ready) row.style.opacity = ".55";
-    sw.appendChild(row);
-    // "On" is for setting up a sight: choose the distance you aim at right here
-    if (angMode === "on") sw.appendChild(checkDistRow(rg, ready));
-  }
   sw.appendChild(segRow("LED",
     (ledMode === "auto" ? "Auto: switched by the light sensor."
       : ledMode === "on" ? "On: always lit." : "Off: stays dark.") +
-    " Cant blinking works in every mode. Back to Auto on restart.",
-    (state.status && state.status.mode) || "auto", ["off", "auto", "on"], (m) => send("mode " + m)));
+    " Cant blinking works in every mode. Kept after a restart.",
+    (state.status && state.status.mode) || "auto", ["off", "auto", "on"], (m) => {
+      if (state.status) state.status.mode = m;
+      render();
+      send("mode " + m);
+    }));
 
   // Groups
   const host = $("setGroups");
@@ -2796,7 +2849,7 @@ function renderSettings() {
     if (g.light) {
       const n = document.createElement("p"); n.className = "gnote"; n.id = "liveLight"; box.appendChild(n);
     }
-    if (g.cal) box.appendChild(calCard());
+    if (g.cal) { box.appendChild(cantRows(lv)); box.appendChild(calCard()); }
     items.forEach((it) => {
       if (it.k === "bright_mode") {
         box.appendChild(segRow("Brightness mode",
@@ -2886,6 +2939,18 @@ $("showHiddenCb").addEventListener("change", () => {
   }
 });
 $("btnClearLog").addEventListener("click", clearSightLog);
+const CONSOLE_KEY = "uvsight.console";
+function applyConsole() {
+  const on = localStorage.getItem(CONSOLE_KEY) === "1";
+  $("consoleCb").checked = on;
+  $("tabConsole").hidden = !on;
+  if (!on && activeView === "console") document.querySelector('nav button[data-view="status"]').click();
+}
+applyConsole();
+$("consoleCb").addEventListener("change", () => {
+  try { localStorage.setItem(CONSOLE_KEY, $("consoleCb").checked ? "1" : "0"); } catch {}
+  applyConsole();
+});
 applySyncUi();
 $("autoCopyCb").addEventListener("change", () => {
   try { localStorage.setItem(AUTOCOPY_KEY, $("autoCopyCb").checked ? "on" : "off"); } catch {}

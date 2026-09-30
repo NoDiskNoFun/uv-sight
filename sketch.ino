@@ -8,6 +8,7 @@
   ------------
   - Motion detection via the built-in IMU (accelerometer only).
   - If the bow lies still (timeout), everything is off: LED, light sensor, radio.
+    The accelerometer drops to 12.5 Hz and the board sleeps until INT1 wakes it.
   - If the bow is moved and it is dark, the UV LED turns on.
   - Brightness is set in percent (perceptual scale).
     Mode "fixed": the LED switches on below dark_on with one brightness and
@@ -25,8 +26,9 @@
   ------------
   - Shot = impact above the tap threshold (IMU tap detection). The IMU
     signals a tap on its INT1 line (P0.11), which triggers a hardware
-    interrupt, so no shot is missed between two loop passes. The interrupt
-    is only enabled while the shot counter is on and the bow is active.
+    interrupt, so no shot is missed between two loop passes. While the bow
+    rests the same line carries the motion wake-up, so the board sleeps
+    until the bow is picked up instead of polling the IMU.
     After a shot there is a lockout ("lockout", default 1.5 s): further
     impacts are ignored (vibration) and the tilt indicator pauses.
   - Shot strength: in shot mode the IMU fills its FIFO at 416 Hz (+-16 g).
@@ -147,7 +149,8 @@ const uint8_t PIN_LDR_PWR = 2;    // D2 powers the LDR only during a measurement
 const uint8_t PIN_LDR     = A0;   // midpoint LDR / 10k
 
 // Timing
-const uint32_t IDLE_POLL_MS       = 500;   // loop interval while idle
+const uint32_t IDLE_POLL_MS       = 500;   // loop interval while idle (fallback without INT1)
+const uint32_t IDLE_WAKE_MAX_MS   = 5000;  // idle: longest sleep between housekeeping passes
 const uint32_t ACTIVE_POLL_MS     = 250;   // loop interval while active
 const uint32_t SENSOR_INTERVAL_MS = 2000;  // check light + battery every 2 s
 const uint32_t IMU_SETTLE_MS      = 1000;  // ignore motion after a mode change
@@ -179,8 +182,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "5.6";
-const uint8_t  PROTO_VERSION     = 14;
+const char*    FW_VERSION        = "5.7";
+const uint8_t  PROTO_VERSION     = 15;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -192,6 +195,12 @@ const uint16_t CONN_INT_MAX      = 320;   // 400 ms
 const uint16_t BLE_MTU           = 247;   // max. packet size (default would be 23)
 const uint8_t  BLE_SEND_RETRIES  = 50;    // retries per packet when the queue is full
 const uint16_t BLE_RETRY_MS      = 20;    // wait between retries
+
+// Power
+// nRF52840 anomaly 89: a TWIM (I2C) that stays enabled while GPIOTE is used
+// draws a static 400 uA. The bus is therefore switched off between loop passes
+// and its power domain toggled, exactly as the errata workaround describes.
+#define TWIM_ANOMALY_89   1
 
 // ============================================================================
 // SETTINGS (changeable via Bluetooth, stored in flash with "save")
@@ -575,7 +584,8 @@ uint8_t  pendingX          = 0;
 #define REG_FIFO_STAT1  0x3A
 #define REG_FIFO_DATA   0x3E
 
-#define XL_26HZ_8G      0x2C    // idle: 26 Hz, +-8 g, low power
+#define XL_12HZ_8G      0x1C    // idle: 12.5 Hz, +-8 g, low power (wake-up within 80 ms)
+#define XL_26HZ_8G      0x2C    // active without shot counter: 26 Hz, +-8 g, low power
 #define XL_416HZ_16G    0x64    // shot mode: 416 Hz, +-16 g
 #define FIFO_XL_ONLY    0x01    // FIFO_CTRL3: accelerometer, no decimation
 #define FIFO_416_CONT   0x36    // FIFO_CTRL5: 416 Hz, continuous mode
@@ -586,6 +596,9 @@ uint8_t  pendingX          = 0;
 // TAP_CFG: interrupts on (0x80), HP filter (0x10), latched (0x01), tap XYZ (0x0E)
 #define TAP_CFG_MOTION  0x91
 #define TAP_CFG_SHOTS   0x9F
+// MD1_CFG: what drives the INT1 line
+#define INT1_WAKE_UP    0x20    // motion (bow rests: wakes the board)
+#define INT1_SINGLE_TAP 0x40    // tap (shot mode: exact time of the impact)
 
 LSM6DS3 imu(I2C_MODE, 0x6A);
 BLEUart bleuart;
@@ -598,6 +611,10 @@ enum LedState { LS_OFF, LS_ON, LS_BLINK, LS_WARN, LS_PULSE };
 
 bool     imuOk             = false;
 bool     imuFast           = false;
+bool     imuIdleOdr        = false;   // accelerometer at 12.5 Hz (bow rests)
+bool     imuBusOn          = false;   // I2C peripheral enabled
+NRF_TWIM_Type* imuTwim     = nullptr; // the TWIM instance the IMU hangs on (found at start)
+TwoWire* imuWire           = &Wire;
 bool     uvPwmActive       = false;
 uint16_t curDuty           = 0;
 LedState ledState          = LS_OFF;
@@ -698,8 +715,9 @@ uint8_t  sessRowN = 0;                    // this session's ends with a distance
 const char* awakeReason    = "";  // "usb", "app" or "" (for the status)
 float    lastShotG         = -1;      // peak of the last counted shot in g (-1 = none yet)
 bool     lastShotClip      = false;   // the peak hit the +-16 g limit
-volatile bool     tapFlag  = false;   // set by the INT1 interrupt
-volatile uint32_t tapMs    = 0;       // time of the first tap since the last check
+volatile bool     int1Flag = false;   // INT1 went high (tap in shot mode, motion otherwise)
+volatile uint32_t int1Ms   = 0;       // time of the first edge since the last check
+SemaphoreHandle_t wakeSem  = nullptr; // the interrupt ends the idle sleep through this
 String   rxBuf;
 uint16_t bleConnHandle     = BLE_CONN_HANDLE_INVALID;
 
@@ -1179,6 +1197,7 @@ void logRecount() {
 // Invariant: every sector holds a gapless prefix of valid records; anything
 // unexpected makes the writer continue in the next sector.
 void logScan() {
+  logCountChanged();
   memset(sectorFirstSeq, 0, sizeof(sectorFirstSeq));
   logHeadAddr = 0; logLastSeq = 0; logCount = 0;
   int16_t head = -1;
@@ -1245,6 +1264,7 @@ bool logAppend(LogRec& r, bool justSaved) {
     }
   }
   qspiClose();
+  if (ok) logCountChanged();
   if (ok && justSaved) {
     recentSeq[recentNext] = r.seq;
     recentMs[recentNext]  = millis();
@@ -1284,11 +1304,16 @@ void logForEachKind(uint32_t since, LogVisitor fn, uint8_t kinds) {
   qspiClose();
 }
 
-// Sessions the app and the terminal can see (without deleted and cleared ones)
+// Sessions the app and the terminal can see (without deleted and cleared ones).
+// Counting reads the whole chip, so the result is kept until the log changes.
 static uint32_t visibleN;
+static bool     visibleValid = false;
+void logCountChanged() { visibleValid = false; }
 uint32_t logVisibleCount() {
+  if (visibleValid) return visibleN;
   visibleN = 0;
   logForEach(0, [](const LogRec&) { visibleN++; return true; });
+  visibleValid = true;
   return visibleN;
 }
 
@@ -1322,6 +1347,7 @@ void logDelete(String args) {
     qspiClose();
   }
   if (ok) {                                           // its ends go as well
+    logCountChanged();
     static uint32_t endAddrs[64];
     static uint8_t  endN;
     endN = 0;
@@ -1356,6 +1382,7 @@ void logClear(String args) {
   }
   const uint32_t n = logVisibleCount();
   shotState.clearedSeq = logLastSeq;
+  logCountChanged();
   const bool ok = stateSave();
   say(ok ? "Log on the sight cleared (" + String(n) + (n == 1 ? " session)." : " sessions).") : String("ERROR while saving!"),
       "{\"t\":\"ack\",\"cmd\":\"clear\",\"ok\":" + jbool(ok) + ",\"count\":" + String(n) + "}");
@@ -1525,7 +1552,7 @@ void fifoRestart() {
 uint16_t fifoWords() {
   uint8_t b[2] = {0, 0};
   if (imu.readRegisterRegion(b, REG_FIFO_STAT1, 2) != IMU_SUCCESS) return 0;
-  return b[0] | ((b[1] & 0x07) << 8);
+  return b[0] | ((b[1] & 0x0F) << 8);          // DIFF_FIFO is 12 bits
 }
 
 // Peak of the total acceleration in the FIFO, in g. Restarts the FIFO.
@@ -1533,7 +1560,7 @@ float readShotPeakG(bool* clipped) {
   *clipped = false;
   uint8_t st[4] = {0, 0, 0, 0};
   if (imu.readRegisterRegion(st, REG_FIFO_STAT1, 4) != IMU_SUCCESS) return -1;
-  uint16_t n   = st[0] | ((st[1] & 0x07) << 8);
+  uint16_t n   = st[0] | ((st[1] & 0x0F) << 8);
   uint16_t pat = (st[2] | ((st[3] & 0x03) << 8)) % 3;   // axis of the next word: 0 x, 1 y, 2 z
   if (n > FIFO_READ_MAX) n = FIFO_READ_MAX;
 
@@ -1577,30 +1604,101 @@ bool imuInit() {
   imu.writeRegister(REG_FIFO_CTRL3,  FIFO_XL_ONLY);       // FIFO only used in shot mode
   imu.writeRegister(REG_FIFO_CTRL5,  FIFO_BYPASS);
   imu.writeRegister(REG_TAP_CFG,     TAP_CFG_MOTION);     // tap off for now
-  imu.writeRegister(REG_MD1_CFG,     0x40);               // only single tap on INT1 (motion is polled)
+  imu.writeRegister(REG_MD1_CFG,     INT1_WAKE_UP);       // motion on INT1 until shot mode routes the tap
 
   uint8_t dummy;
   imu.readRegister(&dummy, REG_WAKE_UP_SRC);
   imu.readRegister(&dummy, REG_TAP_SRC);
   imuFast = false;
+  imuIdleOdr = false;
   imuOk = true;                   // needed by applyImuThresholds()
   applyImuThresholds();
+  // Which I2C peripheral the library opened for the IMU (Wire = TWIM0, Wire1 = TWIM1)
+  if (NRF_TWIM0->ENABLE == TWIM_ENABLE_ENABLE_Enabled) { imuTwim = NRF_TWIM0; imuWire = &Wire; }
+#if WIRE_INTERFACES_COUNT > 1
+  else if (NRF_TWIM1->ENABLE == TWIM_ENABLE_ENABLE_Enabled) { imuTwim = NRF_TWIM1; imuWire = &Wire1; }
+#endif
+  imuBusOn = true;
+  int1Init();
   return true;
 }
 
-// INT1 interrupt: only remember the time, evaluation happens in the loop
-void imuInt1Isr() {
-  if (!tapFlag) tapMs = millis();
-  tapFlag = true;
+// I2C bus on/off around the IMU accesses of one loop pass (anomaly 89, see above)
+void imuBus(bool on) {
+#if TWIM_ANOMALY_89
+  if (!imuOk || !imuTwim || on == imuBusOn) return;
+  if (on) {
+    imuWire->begin();
+  } else {
+    imuWire->end();
+    volatile uint32_t* pwr = (volatile uint32_t*)((uintptr_t)imuTwim + 0xFFC);   // POWER register of the peripheral
+    *pwr = 0;
+    (void)*pwr;
+    *pwr = 1;
+  }
+  imuBusOn = on;
+#else
+  (void)on;
+#endif
+}
+
+// Accelerometer rate while not in shot mode: 12.5 Hz when the bow rests, 26 Hz in use
+void imuSetIdleOdr(bool idle) {
+  if (!imuOk || imuFast || idle == imuIdleOdr) return;
+  imu.writeRegister(REG_CTRL1_XL, idle ? XL_12HZ_8G : XL_26HZ_8G);
+  imuIdleOdr = idle;
+}
+
+// INT1 interrupt. The line is watched with a GPIOTE PORT event (pin sense): unlike
+// an IN event it needs no high-frequency clock, so it costs nothing while the
+// board sleeps. The handler only notes the time and wakes the loop; what the
+// edge meant (tap or motion) is read from the IMU in the loop.
+// The sketch owns the GPIOTE interrupt: attachInterrupt() must not be used.
+static inline uint32_t millisFromIsr() {
+  return (uint32_t)(((uint64_t)xTaskGetTickCountFromISR() * 1000) / configTICK_RATE_HZ);
+}
+
+extern "C" void GPIOTE_IRQHandler(void) {
+  if (NRF_GPIOTE->EVENTS_PORT) {
+    NRF_GPIOTE->EVENTS_PORT = 0;
+    (void)NRF_GPIOTE->EVENTS_PORT;                 // make sure the clear reached the peripheral
+    if (!int1Flag) int1Ms = millisFromIsr();
+    int1Flag = true;
+    if (wakeSem) {
+      BaseType_t woken = pdFALSE;
+      xSemaphoreGiveFromISR(wakeSem, &woken);
+      portYIELD_FROM_ISR(woken);
+    }
+  }
+}
+
+void int1Init() {
+#ifdef PIN_LSM6DS3TR_C_INT1
+  wakeSem = xSemaphoreCreateBinary();
+  const uint32_t pin = g_ADigitalPinMap[PIN_LSM6DS3TR_C_INT1];
+  nrf_gpio_cfg_sense_input(pin, NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_SENSE_HIGH);
+  NRF_GPIOTE->EVENTS_PORT = 0;
+  NRF_GPIOTE->INTENSET = GPIOTE_INTENSET_PORT_Msk;
+  NVIC_ClearPendingIRQ(GPIOTE_IRQn);
+  NVIC_SetPriority(GPIOTE_IRQn, 6);             // an application level allowed next to the SoftDevice
+  NVIC_EnableIRQ(GPIOTE_IRQn);
+#endif
+}
+
+// Idle: sleep until INT1 reports motion, at most IDLE_WAKE_MAX_MS for housekeeping
+void idleSleep() {
+  if (wakeSem) {
+    xSemaphoreTake(wakeSem, 0);                  // drop a stale wake-up
+    if (!int1Flag) xSemaphoreTake(wakeSem, pdMS_TO_TICKS(IDLE_WAKE_MAX_MS));
+    int1Flag = false;                            // the loop reads WAKE_UP_SRC next
+    return;
+  }
+  delay(IDLE_POLL_MS);                           // no INT1 pin: poll as before
 }
 
 // Fast mode (416 Hz) only for shot detection, otherwise low power (26 Hz)
 void imuSetFast(bool fast) {
   if (!imuOk || fast == imuFast) return;
-
-#ifdef PIN_LSM6DS3TR_C_INT1
-  if (!fast) detachInterrupt(digitalPinToInterrupt(PIN_LSM6DS3TR_C_INT1));
-#endif
 
   if (fast) {
     imu.writeRegister(REG_CTRL6_C,  0x00);                // high performance
@@ -1611,7 +1709,9 @@ void imuSetFast(bool fast) {
     imu.writeRegister(REG_TAP_CFG,  TAP_CFG_MOTION);
     imu.writeRegister(REG_CTRL1_XL, XL_26HZ_8G);
     imu.writeRegister(REG_CTRL6_C,  0x10);
+    imuIdleOdr = false;
   }
+  imu.writeRegister(REG_MD1_CFG, fast ? INT1_SINGLE_TAP : INT1_WAKE_UP);   // what INT1 reports
   imuFast = fast;
   applyImuThresholds();
   if (fast) fifoRestart();
@@ -1623,14 +1723,7 @@ void imuSetFast(bool fast) {
   uint8_t dummy;
   imu.readRegister(&dummy, REG_WAKE_UP_SRC);
   imu.readRegister(&dummy, REG_TAP_SRC);   // clears the latched INT1 line
-  tapFlag = false;
-
-#ifdef PIN_LSM6DS3TR_C_INT1
-  if (fast) {
-    pinMode(PIN_LSM6DS3TR_C_INT1, INPUT);
-    attachInterrupt(digitalPinToInterrupt(PIN_LSM6DS3TR_C_INT1), imuInt1Isr, RISING);
-  }
-#endif
+  int1Flag = false;
 }
 
 bool imuMotionSinceLastCheck() {
@@ -2980,6 +3073,7 @@ void finishSession(bool manual) {
   s.start = unixAt(sessionStartMs);
   stateSave();                         // session number must never repeat
   const bool ok = logAppend(s, true);
+  if (!ok) s.seq = 0;                  // the app must not take a number that was never written
 
   say(String(manual ? "Session ended" : "Session ended automatically (" + String(cfg.sessionEndMin) + " min without a shot)") +
       ": " + String(s.ends) + " ends (" + String(s.invalidEnds) + " invalid), " +
@@ -3088,15 +3182,18 @@ void printLogInfo() {
 }
 
 // App: every record newer than "since". Terminal: the newest LOG_PRINT_LAST, or all.
+static uint32_t logSentN;   // records in the current answer, so the app can tell a lost line
 void printLog(uint32_t since, bool all) {
   if (appMode) {
     sendLine("{\"t\":\"logStart\",\"since\":" + String(since) + ",\"last\":" + String(logLastSeq) +
              ",\"total\":" + String(logVisibleCount()) + ",\"epoch\":" + String(shotState.epoch) + "}");
+    logSentN = 0;
     logForEachKind(since, [](const LogRec& r) {
       sendLine(r.magic == END_MAGIC ? endJson(*(const EndRec*)&r) : slotJson(r));
+      logSentN++;
       return true;
     }, LOG_SESSIONS | LOG_ENDS);
-    sendLine("{\"t\":\"logEnd\",\"last\":" + String(logLastSeq) + "}");
+    sendLine("{\"t\":\"logEnd\",\"last\":" + String(logLastSeq) + ",\"n\":" + String(logSentN) + "}");
     return;
   }
   if (!qfOk) { err("Log flash not available."); return; }
@@ -3230,11 +3327,21 @@ void handleScore(String args) {
 // ============================================================================
 // Status and commands
 // ============================================================================
+const char* ledStateText() {
+  switch (ledState) {
+    case LS_ON:    return "on";
+    case LS_BLINK: return "blinking";
+    case LS_WARN:  return "warning";
+    case LS_PULSE: return "pulsing";
+    default:       return "off";
+  }
+}
+
 String statusLine() {
   String s = "Light=" + String(lastLdr) + (isDark ? " (dark)" : " (bright)");
   s += " | Battery=" + String(lastVbat, 2) + "V " + String((int)(lastPct + 0.5f)) + "%";
   s += " (" + String(chargeText(lastCharge)) + ")";
-  s += " | LED=" + String(ledState == LS_ON ? "on" : (ledState == LS_BLINK ? "blinking" : "off"));
+  s += " | LED=" + String(ledStateText());
   s += " Bright=" + String((int)(brightNow < 0 ? brightTarget() : brightNow)) + "%";
   if (levelActive() && tiltFilterOk) s += " | Tilt=" + String(tiltDeg, 1) + "deg";
   if (ledMode == MODE_ON)  s += " | Mode=on";
@@ -3246,7 +3353,7 @@ String statusLine() {
 }
 
 String statusJson() {
-  const char* led  = (ledState == LS_ON) ? "on" : (ledState == LS_BLINK ? "blinking" : "off");
+  const char* led  = ledStateText();
   const char* mode = (ledMode == MODE_ON) ? "on" : (ledMode == MODE_OFF ? "off" : "auto");
   String j = "{\"t\":\"status\",\"light\":" + String(lastLdr) + ",\"dark\":" + jbool(isDark) +
              ",\"vbat\":" + String(lastVbat, 2) + ",\"pct\":" + String((int)(lastPct + 0.5f)) +
@@ -3263,9 +3370,12 @@ String statusJson() {
   return j + "}";
 }
 
+// Every status sent restarts the report timer, so an app that asks for the status
+// itself does not get the periodic report on top of it
 void sendStatus() {
   say(statusLine(), statusJson());
   emit(batJson());
+  lastReportMs = millis();
 }
 
 // Settings go out as one short line per item: long lines were unreliable over BLE
@@ -3355,6 +3465,7 @@ void handleSet(const String& args) {
   setSetting(cfg, *d, v);
   applyImuThresholds();          // apply IMU thresholds right away
   if (key == "tx_power") applyTxPower();
+  if (key == "bat_mah")  bhFit();   // the runtime estimate scales with the capacity
 
   const String shown = fmtSetting(*d, getSetting(cfg, *d));
   say(key + " = " + shown + "  (active, permanent with 'save')",
@@ -3671,6 +3782,16 @@ void appOn() {
   printSetups();
 }
 
+// Commands that only read or write elsewhere: they leave an open score question alone
+bool keepsPendingScore(const String& l) {
+  return l == "status" || l == "?" || l == "get" || l == "config" || l == "help" || l == "h" ||
+         l == "shots" || l == "level" || l == "bat" || l == "range" || l == "setup" || l == "angle" ||
+         l == "log" || l == "log all" || l == "log info" || l.startsWith("log since ") ||
+         l.startsWith("log ends ") || l.startsWith("log put ") || l.startsWith("log putend ") ||
+         l.startsWith("time ") || l.startsWith("awake ") ||
+         l == "app on" || l == "app off" || l == "live on" || l == "live off";
+}
+
 void handleCommand(String line) {
   line.trim();
   const String raw = line;                        // original case (setup names)
@@ -3680,8 +3801,9 @@ void handleCommand(String line) {
   // Setting the distance must not discard an open score question
   if (line == "dist" || line.startsWith("dist ")) { handleDist(line.substring(4)); return; }
 
-  // Pending confirmation for a mismatching end
-  if (pendingScore) {
+  // Pending confirmation for a mismatching end. Only a command that changes the
+  // session or its settings withdraws it; the app keeps syncing in the meantime.
+  if (pendingScore && !keepsPendingScore(line)) {
     pendingScore = false;
     if (line == "yes") {
       // The entered arrow count wins over the sensor count
@@ -3766,7 +3888,7 @@ void handleCommand(String line) {
 void feedChar(char c) {
   if (c == '\n' || c == '\r') {
     if (rxBuf.length()) { handleCommand(rxBuf); rxBuf = ""; }
-  } else if (rxBuf.length() < 160) {
+  } else if (rxBuf.length() < 240) {   // the longest app command is about 150 characters
     rxBuf += c;
   }
 }
@@ -3962,6 +4084,7 @@ void setup() {
 void loop() {
   uint32_t   now       = millis();
   const bool connected = Bluefruit.connected();
+  imuBus(true);
 
   if (!connected) { liveMode = false; welcomed = false; appMode = false; }
   // A command cut off by a lost connection must not be glued to the first one
@@ -3972,17 +4095,20 @@ void loop() {
   // Only movement keeps the board active (a connection does not)
   if (imuMotionSinceLastCheck()) lastMotionMs = now;
 
-  // Shot: from the INT1 interrupt (exact time) or, as a fallback, from polling
+  // Shot: the INT1 edge gives the exact time; the latched TAP_SRC confirms it
+  // (in shot mode INT1 only carries the tap) and re-arms the line
   bool     shot   = false;
   uint32_t shotAt = now;
-  if (tapFlag) {
+  bool     edge   = false;
+  if (int1Flag) {
     noInterrupts();
-    shotAt  = tapMs;
-    tapFlag = false;
+    shotAt   = int1Ms;
+    int1Flag = false;
     interrupts();
-    shot = true;
+    edge = true;
   }
-  if (imuTapSinceLastCheck()) shot = true;   // also re-arms INT1
+  if (imuTapSinceLastCheck()) shot = true;
+  if (!edge) shotAt = now;                   // tap found by polling only
   if (shot) {
     lastMotionMs = now;
     if (shotAllowed(shotAt)) {
@@ -4030,8 +4156,10 @@ void loop() {
   }
   bhService(now, usb);
 
-  // Shot detection only if the counter is on and the bow is in use
+  // Shot detection only if the counter is on and the bow is in use; at rest the
+  // accelerometer runs at its slowest rate
   imuSetFast(active && shotState.shotsOn);
+  imuSetIdleOdr(!active);
 
   // End the session automatically after session_end minutes without a shot
   if (sessionActive && (now - sessionLastShotMs) >= cfg.sessionEndMin * 60000UL) {
@@ -4073,10 +4201,12 @@ void loop() {
         sendStatus();
         lastReportMs = now;
       }
+      imuBus(false);
       delay(ACTIVE_POLL_MS);
       return;
     }
-    delay(IDLE_POLL_MS);
+    imuBus(false);
+    idleSleep();
     return;
   }
 
@@ -4100,5 +4230,6 @@ void loop() {
     lastReportMs = now;
   }
 
+  imuBus(false);
   delay((lvlOn || angOn) ? LEVEL_LOOP_MS : ACTIVE_POLL_MS);
 }

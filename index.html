@@ -521,7 +521,7 @@
           <div class="desc">Sessions you removed from this phone appear greyed out in History, so you can bring them back.</div></div>
         <label class="switch"><input type="checkbox" id="showHiddenCb" aria-label="Show removed sessions"><span></span></label>
       </div>
-      <div class="switchrow">
+      <div class="switchrow" id="clearLogRow" hidden>
         <div><div class="lbl">Delete sessions on the sight</div>
           <div class="desc">Deletes all sessions stored on the sight, for example before you give it away. The sessions on this phone are kept.</div></div>
         <button class="btn secondary" id="btnClearLog" style="color:var(--red); box-shadow: inset 0 0 0 2px var(--red)">Delete</button>
@@ -639,7 +639,7 @@ const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.7";
+const APP_VERSION     = "5.8";
 
 // ---------------------------------------------------------------------------
 // State
@@ -2810,6 +2810,7 @@ function renderSettings() {
   $("btnCfgRetry").hidden = !gaveUp;
   $("setBody").hidden = !(connected && state.cfg);
   $("btnDfu").disabled = !connected;
+  $("clearLogRow").hidden = !connected;          // only with the sight connected
   const h = state.hello;
   const li = state.loginfo;
   $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}` : "") +

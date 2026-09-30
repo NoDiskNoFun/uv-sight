@@ -14,7 +14,7 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 5.7, protocol 15, app 5.10 |
+> | Firmware / protocol / app | Firmware 5.8, protocol 16, app 5.11 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -446,7 +446,7 @@ The archive is stored in Chrome's site data. Clearing Chrome's site data deletes
 
 ---
 
-## JSON protocol (version 15)
+## JSON protocol (version 16)
 
 After `app on` the device sends **only JSON, one object per line**, until `app off` or disconnect. Commands stay the same text commands. Every object has a type field `t`. Lines that do not start with `{` (for example the greeting before `app on`) can be ignored.
 
@@ -476,7 +476,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `logtest` | `step`, `ok`, `detail` | During `log test` |
 | `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `cal`, `angle` (`off`/`auto`/`on`), `cantSignal`, `rangeSignal` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
-| `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`) | Device events |
+| `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`), `range` (+`warn`: `low`/`high`/empty, `ok`) | Device events. `range` is sent whenever the aiming-range signal changes, so an app can mirror the LED (e.g. by vibrating) |
 | `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`) | Confirmation of a command |
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |

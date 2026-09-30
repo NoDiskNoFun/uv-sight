@@ -540,7 +540,7 @@
           <div class="desc">Adds UV-Sight to your home screen. It then also works without internet.</div></div>
         <button class="btn secondary" id="btnInstall">Install</button>
       </div>
-      <div class="switchrow">
+      <div class="switchrow" id="dfuRow" hidden>
         <div><div class="lbl">Firmware update</div>
           <div class="desc" id="fwText">Prepares the sight for new firmware. Connect it to your computer with the USB cable first.</div></div>
         <button class="btn secondary" id="btnDfu">Start</button>
@@ -639,7 +639,7 @@ const PROTO_EXPECTED  = 14;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.8";
+const APP_VERSION     = "5.9";
 
 // ---------------------------------------------------------------------------
 // State
@@ -2811,6 +2811,7 @@ function renderSettings() {
   $("setBody").hidden = !(connected && state.cfg);
   $("btnDfu").disabled = !connected;
   $("clearLogRow").hidden = !connected;          // only with the sight connected
+  $("dfuRow").hidden = !connected;
   const h = state.hello;
   const li = state.loginfo;
   $("versions").textContent = `App ${APP_VERSION}` + (h ? `, firmware ${h.fw}` : "") +

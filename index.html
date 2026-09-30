@@ -635,11 +635,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 14;
+const PROTO_EXPECTED  = 15;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.9";
+const APP_VERSION     = "5.10";
 
 // ---------------------------------------------------------------------------
 // State
@@ -805,7 +805,7 @@ function onDisconnected() {
   if (confirmOpen) { $("dlg").close(); confirmOpen = false; }
   stopPolling();
   stopAutoCopy();
-  fullScan = false; syncSeen = null;
+  fullScan = false; syncSeen = null; syncEpoch = null; syncRetries = 0;
   const wasConnected = state.conn === "connected";
   setConn("off");
   if (wasConnected && !sightAsleep) startAutoReconnect();
@@ -982,6 +982,8 @@ function handleLine(line) {
     case "logStart":
       syncEpoch = m.epoch;
       syncCount = 0;
+      syncGot = 0;
+      syncSince = typeof m.since === "number" ? m.since : loadLogSeq();
       syncSeen = new Set();
       endsSeen = new Set();
       // The sight's log is behind what we fetched: its flash was replaced or cleared
@@ -999,11 +1001,23 @@ function handleLine(line) {
         archiveSlot(m.epoch, m);
         break;
       }
+      syncGot++;
       if (syncSeen) syncSeen.add(`${m.epoch ?? syncEpoch}-${m.id}`);
       if (archiveSlot(m.epoch ?? syncEpoch, m)) syncCount++;
-      if (typeof m.seq === "number" && m.seq > loadLogSeq() && !syncResync) saveLogSeq(m.seq);
       break;
-    case "logEnd":
+    case "logEnd": {
+      // Firmware 5.7+ says how many records it sent. A lost line means the answer is
+      // incomplete: ask again with the same marker instead of moving it past the gap
+      const complete = typeof m.n !== "number" || m.n === syncGot;
+      if (!complete && syncRetries < SYNC_MAX_RETRIES && state.conn === "connected") {
+        syncRetries++;
+        logConsole(`log answer incomplete (${syncGot} of ${m.n} records), asking again`, "err");
+        syncEpoch = null; syncSeen = null; endsSeen = null;
+        send(`log since ${syncSince}`);
+        break;
+      }
+      if (!complete) toast("Some lines from the sight were lost. Move closer and sync again.", true);
+      syncRetries = 0;
       syncEpoch = null;
       if (syncSeen) { markOnSight(syncSeen, true); }
       if (fullScan && localStorage.getItem(ENDS_BACKFILL_KEY) !== "1") {
@@ -1014,7 +1028,7 @@ function handleLine(line) {
         try { localStorage.setItem(ENDS_BACKFILL_KEY, "1"); } catch {}
       }
       endsSeen = null;
-      if (fullScan) {
+      if (fullScan && complete) {
         // Everything not in this complete answer is not on the sight
         const all = new Set(loadArchive().map((r) => r.key));
         for (const k of syncSeen || []) all.delete(k);
@@ -1022,6 +1036,7 @@ function handleLine(line) {
         fullScan = false;
         try { localStorage.setItem(ONSIGHT_INIT_KEY, "1"); } catch {}
       }
+      fullScan = false;
       syncSeen = null;
       if (hiddenFetch) {
         hiddenFetch = false;
@@ -1036,17 +1051,19 @@ function handleLine(line) {
         send("log since 0");
         break;
       }
-      if (typeof m.last === "number" && m.last >= loadLogSeq()) saveLogSeq(m.last);
+      if (complete && typeof m.last === "number" && m.last >= loadLogSeq()) saveLogSeq(m.last);
       if (syncCount) toast(`${syncCount} new ${syncCount === 1 ? "session" : "sessions"} from the sight`);
-      else if (!autoCopyOn()) toast("Everything is already on this phone");
+      else if (!autoCopyOn() && complete) toast("Everything is already on this phone");
       renderHistory();
       startAutoCopy();                             // then send back what the sight is missing
       if (!autoCopy) runBackfill();
       break;
+    }
     case "loginfo":
       state.loginfo = m;
       break;
     case "endrec":
+      if (syncEpoch !== null) syncGot++;
       if (endsSeen) endsSeen.add(`${m.epoch}-${m.id}`);
       mergeEndRec(m);
       break;
@@ -1184,7 +1201,7 @@ function render() {
   $("vSession").textContent = sesText;
 
   // LED
-  let ledText = { on: "On", off: "Off", blinking: "Blinking" }[s.led] || s.led;
+  let ledText = { on: "On", off: "Off", blinking: "Blinking", warning: "Distance warning", pulsing: "Pulsing, aim fits" }[s.led] || s.led;
   if (s.led === "on" && typeof s.bright === "number") ledText += `, ${s.bright} %`;
   const bm = cfgValue("bright_mode");
   const bmText = bm === null ? "" : (bm === 1 ? "auto" : "fixed");
@@ -1578,6 +1595,8 @@ function resolveDates(a) {
   return changed;
 }
 let syncEpoch = null, syncCount = 0, syncResync = false;
+let syncGot = 0, syncSince = 0, syncRetries = 0;   // records received in the current log answer
+const SYNC_MAX_RETRIES = 2;
 let liveSlot = null;   // session that just ended, its "slot" line is expected next
 
 // A session that just ended: keep it on the phone even if the sight could not store it
@@ -1589,7 +1608,7 @@ function handleLiveSlot(sl) {
   if (stored) toast(`Session saved: ${sl.scored} arrows, average ${Number(sl.avg).toFixed(2)}, ${sl.x} X`);
   else toast("The sight could not store this session" + (error ? ` (${error})` : "") +
              ". It is kept on this phone.", true);
-  if (sl.seq && sl.seq === loadLogSeq() + 1) saveLogSeq(sl.seq);   // only if nothing was skipped
+  if (stored && sl.seq && sl.seq === loadLogSeq() + 1) saveLogSeq(sl.seq);   // only if nothing was skipped
   liveSlot = null;
 }
 const LOGSEQ_KEY = "uvsight.logseq.v1";   // newest log record already fetched from the sight
@@ -2297,6 +2316,7 @@ function runBackfill() {
 
 function autoSync() {
   if (!autoCopyOn() || state.conn !== "connected" || copyState) return;
+  if (syncBlocked()) { setTimeout(autoSync, 2000); return; }   // e.g. a score question right after a reconnect
   if (localStorage.getItem(ONSIGHT_INIT_KEY) !== "1" || localStorage.getItem(ENDS_BACKFILL_KEY) !== "1") {
     fullScan = true;                              // first time: learn what the sight has
     send("log since 0");
@@ -2716,7 +2736,11 @@ function setLevel(cmd, patch) {
   render();
   send(cmd);
   clearTimeout(levelResync);
-  levelResync = setTimeout(() => { if (state.conn === "connected") send("level"); }, 800);
+  levelResync = setTimeout(() => {
+    if (state.conn !== "connected") return;
+    if (confirmOpen || awaitingEnd || (state.session && state.session.pending)) { clearTimeout(levelResync); levelResync = setTimeout(() => send("level"), 3000); return; }
+    send("level");
+  }, 800);
 }
 
 // Switches of the "Cant and aiming range" group

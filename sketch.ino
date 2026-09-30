@@ -123,6 +123,10 @@
 #include <nrfx_qspi.h>  // external 2 MB flash for the session log
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
+#if __has_include(<nrf52_erratas.h>)
+  #include <nrf52_erratas.h>   // Nordic MDK: which errata apply to the chip revision at hand
+  #define HAVE_NRF52_ERRATAS 1
+#endif
 
 using namespace Adafruit_LittleFS_Namespace;
 
@@ -197,9 +201,13 @@ const uint8_t  BLE_SEND_RETRIES  = 50;    // retries per packet when the queue i
 const uint16_t BLE_RETRY_MS      = 20;    // wait between retries
 
 // Power
-// nRF52840 anomaly 89: a TWIM (I2C) that stays enabled while GPIOTE is used
-// draws a static 400 uA. The bus is therefore switched off between loop passes
-// and its power domain toggled, exactly as the errata workaround describes.
+// nRF52840 erratum 89: a TWIM (I2C) that stays enabled while GPIOTE is used
+// draws a static 400 uA. Per the Nordic errata this only affects the revision
+// Engineering A; every production revision is free of it. The workaround
+// (switch the bus off between loop passes and toggle its power domain) is
+// therefore only applied when the chip says it needs it.
+//   0 = never, 1 = automatic (checked at start with the MDK, off if the MDK
+//   header is missing), 2 = always
 #define TWIM_ANOMALY_89   1
 
 // ============================================================================
@@ -613,6 +621,7 @@ bool     imuOk             = false;
 bool     imuFast           = false;
 bool     imuIdleOdr        = false;   // accelerometer at 12.5 Hz (bow rests)
 bool     imuBusOn          = false;   // I2C peripheral enabled
+bool     twimWorkaround    = false;   // erratum 89 workaround active (decided at start)
 NRF_TWIM_Type* imuTwim     = nullptr; // the TWIM instance the IMU hangs on (found at start)
 TwoWire* imuWire           = &Wire;
 bool     uvPwmActive       = false;
@@ -1619,14 +1628,19 @@ bool imuInit() {
   else if (NRF_TWIM1->ENABLE == TWIM_ENABLE_ENABLE_Enabled) { imuTwim = NRF_TWIM1; imuWire = &Wire1; }
 #endif
   imuBusOn = true;
+#if TWIM_ANOMALY_89 == 2
+  twimWorkaround = true;
+#elif TWIM_ANOMALY_89 == 1 && defined(HAVE_NRF52_ERRATAS)
+  twimWorkaround = nrf52_errata_89();       // only the Engineering A revision has it
+#endif
   int1Init();
   return true;
 }
 
-// I2C bus on/off around the IMU accesses of one loop pass (anomaly 89, see above)
+// I2C bus on/off around the IMU accesses of one loop pass (erratum 89, see above)
 void imuBus(bool on) {
 #if TWIM_ANOMALY_89
-  if (!imuOk || !imuTwim || on == imuBusOn) return;
+  if (!twimWorkaround || !imuOk || !imuTwim || on == imuBusOn) return;
   if (on) {
     imuWire->begin();
   } else {
@@ -2037,6 +2051,7 @@ void printBat() {
   if (full >= 0) out("  full in about " + String((int)(full + 0.5f)) + " min");
   out("Current draw: resting " + String(fitIdleMa, 3) + " mA, awake " + String(fitActiveMa, 2) +
       " mA, LED factor " + String(fitLedK, 2));
+  out(String("I2C erratum 89 workaround: ") + (twimWorkaround ? "on (chip revision needs it)" : "off (chip revision not affected)"));
   out("Based on " + String(fitRows) + " discharge windows (" + String(fitMah, 0) + " mAh) and " +
       String(fitCharges) + " charges; " + String(bh.count) + " points stored, capacity " + String(cfg.batMah) + " mAh");
 }
@@ -3772,7 +3787,8 @@ void setClock(String args) {
 void appOn() {
   appMode = true;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
-           "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) + "}");
+           "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) +
+           ",\"twim89\":" + jbool(twimWorkaround) + "}");
   sendCfg();
   sendLine(statusJson());
   sendLine(sessionJson());

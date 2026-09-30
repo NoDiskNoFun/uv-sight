@@ -395,7 +395,7 @@ These are set at the top of the sketch and need a rebuild.
 | `SENSOR_INTERVAL_MS` | 2000 ms | Light and battery reading interval |
 | `ACTIVE_POLL_MS` / `LEVEL_LOOP_MS` | 250 / 30 ms | Loop interval active / with cant indicator or aiming angle |
 | `IDLE_WAKE_MAX_MS` / `IDLE_POLL_MS` | 5000 / 500 ms | Idle: longest sleep between housekeeping passes (the IMU interrupt ends it earlier) / poll interval if the board package has no INT1 pin |
-| `TWIM_ANOMALY_89` | 1 | Switch the I2C peripheral off between loop passes and toggle its power (nRF52840 erratum 89, otherwise up to 0.4 mA extra) |
+| `TWIM_ANOMALY_89` | 1 | nRF52840 erratum 89 workaround (I2C peripheral off between loop passes): 0 = never, 1 = automatic (the firmware asks the Nordic MDK whether the chip revision is affected; only Engineering A is), 2 = always. `bat` shows whether it is active |
 | `ADV_FAST_INTERVAL` / `ADV_SLOW_INTERVAL` | 100 ms / ~1 s | Advertising for the first 10 s / afterwards |
 | `CONN_INT_MIN` / `CONN_INT_MAX` | 200 / 400 ms | Requested connection interval |
 | `BLE_NAME` | `UV-Sight` | Bluetooth name |
@@ -520,4 +520,4 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 - **Cold:** below 0 °C LiPo capacity drops noticeably; runtime will be shorter than estimated.
 - **Estimates:** runtimes and some thresholds are estimates and were not measured by the author of the code.
 - **Web Bluetooth:** only Chrome on Android is supported; iPhone browsers do not support Web Bluetooth.
-- **Erratum 89 of the chip:** a documented nRF52840 erratum adds up to about 0.4 mA while the I2C peripheral stays enabled next to GPIOTE. The firmware works around it by switching the I2C peripheral off between loop passes (`TWIM_ANOMALY_89`). Whether the workaround is complete has not been measured on hardware.
+- **Erratum 89 of the chip:** the nRF52840 erratum that adds up to about 0.4 mA while the I2C peripheral stays enabled next to GPIOTE only affects the revision Engineering A, which no XIAO board carries. The firmware checks the revision at start and applies the workaround only there (`TWIM_ANOMALY_89`).

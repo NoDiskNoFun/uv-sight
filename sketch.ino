@@ -186,8 +186,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "5.7";
-const uint8_t  PROTO_VERSION     = 15;
+const char*    FW_VERSION        = "5.8";
+const uint8_t  PROTO_VERSION     = 16;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -2871,6 +2871,18 @@ void rangeWarnUpdate(uint32_t now) {
     rangeOkSince = 0;
     rangeOk = false;
   }
+  rangeEventIfChanged();
+}
+
+// The app mirrors the LED's range signal (e.g. with the phone's vibration motor):
+// one event whenever the warning, its direction or the "aim fits" state changes
+bool   rangeEvWarn = false, rangeEvOk = false;
+int8_t rangeEvDir  = 0;
+void rangeEventIfChanged() {
+  if (rangeWarn == rangeEvWarn && rangeOk == rangeEvOk && (!rangeWarn || rangeWarnDir == rangeEvDir)) return;
+  rangeEvWarn = rangeWarn; rangeEvOk = rangeOk; rangeEvDir = rangeWarnDir;
+  emit(String("{\"t\":\"event\",\"e\":\"range\",\"warn\":\"") + (rangeWarn ? (rangeWarnDir < 0 ? "low" : "high") : "") +
+       "\",\"ok\":" + jbool(rangeOk) + "}");
 }
 
 // "dist <m>": distance of the running session, set by hand (0 = unknown).
@@ -2883,6 +2895,8 @@ void handleDist(String args) {
   endDistM = (uint8_t)d;
   distSrc = d ? 1 : 0;
   rangeWarn = false; rangeBadSince = rangeGoodSince = 0;
+  rangeOk = false; rangeOkSince = 0;
+  rangeEventIfChanged();
   say("Distance " + String(d) + " m.", "{\"t\":\"ack\",\"cmd\":\"dist\",\"dist\":" + String(d) + "}");
 }
 
@@ -3061,6 +3075,7 @@ void finishSession(bool manual) {
   endDistM = 0; distSrc = 0;
   rangeWarn = false; rangeBadSince = rangeGoodSince = 0;
   rangeOk = false; rangeOkSince = 0;
+  rangeEventIfChanged();
   emit(rangeJson());
 
   if (endCount == 0) {
@@ -3796,6 +3811,8 @@ void appOn() {
   sendLine(logInfoJson());
   sendLine(rangeJson());
   printSetups();
+  rangeEvWarn = false; rangeEvOk = false; rangeEvDir = 0;   // next change is reported again
+  rangeEventIfChanged();
 }
 
 // Commands that only read or write elsewhere: they leave an open score question alone
@@ -3887,7 +3904,7 @@ void handleCommand(String line) {
   else if (line.startsWith("setup "))     handleSetup(line.substring(6), raw.substring(6));
   else if (line == "range signal on" || line == "range signal off") {
     lvl.rangeSignal = line == "range signal on";
-    if (!lvl.rangeSignal) rangeWarn = false;
+    if (!lvl.rangeSignal) { rangeWarn = false; rangeOk = false; rangeEventIfChanged(); }
     if (!levelSave()) { err("ERROR while saving!"); return; }
     say(String("Range signal ") + (lvl.rangeSignal ? "on." : "off."), rangeJson());
   }

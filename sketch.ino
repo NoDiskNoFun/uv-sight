@@ -186,8 +186,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "5.9";
-const uint8_t  PROTO_VERSION     = 17;
+const char*    FW_VERSION        = "6.0";
+const uint8_t  PROTO_VERSION     = 18;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -597,12 +597,18 @@ uint8_t  pendingX          = 0;
 #define XL_12HZ_8G      0x1C    // idle: 12.5 Hz, +-8 g, low power (wake-up within 80 ms)
 #define XL_26HZ_8G      0x2C    // active without shot counter: 26 Hz, +-8 g, low power
 #define XL_416HZ_16G    0x64    // shot mode: 416 Hz, +-16 g
+#define G_416HZ_1000DPS 0x68    // CTRL2_G: gyro 416 Hz, +-1000 dps (shot matching, shot mode only)
+#define G_OFF           0x00
 #define FIFO_XL_ONLY    0x01    // FIFO_CTRL3: accelerometer, no decimation
+#define FIFO_XL_G       0x09    // FIFO_CTRL3: gyro + accelerometer, no decimation (6 words per sample)
 #define FIFO_416_CONT   0x36    // FIFO_CTRL5: 416 Hz, continuous mode
 #define FIFO_BYPASS     0x00
 #define G_PER_LSB_16G   0.000488f
-#define FIFO_KEEP_WORDS 360     // restart the FIFO beyond ~0.3 s of data
-#define FIFO_READ_MAX   1500    // never read more words than this after a shot
+#define DPS_PER_LSB_1000 0.035f
+#define FIFO_KEEP_WORDS 720     // restart the FIFO beyond ~0.3 s of data (6 words per sample with the gyro)
+#define FIFO_READ_MAX   2040    // never read more words than this after a shot (FIFO holds 2048)
+#define SHOT_WIN_SAMPLES 13     // ~30 ms before the impact: the arrow is still on the string
+#define SHOT_RING        160    // samples kept from the FIFO around a shot
 // TAP_CFG: interrupts on (0x80), HP filter (0x10), latched (0x01), tap XYZ (0x0E)
 #define TAP_CFG_MOTION  0x91
 #define TAP_CFG_SHOTS   0x9F
@@ -664,6 +670,13 @@ uint8_t  pitchHead = 0, pitchFill = 0;
 const float NO_ANGLE = 1000.0f;          // marks a shot without aiming angle
 float    endShotAng[MAX_SCORES_LINE];   // aiming angle per shot of the open end (NO_ANGLE = none)
 float    endShotCant[MAX_SCORES_LINE];  // cant per shot of the open end (NO_ANGLE = none)
+float    endShotYaw[MAX_SCORES_LINE];   // bow rotation about the vertical during the last 30 ms before impact, deg (NO_ANGLE = none)
+float    endShotRoll[MAX_SCORES_LINE];  // rotation about the arrow axis in the same window, deg
+float    endShotRate[MAX_SCORES_LINE];  // peak rotation rate in the window, deg/s
+// The last closed end, kept for "shot teach" (the app matches arrows to shots after the end closed)
+uint16_t lastEndNo = 0; uint8_t lastEndN = 0; uint8_t lastEndDist = 0;
+float    lastEndAng[MAX_SCORES_LINE], lastEndCant[MAX_SCORES_LINE], lastEndYaw[MAX_SCORES_LINE], lastEndRoll[MAX_SCORES_LINE], lastEndRate[MAX_SCORES_LINE];
+
 uint8_t  endShotN = 0;                  // shots in that list
 float    lastCant = 0, lastCantMax = 0;  // cant statistics of the end just closed (for the messages)
 uint8_t  lastCantN = 0, lastCanted = 0;
@@ -710,6 +723,36 @@ struct SetupTable {
   SetupEntry s[SETUP_MAX];
 };
 const uint32_t SETUP_MAGIC = 0x31505453;   // "STP1"
+
+// ----------------------------------------------------------------------------
+// Shot matching model, one per setup: learns from arrow/shot pairs the app confirmed
+// how the aiming angle maps to height and how the bow's rotation at release maps
+// to the sideways position. Stored in /shotmodel.bin.
+// ----------------------------------------------------------------------------
+struct ShotModel {
+  uint16_t n;              // confirmed examples
+  uint16_t pad;
+  float    spp, spa, saa;  // height: sum pred^2, pred*actual, actual^2 (cm), pred = physics
+  float    xx[6], xy[3];   // sideways: normal equations over [yaw, roll, dcant] (deg) -> dx (cm); xx upper triangle
+  float    sxx;            // sum dx^2
+};
+struct ShotModelFile {
+  uint32_t  magic;
+  uint8_t   on;            // shot matching (gyro in shot mode) enabled
+  uint8_t   pad[3];
+  ShotModel m[SETUP_MAX];
+};
+const uint32_t SHOTMODEL_MAGIC = 0x314D5348;   // "HSM1"
+const char*    SHOTMODEL_FILE  = "/shotmodel.bin";
+ShotModelFile  shotModel;
+const float SM_PRIOR_N   = 5.0f;    // weight of the prior residual spread
+const float SM_PRIOR_SDY = 4.0f;    // cm: height spread left after the angle, before learning
+const float SM_PRIOR_SDX = 15.0f;   // cm: sideways spread before learning (no prediction yet)
+const float SM_RIDGE_Y   = 50.0f;   // cm^2: pulls the height factor towards 1 (pure physics) while n is small
+const float SM_RIDGE_X   = 2.0f;    // deg^2: pulls the sideways factors towards 0 while n is small
+
+// Kinematics of one shot from the FIFO window before the impact
+struct ShotKin { bool ok; float yaw, roll, rate; };
 const char*    SETUP_FILE  = "/setups.bin";
 SetupTable setups;
 int8_t   rangeWarnDir = 0;       // -1 = aiming too low (arrow short), +1 = too high (arrow long)
@@ -1566,33 +1609,67 @@ uint16_t fifoWords() {
   return b[0] | ((b[1] & 0x0F) << 8);          // DIFF_FIFO is 12 bits
 }
 
-// Peak of the total acceleration in the FIFO, in g. Restarts the FIFO.
-float readShotPeakG(bool* clipped) {
+bool gyroWanted() { return shotModel.on && lvl.calibrated; }
+bool fifoHasGyro = false;        // layout the FIFO was started with (follows gyroWanted() in the loop)
+
+// Reads the FIFO after a shot: peak of the total acceleration in g (the impact), and with
+// the gyro on, the bow's rotation in the ~30 ms before the impact (yaw about the vertical,
+// roll about the arrow axis, peak rate). Restarts the FIFO.
+float readShotFifo(bool* clipped, ShotKin* kin) {
   *clipped = false;
+  kin->ok = false; kin->yaw = kin->roll = kin->rate = 0;
   uint8_t st[4] = {0, 0, 0, 0};
   if (imu.readRegisterRegion(st, REG_FIFO_STAT1, 4) != IMU_SUCCESS) return -1;
   uint16_t n   = st[0] | ((st[1] & 0x0F) << 8);
-  uint16_t pat = (st[2] | ((st[3] & 0x03) << 8)) % 3;   // axis of the next word: 0 x, 1 y, 2 z
+  const bool withG = fifoHasGyro;
+  const uint8_t per = withG ? 6 : 3;                        // words per sample: Gx Gy Gz Ax Ay Az, or Ax Ay Az
+  uint16_t pat = (st[2] | ((st[3] & 0x03) << 8)) % per;     // position of the next word in the pattern
   if (n > FIFO_READ_MAX) n = FIFO_READ_MAX;
 
-  int16_t v[3] = {0, 0, 0};
+  static int16_t ring[SHOT_RING][6];                        // the last samples, oldest first after unrolling
+  int16_t cur[6] = {0, 0, 0, 0, 0, 0};
   uint8_t have = 0;
-  float peak2 = 0;
+  uint16_t count = 0;                                       // complete samples seen
+  float peak2 = 0; int32_t peakAt = -1;
   for (uint16_t i = 0; i < n; i++) {
     uint8_t b[2];
     if (imu.readRegisterRegion(b, REG_FIFO_DATA, 2) != IMU_SUCCESS) break;
     const int16_t w = (int16_t)(b[0] | (b[1] << 8));
-    if (w == 32767 || w == -32768) *clipped = true;
-    v[pat] = w;
-    have |= (1 << pat);
-    if (pat == 2 && have == 0x07) {
-      const float x = v[0], y = v[1], z = v[2];
+    const uint8_t slot = withG ? pat : pat + 3;             // accel always lands in 3..5
+    if (slot >= 3 && (w == 32767 || w == -32768)) *clipped = true;
+    cur[slot] = w;
+    have |= (1 << slot);
+    if (slot == 5 && (have & 0x38) == 0x38 && (!withG || (have & 0x07) == 0x07)) {
+      memcpy(ring[count % SHOT_RING], cur, sizeof(cur));
+      const float x = cur[3], y = cur[4], z = cur[5];
       const float m2 = x * x + y * y + z * z;
-      if (m2 > peak2) peak2 = m2;
+      if (m2 > peak2) { peak2 = m2; peakAt = count; }
+      count++;
+      have = 0;
     }
-    pat = (pat + 1) % 3;
+    pat = (pat + 1) % per;
   }
   fifoRestart();
+
+  // Rotation in the window just before the impact, projected on the bow's axes
+  if (withG && peakAt > SHOT_WIN_SAMPLES && count >= (uint16_t)peakAt + 1 && (count < SHOT_RING || (int32_t)count - peakAt <= SHOT_RING - SHOT_WIN_SAMPLES - 1)) {
+    float F[3] = { lvl.L[1] * lvl.D[2] - lvl.L[2] * lvl.D[1], lvl.L[2] * lvl.D[0] - lvl.L[0] * lvl.D[2], lvl.L[0] * lvl.D[1] - lvl.L[1] * lvl.D[0] };
+    if (vnorm(F)) {
+      float rot[3] = {0, 0, 0}; float peakRate = 0;
+      const float dt = 1.0f / 416.0f;
+      for (int32_t s = peakAt - SHOT_WIN_SAMPLES; s < peakAt; s++) {
+        const int16_t* r = ring[s % SHOT_RING];
+        const float w[3] = { r[0] * DPS_PER_LSB_1000, r[1] * DPS_PER_LSB_1000, r[2] * DPS_PER_LSB_1000 };
+        for (uint8_t k = 0; k < 3; k++) rot[k] += w[k] * dt;
+        const float m = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        if (m > peakRate) peakRate = m;
+      }
+      kin->yaw  = vdot(rot, lvl.D);    // about the vertical: the sideways swing of the bow
+      kin->roll = vdot(rot, F);        // about the arrow: torque / cant change at release
+      kin->rate = peakRate;
+      kin->ok   = true;
+    }
+  }
   return sqrtf(peak2) * G_PER_LSB_16G;
 }
 
@@ -1719,9 +1796,15 @@ void imuSetFast(bool fast) {
   if (fast) {
     imu.writeRegister(REG_CTRL6_C,  0x00);                // high performance
     imu.writeRegister(REG_CTRL1_XL, XL_416HZ_16G);
+    fifoHasGyro = gyroWanted();
+    imu.writeRegister(REG_CTRL2_G,  fifoHasGyro ? G_416HZ_1000DPS : G_OFF);
+    imu.writeRegister(REG_FIFO_CTRL3, fifoHasGyro ? FIFO_XL_G : FIFO_XL_ONLY);
     imu.writeRegister(REG_TAP_CFG,  TAP_CFG_SHOTS);
   } else {
     imu.writeRegister(REG_FIFO_CTRL5, FIFO_BYPASS);
+    imu.writeRegister(REG_CTRL2_G,  G_OFF);               // gyro only in shot mode
+    imu.writeRegister(REG_FIFO_CTRL3, FIFO_XL_ONLY);
+    fifoHasGyro = false;
     imu.writeRegister(REG_TAP_CFG,  TAP_CFG_MOTION);
     imu.writeRegister(REG_CTRL1_XL, XL_26HZ_8G);
     imu.writeRegister(REG_CTRL6_C,  0x10);
@@ -2546,7 +2629,7 @@ String shotGText() {
   return lastShotClip ? String(">= 16 g") : String(lastShotG, 1) + " g";
 }
 
-void registerShot(uint32_t now, float g, bool clipped) {
+void registerShot(uint32_t now, float g, bool clipped, const ShotKin& kin) {
   if (!shotAllowed(now)) return;   // ignore vibration
   lastShotMs   = now;
   lastShotG    = g;
@@ -2565,6 +2648,9 @@ void registerShot(uint32_t now, float g, bool clipped) {
   if (endShotN < MAX_SCORES_LINE) {
     endShotAng[endShotN]  = hasAng ? ang : NO_ANGLE;
     endShotCant[endShotN] = hasCant ? cant : NO_ANGLE;
+    endShotYaw[endShotN]  = kin.ok ? kin.yaw : NO_ANGLE;
+    endShotRoll[endShotN] = kin.ok ? kin.roll : NO_ANGLE;
+    endShotRate[endShotN] = kin.ok ? kin.rate : NO_ANGLE;
     endShotN++;
   }
   say("Shot detected (end " + String(endCount + 1) + ": " + String(endShots) + ")" +
@@ -2574,7 +2660,9 @@ void registerShot(uint32_t now, float g, bool clipped) {
       ",\"total\":" + String(shotCount) +
       ",\"g\":" + (g >= 0 ? String(g, 1) : String("null")) + ",\"clip\":" + jbool(clipped) +
       ",\"ang\":" + (hasAng ? String(ang, 2) : String("null")) +
-      ",\"cant\":" + (hasCant ? String(cant, 1) : String("null")) + "}");
+      ",\"cant\":" + (hasCant ? String(cant, 1) : String("null")) +
+      ",\"yaw\":" + (kin.ok ? String(kin.yaw, 2) : String("null")) +
+      ",\"roll\":" + (kin.ok ? String(kin.roll, 2) : String("null")) + "}");
 }
 
 // ============================================================================
@@ -2943,9 +3031,18 @@ bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t
   e.cantC = cn ? (int16_t)lroundf(cs / cn * 100) : 0;
   e.cantMaxC = (uint16_t)lroundf(cmax * 100);
   lastCant = cn ? cs / cn : 0; lastCantMax = cmax; lastCantN = cn; lastCanted = canted;
+  // the shots of this end, kept for "shot list"/"shot teach" of the app
+  lastEndNo = endCount; lastEndN = take; lastEndDist = endDistM;
+  for (uint8_t k = 0; k < take; k++) {
+    lastEndAng[k] = endShotAng[k]; lastEndCant[k] = endShotCant[k];
+    lastEndYaw[k] = endShotYaw[k]; lastEndRoll[k] = endShotRoll[k]; lastEndRate[k] = endShotRate[k];
+  }
   for (uint8_t k = take; k < endShotN; k++) {                                        // keep the rest
     endShotAng[k - take]  = endShotAng[k];
     endShotCant[k - take] = endShotCant[k];
+    endShotYaw[k - take]  = endShotYaw[k];
+    endShotRoll[k - take] = endShotRoll[k];
+    endShotRate[k - take] = endShotRate[k];
   }
   endShotN -= take;
   angNOut = an;
@@ -3008,7 +3105,8 @@ void closeEndValid(const uint8_t* vals, uint8_t n, uint8_t xn, uint8_t keepShots
       " scored, avg " + fmtAvg(scoreSum, scoreCount) + ", " + String(xCount) + " X",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":true,\"arrows\":" + String(n) +
       ",\"sum\":" + String(sum) + ",\"x\":" + String(xn) + ",\"avg\":" + fmtAvg(sum, n) +
-      endAngleJson(ang, sd, angN) + endCantJson() + ",\"stored\":" + jbool(stored) + "}");
+      endAngleJson(ang, sd, angN) + endCantJson() + shotsJson(lastEndAng, lastEndCant, lastEndYaw, lastEndRoll, lastEndRate, lastEndN, lastEndDist) +
+      ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
 }
 
@@ -3463,6 +3561,7 @@ void printHelp() {
   out("range             learned distances, arrow speed; range signal on|off");
   out("setup [use|new|name|del] arrow/bow setups (each learns its own speed)");
   out("name [text|-]      name this sight (shown in the app, added to the BLE name); - removes it");
+  out("shot list|model|reset|on|off  shot matching: shots of the open end with predictions, model state, reset, switch");
   out("level signal on|off  blink when canted (measuring continues)");
   out("log del <e> <id>  delete one session on the sight");
   out("log clear         delete all sessions on the sight (asks first)");
@@ -3861,6 +3960,185 @@ void handleName(String raw) {
   say(sightName[0] ? "Sight name: " + String(sightName) : "Name removed.", nameAck());
 }
 
+// ============================================================================
+// Shot matching: predictions per shot and learning from confirmed pairs
+// ============================================================================
+bool shotModelSave() {
+  InternalFS.remove(SHOTMODEL_FILE);
+  File f(InternalFS);
+  if (!f.open(SHOTMODEL_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)&shotModel, sizeof(shotModel));
+  f.close();
+  return true;
+}
+
+void shotModelLoad() {
+  memset(&shotModel, 0, sizeof(shotModel));
+  File f(InternalFS);
+  if (f.open(SHOTMODEL_FILE, FILE_O_READ)) {
+    ShotModelFile tmp;
+    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == SHOTMODEL_MAGIC) shotModel = tmp;
+    f.close();
+  }
+  if (shotModel.magic != SHOTMODEL_MAGIC) { memset(&shotModel, 0, sizeof(shotModel)); shotModel.magic = SHOTMODEL_MAGIC; shotModel.on = 1; }
+}
+
+// Solve the 3x3 ridge system (xx + ridge*I) k = xy for the sideways factors
+void shotModelKx(const ShotModel& m, float k[3]) {
+  float a[3][3] = { { m.xx[0] + SM_RIDGE_X, m.xx[1], m.xx[2] }, { m.xx[1], m.xx[3] + SM_RIDGE_X, m.xx[4] }, { m.xx[2], m.xx[4], m.xx[5] + SM_RIDGE_X } };
+  float b[3] = { m.xy[0], m.xy[1], m.xy[2] };
+  for (uint8_t c = 0; c < 3; c++) {
+    uint8_t piv = c;
+    for (uint8_t r = c + 1; r < 3; r++) if (fabsf(a[r][c]) > fabsf(a[piv][c])) piv = r;
+    if (fabsf(a[piv][c]) < 1e-9f) { k[0] = k[1] = k[2] = 0; return; }
+    if (piv != c) { for (uint8_t j = 0; j < 3; j++) { const float tmp = a[c][j]; a[c][j] = a[piv][j]; a[piv][j] = tmp; } const float tb = b[c]; b[c] = b[piv]; b[piv] = tb; }
+    for (uint8_t r = 0; r < 3; r++) {
+      if (r == c) continue;
+      const float f = a[r][c] / a[c][c];
+      for (uint8_t j = c; j < 3; j++) a[r][j] -= f * a[c][j];
+      b[r] -= f * b[c];
+    }
+  }
+  for (uint8_t i = 0; i < 3; i++) k[i] = b[i] / a[i][i];
+}
+
+float shotModelKy(const ShotModel& m) { return (m.spa + SM_RIDGE_Y) / (m.spp + SM_RIDGE_Y); }
+
+// Residual spreads (cm) with the prior blended in while few examples exist
+float shotModelSdy(const ShotModel& m) {
+  const float ky = shotModelKy(m);
+  float rss = m.saa - 2 * ky * m.spa + ky * ky * m.spp;
+  if (rss < 0) rss = 0;
+  return sqrtf((SM_PRIOR_N * SM_PRIOR_SDY * SM_PRIOR_SDY + rss) / (SM_PRIOR_N + m.n));
+}
+float shotModelSdx(const ShotModel& m) {
+  float k[3]; shotModelKx(m, k);
+  // rss = sum dx^2 - 2 k.xy + k^T xx k
+  const float kxxk = k[0] * (m.xx[0] * k[0] + m.xx[1] * k[1] + m.xx[2] * k[2]) + k[1] * (m.xx[1] * k[0] + m.xx[3] * k[1] + m.xx[4] * k[2]) + k[2] * (m.xx[2] * k[0] + m.xx[4] * k[1] + m.xx[5] * k[2]);
+  float rss = m.sxx - 2 * (k[0] * m.xy[0] + k[1] * m.xy[1] + k[2] * m.xy[2]) + kxxk;
+  if (rss < 0) rss = 0;
+  return sqrtf((SM_PRIOR_N * SM_PRIOR_SDX * SM_PRIOR_SDX + rss) / (SM_PRIOR_N + m.n));
+}
+
+// Height prediction from physics: how far the arrow lands above the end's mean, in cm
+float shotPredY(float dAngDeg, uint8_t distM) {
+  const float d = distM ? distM : 18;
+  return tanf(dAngDeg * 0.01745329f) * d * 100.0f;
+}
+
+// Means of the shots that have a value
+static void shotMeans(const float* ang, const float* cant, uint8_t n, float& angMean, float& cantMean) {
+  float as = 0, cs = 0; uint8_t an = 0, cn = 0;
+  for (uint8_t k = 0; k < n; k++) {
+    if (ang[k] < NO_ANGLE) { as += ang[k]; an++; }
+    if (cant[k] < NO_ANGLE) { cs += cant[k]; cn++; }
+  }
+  angMean = an ? as / an : 0; cantMean = cn ? cs / cn : 0;
+}
+
+// ,"shots":[{...}] with the measured values and the model's predictions (cm from the end's mean)
+String shotsJson(const float* ang, const float* cant, const float* yaw, const float* roll, const float* rate, uint8_t n, uint8_t distM) {
+  const ShotModel& m = shotModel.m[setups.active];
+  float kx[3]; shotModelKx(m, kx);
+  const float ky = shotModelKy(m);
+  float angMean, cantMean; shotMeans(ang, cant, n, angMean, cantMean);
+  String j = ",\"sdx\":" + String(shotModelSdx(m), 1) + ",\"sdy\":" + String(shotModelSdy(m), 1) + ",\"modelN\":" + String(m.n) +
+             ",\"matching\":" + jbool(shotModel.on) + ",\"shots\":[";
+  for (uint8_t k = 0; k < n; k++) {
+    if (k) j += ",";
+    const bool hasAng = ang[k] < NO_ANGLE, hasCant = cant[k] < NO_ANGLE, hasKin = yaw[k] < NO_ANGLE;
+    j += "{\"i\":" + String(k) +
+         ",\"ang\":"  + (hasAng ? String(ang[k], 2) : String("null")) +
+         ",\"cant\":" + (hasCant ? String(cant[k], 1) : String("null")) +
+         ",\"yaw\":"  + (hasKin ? String(yaw[k], 2) : String("null")) +
+         ",\"roll\":" + (hasKin ? String(roll[k], 2) : String("null")) +
+         ",\"rate\":" + (hasKin ? String(rate[k], 0) : String("null"));
+    if (hasAng) j += ",\"py\":" + String(ky * shotPredY(ang[k] - angMean, distM), 1);
+    if (hasKin && m.n > 0) {
+      const float dc = hasCant ? cant[k] - cantMean : 0;
+      j += ",\"px\":" + String(kx[0] * yaw[k] + kx[1] * roll[k] + kx[2] * dc, 1);
+    } else if (hasKin) j += ",\"px\":0";
+    j += "}";
+  }
+  return j + "]";
+}
+
+String shotModelJson() {
+  const ShotModel& m = shotModel.m[setups.active];
+  float kx[3]; shotModelKx(m, kx);
+  return "{\"t\":\"shotModel\",\"setup\":" + String(setups.active) + ",\"on\":" + jbool(shotModel.on) + ",\"n\":" + String(m.n) +
+         ",\"ky\":" + String(shotModelKy(m), 3) + ",\"sdy\":" + String(shotModelSdy(m), 1) +
+         ",\"kx\":[" + String(kx[0], 3) + "," + String(kx[1], 3) + "," + String(kx[2], 3) + "],\"sdx\":" + String(shotModelSdx(m), 1) + "}";
+}
+
+// shot teach <end> <i>:<dx mm>:<dy mm> ...   (positions relative to the group's mean, from the photo)
+void shotTeach(String args) {
+  args.trim();
+  const int sp = args.indexOf(' ');
+  if (sp < 0) { err("Format: shot teach <end> <i>:<dx>:<dy> ..."); return; }
+  const int endNo = args.substring(0, sp).toInt();
+  if (endNo != (int)lastEndNo || lastEndN == 0) { err("shot teach: not the last end (" + String(lastEndNo) + ")"); return; }
+  ShotModel& m = shotModel.m[setups.active];
+  float angMean, cantMean; shotMeans(lastEndAng, lastEndCant, lastEndN, angMean, cantMean);
+  uint8_t added = 0;
+  String rest = args.substring(sp + 1);
+  while (rest.length()) {
+    rest.trim();
+    int e = rest.indexOf(' '); if (e < 0) e = rest.length();
+    const String tok = rest.substring(0, e); rest = rest.substring(e);
+    const int c1 = tok.indexOf(':'), c2 = c1 < 0 ? -1 : tok.indexOf(':', c1 + 1);
+    if (c1 < 0 || c2 < 0) continue;
+    const int i = tok.substring(0, c1).toInt();
+    const float dx = tok.substring(c1 + 1, c2).toFloat() / 10.0f, dy = tok.substring(c2 + 1).toFloat() / 10.0f;   // mm -> cm
+    if (i < 0 || i >= lastEndN) continue;
+    if (lastEndAng[i] < NO_ANGLE) {
+      const float pred = shotPredY(lastEndAng[i] - angMean, lastEndDist);
+      m.spp += pred * pred; m.spa += pred * dy; m.saa += dy * dy;
+    }
+    if (lastEndYaw[i] < NO_ANGLE) {
+      const float f[3] = { lastEndYaw[i], lastEndRoll[i], lastEndCant[i] < NO_ANGLE ? lastEndCant[i] - cantMean : 0 };
+      m.xx[0] += f[0] * f[0]; m.xx[1] += f[0] * f[1]; m.xx[2] += f[0] * f[2];
+      m.xx[3] += f[1] * f[1]; m.xx[4] += f[1] * f[2]; m.xx[5] += f[2] * f[2];
+      for (uint8_t k = 0; k < 3; k++) m.xy[k] += f[k] * dx;
+      m.sxx += dx * dx;
+    }
+    added++;
+  }
+  if (added) { m.n += added; if (!shotModelSave()) { err("ERROR while saving!"); return; } }
+  say("Shot model: " + String(added) + " examples added, " + String(m.n) + " in total.",
+      "{\"t\":\"ack\",\"cmd\":\"shot\",\"what\":\"teach\",\"added\":" + String(added) + ",\"n\":" + String(m.n) + "}");
+  emit(shotModelJson());
+}
+
+// shot list [dist] | shot teach ... | shot model | shot reset [id] | shot on | shot off
+void handleShot(String args) {
+  args.trim();
+  if (args.startsWith("list")) {
+    const int d = args.substring(4).toInt();
+    const uint8_t dist = d > 0 && d <= 150 ? (uint8_t)d : endDistM;
+    sendLine("{\"t\":\"shots\",\"end\":" + String(endCount + 1) + ",\"n\":" + String(endShotN) + ",\"dist\":" + String(dist) +
+             shotsJson(endShotAng, endShotCant, endShotYaw, endShotRoll, endShotRate, endShotN, dist) + "}");
+  } else if (args.startsWith("teach")) {
+    shotTeach(args.substring(5));
+  } else if (args == "model") {
+    say("Shot model (setup " + setupName(setups.active) + "): " + String(shotModel.m[setups.active].n) + " examples, height +-" +
+        String(shotModelSdy(shotModel.m[setups.active]), 1) + " cm, sideways +-" + String(shotModelSdx(shotModel.m[setups.active]), 1) + " cm", shotModelJson());
+  } else if (args.startsWith("reset")) {
+    int id = args.substring(5).toInt();
+    if (args.substring(5).length() == 0 || args.substring(5) == " ") id = setups.active;
+    if (id < 0 || id >= SETUP_MAX) { err("shot reset: setup 0.." + String(SETUP_MAX - 1)); return; }
+    memset(&shotModel.m[id], 0, sizeof(ShotModel));
+    if (!shotModelSave()) { err("ERROR while saving!"); return; }
+    say("Shot model of setup " + setupName(id) + " reset.", "{\"t\":\"ack\",\"cmd\":\"shot\",\"what\":\"reset\",\"setup\":" + String(id) + "}");
+    emit(shotModelJson());
+  } else if (args == "on" || args == "off") {
+    shotModel.on = args == "on";
+    if (!shotModelSave()) { err("ERROR while saving!"); return; }
+    // the loop re-applies the FIFO layout when gyroWanted() changed
+    say(String("Shot matching ") + (shotModel.on ? "on." : "off."), shotModelJson());
+  } else err("Possible: shot list [m], shot teach <end> <i>:<dx>:<dy> ..., shot model, shot reset [id], shot on|off");
+}
+
 void appOn() {
   appMode = true;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
@@ -3872,6 +4150,7 @@ void appOn() {
   sendLine(levelJson());
   sendLine(logInfoJson());
   sendLine(rangeJson());
+  sendLine(shotModelJson());
   printSetups();
   rangeEvWarn = false; rangeEvOk = false; rangeEvDir = 0;   // next change is reported again
   rangeEventIfChanged();
@@ -3880,7 +4159,7 @@ void appOn() {
 // Commands that only read or write elsewhere: they leave an open score question alone
 bool keepsPendingScore(const String& l) {
   return l == "status" || l == "?" || l == "get" || l == "config" || l == "help" || l == "h" ||
-         l == "shots" || l == "level" || l == "bat" || l == "range" || l == "setup" || l == "angle" || l == "name" || l.startsWith("name ") ||
+         l == "shots" || l == "level" || l == "bat" || l == "range" || l == "setup" || l == "angle" || l == "name" || l.startsWith("name ") || l.startsWith("shot ") ||
          l == "log" || l == "log all" || l == "log info" || l.startsWith("log since ") ||
          l.startsWith("log ends ") || l.startsWith("log put ") || l.startsWith("log putend ") ||
          l.startsWith("time ") || l.startsWith("awake ") ||
@@ -3962,6 +4241,7 @@ void handleCommand(String line) {
   else if (line.startsWith("log putend ")) logPutEnd(line.substring(11));
   else if (line.startsWith("log ends "))  printEnds(line.substring(9));
   else if (line == "range")               printRange();
+  else if (line.startsWith("shot "))      handleShot(line.substring(5));
   else if (line == "name")                handleName("");
   else if (line.startsWith("name "))      handleName(raw.substring(5));
   else if (line == "setup")               handleSetup("", "");
@@ -4154,6 +4434,7 @@ void setup() {
   // logInit() runs after bleInit(): the random epoch needs the SoftDevice
   levelLoad();
   sightNameLoad();
+  shotModelLoad();
 
   imuOk = imuInit();
   bleInit();
@@ -4207,12 +4488,13 @@ void loop() {
   }
   if (imuTapSinceLastCheck()) shot = true;
   if (!edge) shotAt = now;                   // tap found by polling only
+  if (imuFast && !shot && fifoHasGyro != gyroWanted()) { imuFast = false; imuSetFast(true); }   // calibration or "shot on|off" changed the layout
   if (shot) {
     lastMotionMs = now;
     if (shotAllowed(shotAt)) {
-      bool clip = false;
-      const float g = readShotPeakG(&clip);   // strength from the FIFO
-      registerShot(shotAt, g, clip);
+      bool clip = false; ShotKin kin;
+      const float g = readShotFifo(&clip, &kin);   // strength and bow rotation from the FIFO
+      registerShot(shotAt, g, clip, kin);
     }
   } else if (imuFast && fifoWords() > FIFO_KEEP_WORDS) {
     fifoRestart();                            // keep only the recent data

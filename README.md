@@ -203,6 +203,7 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 | `/level.bin` | internal | Cant indicator mode, calibration, LED switch, signals | Automatically |
 | `/setups.bin` | internal | Arrow/bow setups | Automatically |
 | `/sightname.txt` | internal | Name of this sight (`name <text>`) | Automatically |
+| `/shotmodel.bin` | internal | Shot matching model per setup and its on/off switch | Automatically |
 | `/bathist.bin` | internal | Battery history for the runtime estimate | Automatically |
 | session log | external 2 MB QSPI flash | Sessions and ends as 64-byte records with CRC, ring buffer | Automatically |
 | `/shots.old` | internal | Backup of the log format of firmware 1.2 to 2.1 after the migration | Once |
@@ -273,6 +274,10 @@ Each step waits 3 s, then measures for about 0.6 s. If the two positions differ 
 
 ---
 
+## Shot matching
+
+With the shot counter running, the sight also records how the bow moved at each release and tells the app, per shot, where it expects the arrow relative to the end's mean: the height from the aiming angle, the sideways position from the bow's rotation in the last 30 ms before the impact (gyroscope, read from the IMU FIFO, shot mode only). The app matches these predictions to the arrow positions it sees on the photo and reports the sure pairs back (`shot teach`). From them, each setup learns its own factors and the remaining spread, so the predictions and the app's confidence improve with every end. Everything is stored per setup in `/shotmodel.bin`; `shot model` shows the state, `shot reset` starts over, `shot off` turns matching and the gyro off. The gyro adds about 0.5 mA while the bow is active.
+
 ## Battery and charging
 
 | Item | Value |
@@ -339,6 +344,9 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `awake <s>` | Stay reachable without movement, max 900 s | No |
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
 | `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "UV-Sight" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
+| `shot list [m]` | Shots of the open end with angle, cant, bow rotation at release and the model's predicted position (for the app's shot matching) | – |
+| `shot teach <end> <i>:<dx>:<dy> …` | Confirmed arrow positions (mm from the group's mean) for shots of the last closed end: the model learns from them | Yes |
+| `shot model`, `shot reset [id]`, `shot on`/`shot off` | Shot matching model of the active setup: state, reset, switch (off also turns the gyro off) | Yes |
 | `dfu` | Reboot into update mode (USB needed) | – |
 
 Range is about 10 m at the default `tx_power` of 0 dBm; +8 dBm roughly doubles it. A cheap USB adapter without antenna, a metal PC case or a nearby USB 3 port can reduce the range a lot. Anyone within range can connect; there is no PIN.

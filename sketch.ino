@@ -186,11 +186,13 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "5.8";
-const uint8_t  PROTO_VERSION     = 16;
+const char*    FW_VERSION        = "5.9";
+const uint8_t  PROTO_VERSION     = 17;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
+const char*    NAME_FILE         = "/sightname.txt";   // the name the owner gave this sight ("name <text>")
+char           sightName[20]     = "";                 // shown in the app and appended to the BLE name
 const uint16_t ADV_FAST_INTERVAL = 160;   // 100 ms (unit 0.625 ms), first 10 s
 const uint16_t ADV_SLOW_INTERVAL = 1636;  // ~1 s afterwards
 const uint16_t ADV_FAST_TIMEOUT  = 10;    // s
@@ -3460,6 +3462,7 @@ void printHelp() {
   out("dist <m>          distance of the session (0 = unknown); keeps an open question");
   out("range             learned distances, arrow speed; range signal on|off");
   out("setup [use|new|name|del] arrow/bow setups (each learns its own speed)");
+  out("name [text|-]      name this sight (shown in the app, added to the BLE name); - removes it");
   out("level signal on|off  blink when canted (measuring continues)");
   out("log del <e> <id>  delete one session on the sight");
   out("log clear         delete all sessions on the sight (asks first)");
@@ -3799,11 +3802,70 @@ void setClock(String args) {
   say("Clock set: " + fmtUnix(t), "{\"t\":\"ack\",\"cmd\":\"time\"}");
 }
 
+// ============================================================================
+// Sight identity: a fixed id from the chip and a name the owner can set, so the
+// app can tell two sights apart (sessions, sync, preferences per sight)
+// ============================================================================
+String deviceIdHex() {
+  char b[17];
+  snprintf(b, sizeof(b), "%08lX%08lX", (unsigned long)NRF_FICR->DEVICEID[1], (unsigned long)NRF_FICR->DEVICEID[0]);
+  return String(b);
+}
+
+String bleNameFull() { return sightName[0] ? String(BLE_NAME) + " " + sightName : String(BLE_NAME); }
+
+void sightNameLoad() {
+  memset(sightName, 0, sizeof(sightName));
+  File f(InternalFS);
+  if (f.open(NAME_FILE, FILE_O_READ)) {
+    int n = f.read(sightName, sizeof(sightName) - 1);
+    if (n < 0) n = 0;
+    sightName[n] = 0;
+    f.close();
+  }
+}
+
+bool sightNameSave() {
+  InternalFS.remove(NAME_FILE);
+  if (!sightName[0]) return true;
+  File f(InternalFS);
+  if (!f.open(NAME_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)sightName, strlen(sightName));
+  f.close();
+  return true;
+}
+
+String nameAck() { return "{\"t\":\"ack\",\"cmd\":\"name\",\"name\":" + jstr(String(sightName)) + ",\"id\":\"" + deviceIdHex() + "\"}"; }
+
+// name | name <text> | name -   (raw keeps the case)
+void handleName(String raw) {
+  raw.trim();
+  if (raw.length() == 0) {
+    say(sightName[0] ? "Sight name: " + String(sightName) + " (id " + deviceIdHex() + ")" : "No name set (name <text>), id " + deviceIdHex(), nameAck());
+    return;
+  }
+  String clean;
+  if (raw != "-") {
+    for (unsigned int i = 0; i < raw.length(); i++) {
+      const char c = raw[i];
+      if ((uint8_t)c < 0x20 || c == '"' || c == '\\') continue;
+      clean += c;
+    }
+  }
+  uint8_t len = clean.length() > 16 ? 16 : clean.length();
+  while (len > 0 && len < clean.length() && ((uint8_t)clean[len] & 0xC0) == 0x80) len--;   // keep UTF-8 whole
+  memset(sightName, 0, sizeof(sightName));
+  memcpy(sightName, clean.c_str(), len);
+  if (!sightNameSave()) { err("ERROR while saving!"); return; }
+  Bluefruit.setName(bleNameFull().c_str());        // advertised from the next wake-up on
+  say(sightName[0] ? "Sight name: " + String(sightName) : "Name removed.", nameAck());
+}
+
 void appOn() {
   appMode = true;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
            "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) +
-           ",\"twim89\":" + jbool(twimWorkaround) + "}");
+           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + "}");
   sendCfg();
   sendLine(statusJson());
   sendLine(sessionJson());
@@ -3818,7 +3880,7 @@ void appOn() {
 // Commands that only read or write elsewhere: they leave an open score question alone
 bool keepsPendingScore(const String& l) {
   return l == "status" || l == "?" || l == "get" || l == "config" || l == "help" || l == "h" ||
-         l == "shots" || l == "level" || l == "bat" || l == "range" || l == "setup" || l == "angle" ||
+         l == "shots" || l == "level" || l == "bat" || l == "range" || l == "setup" || l == "angle" || l == "name" || l.startsWith("name ") ||
          l == "log" || l == "log all" || l == "log info" || l.startsWith("log since ") ||
          l.startsWith("log ends ") || l.startsWith("log put ") || l.startsWith("log putend ") ||
          l.startsWith("time ") || l.startsWith("awake ") ||
@@ -3900,6 +3962,8 @@ void handleCommand(String line) {
   else if (line.startsWith("log putend ")) logPutEnd(line.substring(11));
   else if (line.startsWith("log ends "))  printEnds(line.substring(9));
   else if (line == "range")               printRange();
+  else if (line == "name")                handleName("");
+  else if (line.startsWith("name "))      handleName(raw.substring(5));
   else if (line == "setup")               handleSetup("", "");
   else if (line.startsWith("setup "))     handleSetup(line.substring(6), raw.substring(6));
   else if (line == "range signal on" || line == "range signal off") {
@@ -3954,7 +4018,7 @@ void bleInit() {
   Bluefruit.begin();
   cfg.txPower = snapTxPower(cfg.txPower);
   Bluefruit.setTxPower(cfg.txPower);
-  Bluefruit.setName(BLE_NAME);
+  Bluefruit.setName(bleNameFull().c_str());
   Bluefruit.Periph.setConnInterval(CONN_INT_MIN, CONN_INT_MAX);
   Bluefruit.Periph.setConnectCallback(onConnect);
   Bluefruit.Periph.setDisconnectCallback(onDisconnect);
@@ -4089,6 +4153,7 @@ void setup() {
   cfgLoad();
   // logInit() runs after bleInit(): the random epoch needs the SoftDevice
   levelLoad();
+  sightNameLoad();
 
   imuOk = imuInit();
   bleInit();

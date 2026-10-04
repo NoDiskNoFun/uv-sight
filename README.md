@@ -344,7 +344,8 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `awake <s>` | Stay reachable without movement, max 900 s | No |
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
 | `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "UV-Sight" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
-| `shot list [m]` | Shots of the open end with angle, cant, bow rotation at release and the model's predicted position (for the app's shot matching) | – |
+| `shot list [m]` | Shots of the open end: time, aiming angle, hold spread and duration, sinking before release, cant, bow rotation at release and the model's predicted position (for the app's shot matching and hints) | – |
+| `shot trace [last] <i>` | Aim trace of one shot: angle and cant over the 1.9 s before the release | – |
 | `shot teach <end> <i>:<dx>:<dy> …` | Confirmed arrow positions (mm from the group's mean) for shots of the last closed end: the model learns from them | Yes |
 | `shot model`, `shot reset [id]`, `shot on`/`shot off` | Shot matching model of the active setup: state, reset, switch (off also turns the gyro off) | Yes |
 | `dfu` | Reboot into update mode (USB needed) | – |

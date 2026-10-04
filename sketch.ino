@@ -149,6 +149,14 @@ using namespace Adafruit_LittleFS_Namespace;
 
 // Pins (Arduino pin n = XIAO Dn)
 const uint8_t PIN_UV      = 6;    // D6 -> 2.2k -> base of BC547
+// UV LED stage present? 0 = no (hunting bow without a sight: no LED, no light sensor), 1 = yes,
+// 2 = find out at boot: with the BC547 and its base resistor fitted, a pin charged HIGH and then
+// released falls to the base-emitter voltage within microseconds; without them it stays HIGH.
+// Without the LED stage all light settings default to off and the app hides them.
+#ifndef UV_HAS_LED
+#define UV_HAS_LED 2
+#endif
+bool ledPresent = true;
 const uint8_t PIN_LDR_PWR = 2;    // D2 powers the LDR only during a measurement
 const uint8_t PIN_LDR     = A0;   // midpoint LDR / 10k
 
@@ -186,8 +194,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "6.0";
-const uint8_t  PROTO_VERSION     = 18;
+const char*    FW_VERSION        = "6.2";
+const uint8_t  PROTO_VERSION     = 20;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -673,9 +681,21 @@ float    endShotCant[MAX_SCORES_LINE];  // cant per shot of the open end (NO_ANG
 float    endShotYaw[MAX_SCORES_LINE];   // bow rotation about the vertical during the last 30 ms before impact, deg (NO_ANGLE = none)
 float    endShotRoll[MAX_SCORES_LINE];  // rotation about the arrow axis in the same window, deg
 float    endShotRate[MAX_SCORES_LINE];  // peak rotation rate in the window, deg/s
+uint32_t endShotMs[MAX_SCORES_LINE];    // time of each shot (rhythm of the end)
+float    endShotHold[MAX_SCORES_LINE];  // spread of the aiming angle while holding, deg (NO_ANGLE = none)
+uint16_t endShotHoldMs[MAX_SCORES_LINE];// how long the aim stayed within HOLD_TOL_DEG before the release, ms
+float    endShotDrop[MAX_SCORES_LINE];  // aiming angle in the last 150..400 ms minus the hold mean, deg (sinking = negative)
+// Aim trace per shot: the angle history of the ~1.9 s before the release, for the app's shot trace view
+const uint8_t TRACE_SAMPLES = 64;
+const uint16_t TRACE_SPAN_MS = 1900;
+const float HOLD_TOL_DEG = 0.6f;
+struct ShotTrace { uint8_t n; uint16_t ms[TRACE_SAMPLES]; int16_t pitch[TRACE_SAMPLES]; int16_t cant[TRACE_SAMPLES]; };
+ShotTrace endTrace[MAX_SCORES_LINE];
+ShotTrace lastEndTrace[MAX_SCORES_LINE];
 // The last closed end, kept for "shot teach" (the app matches arrows to shots after the end closed)
 uint16_t lastEndNo = 0; uint8_t lastEndN = 0; uint8_t lastEndDist = 0;
 float    lastEndAng[MAX_SCORES_LINE], lastEndCant[MAX_SCORES_LINE], lastEndYaw[MAX_SCORES_LINE], lastEndRoll[MAX_SCORES_LINE], lastEndRate[MAX_SCORES_LINE];
+uint32_t lastEndMs[MAX_SCORES_LINE]; float lastEndHold[MAX_SCORES_LINE]; uint16_t lastEndHoldMs[MAX_SCORES_LINE]; float lastEndDrop[MAX_SCORES_LINE];
 
 uint8_t  endShotN = 0;                  // shots in that list
 float    lastCant = 0, lastCantMax = 0;  // cant statistics of the end just closed (for the messages)
@@ -1570,6 +1590,7 @@ void levelLoad() {
     }
     f.close();
   }
+  if (!ledPresent) { lvl.cantSignal = 0; lvl.rangeSignal = 0; lvl.ledMode = MODE_OFF; }   // nothing to light up
 }
 
 bool levelSave() {
@@ -2291,6 +2312,39 @@ bool aimingMean(const float* buf, uint32_t shotMs, float& mean, float& sd) {
   return true;
 }
 
+// Details of the aim before a shot from the angle history: how long the aim stayed within
+// HOLD_TOL_DEG of its mean (holdMs), whether it sank in the last 150..400 ms (drop, deg),
+// and the trace itself (newest sample last) for the app.
+void aimDetail(uint32_t shotMs, bool hasMean, float mean, uint16_t& holdMs, float& drop, bool& hasDrop, ShotTrace& tr) {
+  holdMs = 0; drop = 0; hasDrop = false; tr.n = 0;
+  float lateS = 0; uint8_t lateN = 0; float holdS = 0; uint8_t holdN = 0;
+  uint32_t lastGood = 0; bool broken = false;
+  // newest first
+  for (uint8_t k = 0; k < pitchFill; k++) {
+    const uint8_t i = (pitchHead + PITCH_SAMPLES - 1 - k) % PITCH_SAMPLES;
+    const int32_t before = (int32_t)(shotMs - pitchMs[i]);
+    if (before < 0) continue;
+    if (before <= (int32_t)TRACE_SPAN_MS && tr.n < TRACE_SAMPLES) {
+      const uint8_t j = tr.n++;
+      tr.ms[j] = (uint16_t)before;
+      tr.pitch[j] = (int16_t)lroundf(pitchBuf[i] * 100); tr.cant[j] = (int16_t)lroundf(cantBuf[i] * 100);
+    }
+    if (before >= 150 && before < 400) { lateS += pitchBuf[i]; lateN++; }
+    if (before >= 400 && before <= (int32_t)PITCH_FROM_MS) { holdS += pitchBuf[i]; holdN++; }
+    if (hasMean && before >= (int32_t)PITCH_TO_MS && !broken) {
+      if (fabsf(pitchBuf[i] - mean) <= HOLD_TOL_DEG) lastGood = (uint32_t)before; else if (lastGood) broken = true;
+    }
+  }
+  if (lastGood > PITCH_TO_MS) holdMs = (uint16_t)(lastGood - PITCH_TO_MS);
+  if (lateN >= 3 && holdN >= 5) { drop = lateS / lateN - holdS / holdN; hasDrop = true; }
+  // oldest first for the app
+  for (uint8_t a = 0, b = tr.n ? tr.n - 1 : 0; a < b; a++, b--) {
+    uint16_t tm = tr.ms[a]; tr.ms[a] = tr.ms[b]; tr.ms[b] = tm;
+    int16_t tp = tr.pitch[a]; tr.pitch[a] = tr.pitch[b]; tr.pitch[b] = tp;
+    int16_t tc = tr.cant[a]; tr.cant[a] = tr.cant[b]; tr.cant[b] = tc;
+  }
+}
+
 // One accelerometer reading feeds the cant indicator and the angle history
 void updateOrientation(bool tiltOn, bool angleOn) {
   float a[3];
@@ -2503,7 +2557,8 @@ void updateLed(uint32_t now) {
   // what the LED does while the bow is level (or the indicator is off).
   // Priority: wrong distance (safety: could shoot over the target) before cant
   LedState st;
-  if (lowBatLock)                                 st = LS_OFF;
+  if (!ledPresent)                                st = LS_OFF;
+  else if (lowBatLock)                            st = LS_OFF;
   else if (rangeWarn && !tiltPause)               st = LS_WARN;
   else if (rangeOk && !tiltPause)                 st = LS_PULSE;   // setting up a sight: aim is right
   else if (levelActive() && lvl.cantSignal && tilted && !tiltPause) st = LS_BLINK;
@@ -2651,6 +2706,12 @@ void registerShot(uint32_t now, float g, bool clipped, const ShotKin& kin) {
     endShotYaw[endShotN]  = kin.ok ? kin.yaw : NO_ANGLE;
     endShotRoll[endShotN] = kin.ok ? kin.roll : NO_ANGLE;
     endShotRate[endShotN] = kin.ok ? kin.rate : NO_ANGLE;
+    endShotMs[endShotN]   = now;
+    endShotHold[endShotN] = hasAng ? angSd : NO_ANGLE;
+    uint16_t holdMs = 0; float drop = 0; bool hasDrop = false;
+    if (angleActive()) aimDetail(now, hasAng, ang, holdMs, drop, hasDrop, endTrace[endShotN]); else endTrace[endShotN].n = 0;
+    endShotHoldMs[endShotN] = holdMs;
+    endShotDrop[endShotN]   = hasDrop ? drop : NO_ANGLE;
     endShotN++;
   }
   say("Shot detected (end " + String(endCount + 1) + ": " + String(endShots) + ")" +
@@ -3036,6 +3097,8 @@ bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t
   for (uint8_t k = 0; k < take; k++) {
     lastEndAng[k] = endShotAng[k]; lastEndCant[k] = endShotCant[k];
     lastEndYaw[k] = endShotYaw[k]; lastEndRoll[k] = endShotRoll[k]; lastEndRate[k] = endShotRate[k];
+    lastEndMs[k] = endShotMs[k]; lastEndHold[k] = endShotHold[k]; lastEndHoldMs[k] = endShotHoldMs[k]; lastEndDrop[k] = endShotDrop[k];
+    lastEndTrace[k] = endTrace[k];
   }
   for (uint8_t k = take; k < endShotN; k++) {                                        // keep the rest
     endShotAng[k - take]  = endShotAng[k];
@@ -3043,6 +3106,11 @@ bool storeEnd(bool valid, bool skipped, const uint8_t* vals, uint8_t n, uint16_t
     endShotYaw[k - take]  = endShotYaw[k];
     endShotRoll[k - take] = endShotRoll[k];
     endShotRate[k - take] = endShotRate[k];
+    endShotMs[k - take]   = endShotMs[k];
+    endShotHold[k - take] = endShotHold[k];
+    endShotHoldMs[k - take] = endShotHoldMs[k];
+    endShotDrop[k - take] = endShotDrop[k];
+    endTrace[k - take]    = endTrace[k];
   }
   endShotN -= take;
   angNOut = an;
@@ -3105,7 +3173,7 @@ void closeEndValid(const uint8_t* vals, uint8_t n, uint8_t xn, uint8_t keepShots
       " scored, avg " + fmtAvg(scoreSum, scoreCount) + ", " + String(xCount) + " X",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":true,\"arrows\":" + String(n) +
       ",\"sum\":" + String(sum) + ",\"x\":" + String(xn) + ",\"avg\":" + fmtAvg(sum, n) +
-      endAngleJson(ang, sd, angN) + endCantJson() + shotsJson(lastEndAng, lastEndCant, lastEndYaw, lastEndRoll, lastEndRate, lastEndN, lastEndDist) +
+      endAngleJson(ang, sd, angN) + endCantJson() + shotsJson(lastEndAng, lastEndCant, lastEndYaw, lastEndRoll, lastEndRate, lastEndN, lastEndDist, lastEndMs, lastEndHold, lastEndHoldMs, lastEndDrop) +
       ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
 }
@@ -3468,7 +3536,7 @@ const char* ledStateText() {
 }
 
 String statusLine() {
-  String s = "Light=" + String(lastLdr) + (isDark ? " (dark)" : " (bright)");
+  String s = ledPresent ? "Light=" + String(lastLdr) + (isDark ? " (dark)" : " (bright)") : String("No UV LED fitted");
   s += " | Battery=" + String(lastVbat, 2) + "V " + String((int)(lastPct + 0.5f)) + "%";
   s += " (" + String(chargeText(lastCharge)) + ")";
   s += " | LED=" + String(ledStateText());
@@ -3561,7 +3629,7 @@ void printHelp() {
   out("range             learned distances, arrow speed; range signal on|off");
   out("setup [use|new|name|del] arrow/bow setups (each learns its own speed)");
   out("name [text|-]      name this sight (shown in the app, added to the BLE name); - removes it");
-  out("shot list|model|reset|on|off  shot matching: shots of the open end with predictions, model state, reset, switch");
+  out("shot list|trace|model|reset|on|off  shots of the open end with predictions, aim trace of one shot, model state, reset, switch");
   out("level signal on|off  blink when canted (measuring continues)");
   out("log del <e> <id>  delete one session on the sight");
   out("log clear         delete all sessions on the sight (asks first)");
@@ -4037,7 +4105,8 @@ static void shotMeans(const float* ang, const float* cant, uint8_t n, float& ang
 }
 
 // ,"shots":[{...}] with the measured values and the model's predictions (cm from the end's mean)
-String shotsJson(const float* ang, const float* cant, const float* yaw, const float* roll, const float* rate, uint8_t n, uint8_t distM) {
+String shotsJson(const float* ang, const float* cant, const float* yaw, const float* roll, const float* rate, uint8_t n, uint8_t distM,
+                 const uint32_t* ms, const float* hold, const uint16_t* holdMs, const float* drop) {
   const ShotModel& m = shotModel.m[setups.active];
   float kx[3]; shotModelKx(m, kx);
   const float ky = shotModelKy(m);
@@ -4053,6 +4122,10 @@ String shotsJson(const float* ang, const float* cant, const float* yaw, const fl
          ",\"yaw\":"  + (hasKin ? String(yaw[k], 2) : String("null")) +
          ",\"roll\":" + (hasKin ? String(roll[k], 2) : String("null")) +
          ",\"rate\":" + (hasKin ? String(rate[k], 0) : String("null"));
+    if (ms) j += ",\"t\":" + String((ms[k] - ms[0]) / 1000.0f, 1);                       // seconds since the end's first shot
+    if (hold && hold[k] < NO_ANGLE) j += ",\"hold\":" + String(hold[k], 2);
+    if (holdMs && holdMs[k]) j += ",\"holdMs\":" + String(holdMs[k]);
+    if (drop && drop[k] < NO_ANGLE) j += ",\"drop\":" + String(drop[k], 2);
     if (hasAng) j += ",\"py\":" + String(ky * shotPredY(ang[k] - angMean, distM), 1);
     if (hasKin && m.n > 0) {
       const float dc = hasCant ? cant[k] - cantMean : 0;
@@ -4117,7 +4190,23 @@ void handleShot(String args) {
     const int d = args.substring(4).toInt();
     const uint8_t dist = d > 0 && d <= 150 ? (uint8_t)d : endDistM;
     sendLine("{\"t\":\"shots\",\"end\":" + String(endCount + 1) + ",\"n\":" + String(endShotN) + ",\"dist\":" + String(dist) +
-             shotsJson(endShotAng, endShotCant, endShotYaw, endShotRoll, endShotRate, endShotN, dist) + "}");
+             shotsJson(endShotAng, endShotCant, endShotYaw, endShotRoll, endShotRate, endShotN, dist, endShotMs, endShotHold, endShotHoldMs, endShotDrop) + "}");
+  } else if (args.startsWith("trace")) {
+    // shot trace <i> (open end) | shot trace last <i> (last closed end)
+    String a = args.substring(5); a.trim();
+    const bool last = a.startsWith("last");
+    if (last) { a = a.substring(4); a.trim(); }
+    const int i = a.toInt();
+    const uint8_t n = last ? lastEndN : endShotN;
+    if (i < 0 || i >= n) { err("shot trace: shot 0.." + String(n ? n - 1 : 0)); return; }
+    const ShotTrace& tr = last ? lastEndTrace[i] : endTrace[i];
+    String j = "{\"t\":\"trace\",\"end\":" + String(last ? lastEndNo : endCount + 1) + ",\"i\":" + String(i) + ",\"n\":" + String(tr.n) + ",\"ms\":[";
+    for (uint8_t k = 0; k < tr.n; k++) { if (k) j += ","; j += String(tr.ms[k]); }
+    j += "],\"pitch\":[";
+    for (uint8_t k = 0; k < tr.n; k++) { if (k) j += ","; j += String(tr.pitch[k]); }
+    j += "],\"cant\":[";
+    for (uint8_t k = 0; k < tr.n; k++) { if (k) j += ","; j += String(tr.cant[k]); }
+    sendLine(j + "]}");
   } else if (args.startsWith("teach")) {
     shotTeach(args.substring(5));
   } else if (args == "model") {
@@ -4136,14 +4225,14 @@ void handleShot(String args) {
     if (!shotModelSave()) { err("ERROR while saving!"); return; }
     // the loop re-applies the FIFO layout when gyroWanted() changed
     say(String("Shot matching ") + (shotModel.on ? "on." : "off."), shotModelJson());
-  } else err("Possible: shot list [m], shot teach <end> <i>:<dx>:<dy> ..., shot model, shot reset [id], shot on|off");
+  } else err("Possible: shot list [m], shot trace [last] <i>, shot teach <end> <i>:<dx>:<dy> ..., shot model, shot reset [id], shot on|off");
 }
 
 void appOn() {
   appMode = true;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
            "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) +
-           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + "}");
+           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + ",\"led\":" + jbool(ledPresent) + "}");
   sendCfg();
   sendLine(statusJson());
   sendLine(sessionJson());
@@ -4219,6 +4308,7 @@ void handleCommand(String line) {
   else if (line == "app off")   { appMode = false; out("App mode off, human-readable output."); }
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
   else if (line == "live off")  { liveMode = false; say("Live output off.", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":false}"); }
+  else if (!ledPresent && (line == "mode auto" || line == "mode on" || line == "level signal on" || line == "range signal on")) err("This sight has no UV LED.");
   else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
   else if (line == "mode on")   { ledMode = MODE_ON;   lvl.ledMode = ledMode; levelSave(); say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
   else if (line == "mode off")  { ledMode = MODE_OFF;  lvl.ledMode = ledMode; levelSave(); say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
@@ -4355,7 +4445,7 @@ void evaluate() {
     unloadedMv = (uint16_t)(lastVbat * 1000);
     unloadedMs = millis();
   }
-  lastLdr  = readLdr();
+  lastLdr  = ledPresent ? readLdr() : 0;          // the light sensor only serves the LED
 
   // Battery protection
   if (lastVbat < cfg.cutoff) {
@@ -4401,11 +4491,31 @@ void evaluate() {
 // ============================================================================
 // Setup
 // ============================================================================
+// Is the transistor stage of the UV LED fitted? See UV_HAS_LED.
+bool detectLedStage() {
+#if UV_HAS_LED == 0
+  return false;
+#elif UV_HAS_LED == 1
+  return true;
+#else
+  uint8_t low = 0;
+  for (uint8_t i = 0; i < 5; i++) {
+    pinMode(PIN_UV, OUTPUT); digitalWrite(PIN_UV, HIGH); delay(1);
+    pinMode(PIN_UV, INPUT);                       // no pull: the base-emitter junction drains the pin, an open pin keeps its charge
+    delayMicroseconds(200);
+    if (digitalRead(PIN_UV) == LOW) low++;
+  }
+  pinMode(PIN_UV, OUTPUT); digitalWrite(PIN_UV, LOW);
+  return low >= 3;
+#endif
+}
+
 void setup() {
   Serial.begin(115200);
 
   pinMode(PIN_UV, OUTPUT);
   digitalWrite(PIN_UV, LOW);
+  ledPresent = detectLedStage();
   pinMode(PIN_LDR_PWR, OUTPUT);
   digitalWrite(PIN_LDR_PWR, LOW);
 

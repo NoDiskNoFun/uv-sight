@@ -635,11 +635,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 19;
+const PROTO_EXPECTED  = 20;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.14";
+const APP_VERSION     = "5.15";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1208,9 +1208,11 @@ function render() {
   const bmText = bm === null ? "" : (bm === 1 ? "auto" : "fixed");
   const modeText = s.mode === "on" ? "switched on" : s.mode === "off" ? "switched off" : bmText;
   $("vLed").innerHTML = ledText + (modeText ? ` <small>${modeText}</small>` : "");
+  $("vLed").parentElement.hidden = !hasLed();
 
   // Ambient light
   $("vLight").innerHTML = `${s.dark ? "Dark" : "Bright"} <small>${s.light}</small>`;
+  $("vLight").parentElement.hidden = !hasLed();
 
   // Cant
   const lv = state.level;
@@ -1245,6 +1247,7 @@ function render() {
   // Runtime estimates
   const rt = runtimeEstimates(s);
   $("vRunLight").innerHTML = rt ? rt.light : "–";
+  $("vRunLight").parentElement.hidden = !hasLed();
   $("vRunIdle").innerHTML  = rt ? rt.idle  : "–";
 
   const h = state.hello;
@@ -2767,7 +2770,7 @@ function angleModeRow(lv) {
 function cantRows(lv) {
   const cw = document.createDocumentFragment();
   const lvMode = lv.mode || "off";
-  if (lvMode !== "off") {
+  if (lvMode !== "off" && hasLed()) {
     cw.appendChild(switchRow("Blink when canted", "Off: the cant is still measured and stored, the LED just stays calm.",
       lv.cantSignal !== false, (on) => setLevel(on ? "level signal on" : "level signal off", { cantSignal: on })));
     const st = lv.style || "normal";
@@ -2776,7 +2779,7 @@ function cantRows(lv) {
       st, ["normal", "inverted"], (m) => setLevel("level style " + m, { style: m })));
   }
   const angMode = lv.angle || "auto";
-  if (angMode !== "off") {
+  if (angMode !== "off" && hasLed()) {
     const rg = state.range || {};
     const ready = rg.state === "ready";
     const row = switchRow("Warn if the distance doesn't fit",
@@ -2824,6 +2827,9 @@ function switchRow(label, desc, checked, onChange) {
   return row;
 }
 
+// A sight built without the UV LED stage (hunting bow) has nothing to light: hide those options
+function hasLed() { return !(state.hello && state.hello.led === false); }
+
 function renderSettings() {
   const connected = state.conn === "connected";
   const gaveUp = cfgRetries >= CFG_MAX_RETRIES && !state.cfg;
@@ -2867,7 +2873,7 @@ function renderSettings() {
     sw.appendChild(checkDistRow(rg, rg.state === "ready"));
   }
   const ledMode = (state.status && state.status.mode) || "auto";
-  sw.appendChild(segRow("LED",
+  if (hasLed()) sw.appendChild(segRow("LED",
     (ledMode === "auto" ? "Auto: switched by the light sensor."
       : ledMode === "on" ? "On: always lit." : "Off: stays dark.") +
     " Cant blinking works in every mode. Kept after a restart.",
@@ -2916,9 +2922,12 @@ function renderSettings() {
     });
     host.appendChild(box);
   };
+  const LED_KEYS = new Set(["tilt_offset", "tilt_full", "blink_min", "blink_max"]);
   for (const g of GROUPS) {
-    const items = g.keys.map((k) => byKey[k]).filter(Boolean);
-    items.forEach((it) => used.add(it.k));
+    const all = g.keys.map((k) => byKey[k]).filter(Boolean);
+    all.forEach((it) => used.add(it.k));
+    if (!hasLed() && (g.light || g.title === "UV light")) continue;      // nothing to light up on this sight
+    const items = hasLed() ? all : all.filter((it) => !LED_KEYS.has(it.k));
     if (items.length || g.cal) addGroup(g, items);
   }
   const rest = state.cfg.items.filter((it) => !used.has(it.k));   // settings added in newer firmware

@@ -149,6 +149,14 @@ using namespace Adafruit_LittleFS_Namespace;
 
 // Pins (Arduino pin n = XIAO Dn)
 const uint8_t PIN_UV      = 6;    // D6 -> 2.2k -> base of BC547
+// UV LED stage present? 0 = no (hunting bow without a sight: no LED, no light sensor), 1 = yes,
+// 2 = find out at boot: with the BC547 and its base resistor fitted, a pin charged HIGH and then
+// released falls to the base-emitter voltage within microseconds; without them it stays HIGH.
+// Without the LED stage all light settings default to off and the app hides them.
+#ifndef UV_HAS_LED
+#define UV_HAS_LED 2
+#endif
+bool ledPresent = true;
 const uint8_t PIN_LDR_PWR = 2;    // D2 powers the LDR only during a measurement
 const uint8_t PIN_LDR     = A0;   // midpoint LDR / 10k
 
@@ -186,8 +194,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "6.1";
-const uint8_t  PROTO_VERSION     = 19;
+const char*    FW_VERSION        = "6.2";
+const uint8_t  PROTO_VERSION     = 20;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -1582,6 +1590,7 @@ void levelLoad() {
     }
     f.close();
   }
+  if (!ledPresent) { lvl.cantSignal = 0; lvl.rangeSignal = 0; lvl.ledMode = MODE_OFF; }   // nothing to light up
 }
 
 bool levelSave() {
@@ -2548,7 +2557,8 @@ void updateLed(uint32_t now) {
   // what the LED does while the bow is level (or the indicator is off).
   // Priority: wrong distance (safety: could shoot over the target) before cant
   LedState st;
-  if (lowBatLock)                                 st = LS_OFF;
+  if (!ledPresent)                                st = LS_OFF;
+  else if (lowBatLock)                            st = LS_OFF;
   else if (rangeWarn && !tiltPause)               st = LS_WARN;
   else if (rangeOk && !tiltPause)                 st = LS_PULSE;   // setting up a sight: aim is right
   else if (levelActive() && lvl.cantSignal && tilted && !tiltPause) st = LS_BLINK;
@@ -3526,7 +3536,7 @@ const char* ledStateText() {
 }
 
 String statusLine() {
-  String s = "Light=" + String(lastLdr) + (isDark ? " (dark)" : " (bright)");
+  String s = ledPresent ? "Light=" + String(lastLdr) + (isDark ? " (dark)" : " (bright)") : String("No UV LED fitted");
   s += " | Battery=" + String(lastVbat, 2) + "V " + String((int)(lastPct + 0.5f)) + "%";
   s += " (" + String(chargeText(lastCharge)) + ")";
   s += " | LED=" + String(ledStateText());
@@ -4222,7 +4232,7 @@ void appOn() {
   appMode = true;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
            "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) +
-           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + "}");
+           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + ",\"led\":" + jbool(ledPresent) + "}");
   sendCfg();
   sendLine(statusJson());
   sendLine(sessionJson());
@@ -4298,6 +4308,7 @@ void handleCommand(String line) {
   else if (line == "app off")   { appMode = false; out("App mode off, human-readable output."); }
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
   else if (line == "live off")  { liveMode = false; say("Live output off.", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":false}"); }
+  else if (!ledPresent && (line == "mode auto" || line == "mode on" || line == "level signal on" || line == "range signal on")) err("This sight has no UV LED.");
   else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
   else if (line == "mode on")   { ledMode = MODE_ON;   lvl.ledMode = ledMode; levelSave(); say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
   else if (line == "mode off")  { ledMode = MODE_OFF;  lvl.ledMode = ledMode; levelSave(); say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
@@ -4434,7 +4445,7 @@ void evaluate() {
     unloadedMv = (uint16_t)(lastVbat * 1000);
     unloadedMs = millis();
   }
-  lastLdr  = readLdr();
+  lastLdr  = ledPresent ? readLdr() : 0;          // the light sensor only serves the LED
 
   // Battery protection
   if (lastVbat < cfg.cutoff) {
@@ -4480,11 +4491,31 @@ void evaluate() {
 // ============================================================================
 // Setup
 // ============================================================================
+// Is the transistor stage of the UV LED fitted? See UV_HAS_LED.
+bool detectLedStage() {
+#if UV_HAS_LED == 0
+  return false;
+#elif UV_HAS_LED == 1
+  return true;
+#else
+  uint8_t low = 0;
+  for (uint8_t i = 0; i < 5; i++) {
+    pinMode(PIN_UV, OUTPUT); digitalWrite(PIN_UV, HIGH); delay(1);
+    pinMode(PIN_UV, INPUT);                       // no pull: the base-emitter junction drains the pin, an open pin keeps its charge
+    delayMicroseconds(200);
+    if (digitalRead(PIN_UV) == LOW) low++;
+  }
+  pinMode(PIN_UV, OUTPUT); digitalWrite(PIN_UV, LOW);
+  return low >= 3;
+#endif
+}
+
 void setup() {
   Serial.begin(115200);
 
   pinMode(PIN_UV, OUTPUT);
   digitalWrite(PIN_UV, LOW);
+  ledPresent = detectLedStage();
   pinMode(PIN_LDR_PWR, OUTPUT);
   digitalWrite(PIN_LDR_PWR, LOW);
 

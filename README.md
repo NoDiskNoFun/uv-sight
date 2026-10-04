@@ -392,6 +392,8 @@ Change with `set <name> <value>`, keep with `save`. Out-of-range values are reje
 
 ## Compile-time constants
 
+`UV_HAS_LED` (default 2): whether the UV LED stage (BC547, resistors, LED, light sensor) is fitted. 0 = no, for a sight on a bow without a pin, e.g. a hunting bow, that only counts shots and measures angles; 1 = yes; 2 = find out at boot. The check charges the LED pin and lets it float for a moment: with the transistor and its base resistor fitted the pin falls to the base-emitter voltage, without them it stays high. Without the LED stage the light settings default to off, the light sensor is not read, `mode on`, `level signal on` and `range signal on` are refused, and the app hides all light options (the `hello` message carries `"led":false`). Set it on the command line with `--build-property compiler.cpp.extra_flags=-DUV_HAS_LED=0`.
+
 These are set at the top of the sketch and need a rebuild.
 
 | Constant | Value | Meaning |

@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "uvsight")(type "KiCad")(uri "${KIPRJMOD}/lib/uvsight.pretty")(options "")(descr "UV-Sight project footprints"))
+)

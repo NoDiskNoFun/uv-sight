@@ -194,8 +194,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "6.2";
-const uint8_t  PROTO_VERSION     = 20;
+const char*    FW_VERSION        = "6.3";
+const uint8_t  PROTO_VERSION     = 21;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -3173,9 +3173,9 @@ void closeEndValid(const uint8_t* vals, uint8_t n, uint8_t xn, uint8_t keepShots
       " scored, avg " + fmtAvg(scoreSum, scoreCount) + ", " + String(xCount) + " X",
       "{\"t\":\"end\",\"n\":" + String(endCount) + ",\"valid\":true,\"arrows\":" + String(n) +
       ",\"sum\":" + String(sum) + ",\"x\":" + String(xn) + ",\"avg\":" + fmtAvg(sum, n) +
-      endAngleJson(ang, sd, angN) + endCantJson() + shotsJson(lastEndAng, lastEndCant, lastEndYaw, lastEndRoll, lastEndRate, lastEndN, lastEndDist, lastEndMs, lastEndHold, lastEndHoldMs, lastEndDrop) +
-      ",\"stored\":" + jbool(stored) + "}");
+      endAngleJson(ang, sd, angN) + endCantJson() + ",\"stored\":" + jbool(stored) + "}");
   emit(sessionJson());
+  if (appMode) sendShots(lastEndNo, lastEndAng, lastEndCant, lastEndYaw, lastEndRoll, lastEndRate, lastEndN, lastEndDist, lastEndMs, lastEndHold, lastEndHoldMs, lastEndDrop);
 }
 
 // Close an end as invalid: all arrows 0 points, not in the overall average
@@ -4104,19 +4104,21 @@ static void shotMeans(const float* ang, const float* cant, uint8_t n, float& ang
   angMean = an ? as / an : 0; cantMean = cn ? cs / cn : 0;
 }
 
-// ,"shots":[{...}] with the measured values and the model's predictions (cm from the end's mean)
-String shotsJson(const float* ang, const float* cant, const float* yaw, const float* roll, const float* rate, uint8_t n, uint8_t distM,
-                 const uint32_t* ms, const float* hold, const uint16_t* holdMs, const float* drop) {
+// The shots of one end as a short line each (a single long line would be cut off on the
+// way through Bluetooth): shotsStart, one shotItem per shot with the measured values and the
+// model's predictions (cm from the end's mean), shotsEnd.
+void sendShots(uint16_t endNo, const float* ang, const float* cant, const float* yaw, const float* roll, const float* rate, uint8_t n, uint8_t distM,
+               const uint32_t* ms, const float* hold, const uint16_t* holdMs, const float* drop) {
   const ShotModel& m = shotModel.m[setups.active];
   float kx[3]; shotModelKx(m, kx);
   const float ky = shotModelKy(m);
   float angMean, cantMean; shotMeans(ang, cant, n, angMean, cantMean);
-  String j = ",\"sdx\":" + String(shotModelSdx(m), 1) + ",\"sdy\":" + String(shotModelSdy(m), 1) + ",\"modelN\":" + String(m.n) +
-             ",\"matching\":" + jbool(shotModel.on) + ",\"shots\":[";
+  sendLine("{\"t\":\"shotsStart\",\"end\":" + String(endNo) + ",\"n\":" + String(n) + ",\"dist\":" + String(distM) +
+           ",\"sdx\":" + String(shotModelSdx(m), 1) + ",\"sdy\":" + String(shotModelSdy(m), 1) + ",\"modelN\":" + String(m.n) +
+           ",\"matching\":" + jbool(shotModel.on) + "}");
   for (uint8_t k = 0; k < n; k++) {
-    if (k) j += ",";
     const bool hasAng = ang[k] < NO_ANGLE, hasCant = cant[k] < NO_ANGLE, hasKin = yaw[k] < NO_ANGLE;
-    j += "{\"i\":" + String(k) +
+    String j = "{\"t\":\"shotItem\",\"end\":" + String(endNo) + ",\"i\":" + String(k) +
          ",\"ang\":"  + (hasAng ? String(ang[k], 2) : String("null")) +
          ",\"cant\":" + (hasCant ? String(cant[k], 1) : String("null")) +
          ",\"yaw\":"  + (hasKin ? String(yaw[k], 2) : String("null")) +
@@ -4131,9 +4133,9 @@ String shotsJson(const float* ang, const float* cant, const float* yaw, const fl
       const float dc = hasCant ? cant[k] - cantMean : 0;
       j += ",\"px\":" + String(kx[0] * yaw[k] + kx[1] * roll[k] + kx[2] * dc, 1);
     } else if (hasKin) j += ",\"px\":0";
-    j += "}";
+    sendLine(j + "}");
   }
-  return j + "]";
+  sendLine("{\"t\":\"shotsEnd\",\"end\":" + String(endNo) + ",\"n\":" + String(n) + "}");
 }
 
 String shotModelJson() {
@@ -4189,8 +4191,7 @@ void handleShot(String args) {
   if (args.startsWith("list")) {
     const int d = args.substring(4).toInt();
     const uint8_t dist = d > 0 && d <= 150 ? (uint8_t)d : endDistM;
-    sendLine("{\"t\":\"shots\",\"end\":" + String(endCount + 1) + ",\"n\":" + String(endShotN) + ",\"dist\":" + String(dist) +
-             shotsJson(endShotAng, endShotCant, endShotYaw, endShotRoll, endShotRate, endShotN, dist, endShotMs, endShotHold, endShotHoldMs, endShotDrop) + "}");
+    sendShots(endCount + 1, endShotAng, endShotCant, endShotYaw, endShotRoll, endShotRate, endShotN, dist, endShotMs, endShotHold, endShotHoldMs, endShotDrop);
   } else if (args.startsWith("trace")) {
     // shot trace <i> (open end) | shot trace last <i> (last closed end)
     String a = args.substring(5); a.trim();

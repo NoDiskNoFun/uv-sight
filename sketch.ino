@@ -194,8 +194,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "6.3";
-const uint8_t  PROTO_VERSION     = 21;
+const char*    FW_VERSION        = "6.4";
+const uint8_t  PROTO_VERSION     = 22;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -687,6 +687,7 @@ uint16_t endShotHoldMs[MAX_SCORES_LINE];// how long the aim stayed within HOLD_T
 float    endShotDrop[MAX_SCORES_LINE];  // aiming angle in the last 150..400 ms minus the hold mean, deg (sinking = negative)
 // Aim trace per shot: the angle history of the ~1.9 s before the release, for the app's shot trace view
 const uint8_t TRACE_SAMPLES = 64;
+const uint8_t TRACE_PART = 8;           // samples per "trace" line: a whole trace is over 1 kB, more than one BLE line reliably carries
 const uint16_t TRACE_SPAN_MS = 1900;
 const float HOLD_TOL_DEG = 0.6f;
 struct ShotTrace { uint8_t n; uint16_t ms[TRACE_SAMPLES]; int16_t pitch[TRACE_SAMPLES]; int16_t cant[TRACE_SAMPLES]; };
@@ -4201,13 +4202,20 @@ void handleShot(String args) {
     const uint8_t n = last ? lastEndN : endShotN;
     if (i < 0 || i >= n) { err("shot trace: shot 0.." + String(n ? n - 1 : 0)); return; }
     const ShotTrace& tr = last ? lastEndTrace[i] : endTrace[i];
-    String j = "{\"t\":\"trace\",\"end\":" + String(last ? lastEndNo : endCount + 1) + ",\"i\":" + String(i) + ",\"n\":" + String(tr.n) + ",\"ms\":[";
-    for (uint8_t k = 0; k < tr.n; k++) { if (k) j += ","; j += String(tr.ms[k]); }
-    j += "],\"pitch\":[";
-    for (uint8_t k = 0; k < tr.n; k++) { if (k) j += ","; j += String(tr.pitch[k]); }
-    j += "],\"cant\":[";
-    for (uint8_t k = 0; k < tr.n; k++) { if (k) j += ","; j += String(tr.cant[k]); }
-    sendLine(j + "]}");
+    // in parts of TRACE_PART samples (k = index of the first one, n = the whole trace); the app joins them
+    const String head = "{\"t\":\"trace\",\"end\":" + String(last ? lastEndNo : endCount + 1) + ",\"i\":" + String(i) + ",\"n\":" + String(tr.n);
+    uint8_t k = 0;
+    do {
+      const uint8_t m = (tr.n - k < TRACE_PART) ? (uint8_t)(tr.n - k) : TRACE_PART;
+      String j = head + ",\"k\":" + String(k) + ",\"ms\":[";
+      for (uint8_t q = k; q < k + m; q++) { if (q > k) j += ","; j += String(tr.ms[q]); }
+      j += "],\"pitch\":[";
+      for (uint8_t q = k; q < k + m; q++) { if (q > k) j += ","; j += String(tr.pitch[q]); }
+      j += "],\"cant\":[";
+      for (uint8_t q = k; q < k + m; q++) { if (q > k) j += ","; j += String(tr.cant[q]); }
+      sendLine(j + "]}");
+      k += m;
+    } while (k < tr.n);
   } else if (args.startsWith("teach")) {
     shotTeach(args.substring(5));
   } else if (args == "model") {

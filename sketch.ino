@@ -194,8 +194,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "6.4";
-const uint8_t  PROTO_VERSION     = 22;
+const char*    FW_VERSION        = "7.0";
+const uint8_t  PROTO_VERSION     = 23;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -361,6 +361,7 @@ struct __attribute__((packed, aligned(4))) LogRec {
 };
 static_assert(sizeof(LogRec) == 64, "LogRec must be 64 bytes");
 typedef bool (*LogVisitor)(const LogRec&);   // callback for logForEach()
+
 
 // One end of a session, written when the end is closed. Same size and ring as
 // the session records, told apart by the magic; the session key (epoch + id)
@@ -650,7 +651,54 @@ bool     lowBatLock        = false;
 bool     wasInactive       = true;
 bool     liveMode          = false;
 bool     welcomed          = false;
-bool     appMode           = false;   // true: output is JSON only
+bool     appMode           = false;   // true: output is JSON only (of the link being served, see curLink)
+
+// ----------------------------------------------------------------------------
+// Links: up to two Bluetooth connections at once. The first app link that is not
+// a trainer is the primary link: it gets every live line (shots, status, events).
+// A trainer link only gets the answers to its own commands, so a trainer looking
+// in never slows the archer's app down. Each link has its own line buffer, app
+// mode and, after "app on <id> <name>" and "auth", its owner and role.
+// ----------------------------------------------------------------------------
+const uint8_t LINKS = 2;
+enum LinkRole : uint8_t { ROLE_NONE = 0, ROLE_OPEN, ROLE_LOCKED, ROLE_USER, ROLE_TRAINER };
+struct Link {
+  bool    used;
+  bool    app;              // "app on": JSON output
+  bool    live;             // "live on"
+  bool    authed;           // the password was given
+  bool    pending;          // asked for trainer access, not approved yet
+  bool    welcomed;
+  uint8_t id[8];            // owner id of the app (all 0xFF = none: single mode)
+  char    name[13];         // owner name
+  String  rx;               // line buffer
+};
+Link     links[LINKS];
+int8_t   curLink           = -1;      // link whose command is being handled; -1: none (Serial, or a spontaneous line)
+// Bytes received per link: written by the BLE event task, read by the loop
+const uint16_t RXQ = 512;
+struct RxQueue { volatile uint16_t head, tail; char buf[RXQ]; };
+RxQueue  rxq[LINKS];
+
+// The group: one password per sight and the trainers (apps that see everything).
+// Stored in /group.bin; "group clear" works over USB only.
+const char*    GROUP_FILE   = "/group.bin";
+const uint32_t GROUP_MAGIC  = 0x31505247;   // "GRP1"
+const uint8_t  TRAINER_MAX  = 8;
+const uint8_t  PENDING_MAX  = 4;
+struct Trainer { uint8_t id[8]; char name[13]; uint8_t pad[3]; };
+struct GroupFile {
+  uint32_t magic;
+  uint8_t  salt[8];
+  uint8_t  hash[32];        // SHA-256(salt + password); all 0 = no password
+  uint8_t  nTrainers, nPending, pad[2];
+  Trainer  trainers[TRAINER_MAX];
+  Trainer  pending[PENDING_MAX];
+};
+GroupFile group;
+// Owner of the running session: the primary link's app when it started; all 0xFF = none
+uint8_t  sessOwnerId[8];
+char     sessOwnerName[13];
 LedMode  ledMode           = MODE_AUTO;
 uint8_t  darkCount         = 0;
 uint8_t  brightCount       = 0;
@@ -711,7 +759,8 @@ uint8_t  distSrc = 0;             // distance of the session: 0 = unknown, 1 = s
 const uint8_t  RANGE_MAX_ROWS   = 240;    // most recent ends used for learning
 const uint8_t  RANGE_MAX_GENS   = 6;      // calibrations with their own zero point
 const uint8_t  RANGE_MIN_ARROWS = 3;      // an end needs this many angles to count
-const uint8_t  SETUP_MAX        = 8;      // arrow/bow setups (ids 0..7, never reused)
+const uint8_t  SETUP_MAX        = 32;     // arrow/bow setups (ids 0..31, never reused); one per archer on a shared sight
+const uint8_t  SETUP_MAX_OLD    = 8;      // before firmware 7.0 (files are migrated)
 const float    K_PRIOR          = 0.0015f;   // typical drag of an arrow, 1/m
 const float    K_PRIOR_SD       = 0.0008f;
 const float    H_PRIOR_SD       = 0.3f;      // height difference arrow/target, m
@@ -736,14 +785,17 @@ float    rngOffset = 0, rngSpeed = 0;
 uint16_t rngEnds = 0; uint8_t rngDists = 0;
 
 // Setups, stored in internal flash
-struct SetupEntry { uint8_t used; char name[19]; };     // used: 0 = free, 1 = in use, 2 = deleted (name kept)
+struct SetupEntry { uint8_t used; char name[19]; uint8_t owner[8]; };   // used: 0 = free, 1 = in use, 2 = deleted (name kept); owner: app id, all 0xFF = nobody's
 struct SetupTable {
   uint32_t   magic;
   uint8_t    active;
   uint8_t    pad[3];
   SetupEntry s[SETUP_MAX];
 };
-const uint32_t SETUP_MAGIC = 0x31505453;   // "STP1"
+const uint32_t SETUP_MAGIC = 0x32505453;   // "STP2" (STP1: 8 setups without owner)
+struct SetupEntryOld { uint8_t used; char name[19]; };
+struct SetupTableOld { uint32_t magic; uint8_t active; uint8_t pad[3]; SetupEntryOld s[SETUP_MAX_OLD]; };
+const uint32_t SETUP_MAGIC_OLD = 0x31505453;
 
 // ----------------------------------------------------------------------------
 // Shot matching model, one per setup: learns from arrow/shot pairs the app confirmed
@@ -763,6 +815,7 @@ struct ShotModelFile {
   uint8_t   pad[3];
   ShotModel m[SETUP_MAX];
 };
+struct ShotModelFileOld { uint32_t magic; uint8_t on; uint8_t pad[3]; ShotModel m[SETUP_MAX_OLD]; };   // before 7.0: 8 setups
 const uint32_t SHOTMODEL_MAGIC = 0x314D5348;   // "HSM1"
 const char*    SHOTMODEL_FILE  = "/shotmodel.bin";
 ShotModelFile  shotModel;
@@ -793,8 +846,7 @@ bool     lastShotClip      = false;   // the peak hit the +-16 g limit
 volatile bool     int1Flag = false;   // INT1 went high (tap in shot mode, motion otherwise)
 volatile uint32_t int1Ms   = 0;       // time of the first edge since the last check
 SemaphoreHandle_t wakeSem  = nullptr; // the interrupt ends the idle sleep through this
-String   rxBuf;
-uint16_t bleConnHandle     = BLE_CONN_HANDLE_INVALID;
+String   rxBuf;                       // line buffer of the USB serial console
 
 enum ChargeState { CHG_NO_USB, CHG_CHARGING, CHG_FULL };
 ChargeState lastCharge     = CHG_NO_USB;
@@ -857,11 +909,40 @@ void applyTxPower() {
 // ============================================================================
 // Sends text in packets matching the negotiated size. If the send queue is
 // full, waits briefly and retries instead of dropping the packet.
-void bleSend(const String& s) {
-  if (bleConnHandle == BLE_CONN_HANDLE_INVALID) return;
-  if (!Bluefruit.connected(bleConnHandle) || !bleuart.notifyEnabled(bleConnHandle)) return;
+bool noId(const uint8_t* id) { for (uint8_t i = 0; i < 8; i++) if (id[i] != 0xFF) return false; return true; }
+bool sameId(const uint8_t* a, const uint8_t* b) { return memcmp(a, b, 8) == 0; }
+bool groupHasPw() { for (uint8_t i = 0; i < 32; i++) if (group.hash[i]) return true; return false; }
+int8_t trainerIndex(const uint8_t* id) { if (noId(id)) return -1; for (uint8_t i = 0; i < group.nTrainers; i++) if (sameId(group.trainers[i].id, id)) return i; return -1; }
+int8_t pendingIndex(const uint8_t* id) { if (noId(id)) return -1; for (uint8_t i = 0; i < group.nPending; i++) if (sameId(group.pending[i].id, id)) return i; return -1; }
 
-  BLEConnection* conn = Bluefruit.Connection(bleConnHandle);
+LinkRole linkRole(uint8_t h) {
+  if (h >= LINKS || !links[h].used) return ROLE_NONE;
+  const Link& L = links[h];
+  if (groupHasPw() && !L.authed) return ROLE_LOCKED;
+  if (noId(L.id)) return ROLE_NONE;
+  if (trainerIndex(L.id) >= 0) return ROLE_TRAINER;
+  return groupHasPw() ? ROLE_USER : ROLE_OPEN;
+}
+const char* roleText(LinkRole r) { return r == ROLE_TRAINER ? "trainer" : r == ROLE_USER ? "user" : r == ROLE_OPEN ? "open" : r == ROLE_LOCKED ? "locked" : "none"; }
+/** The archer's link: the first app link that is not a trainer; else the first link. */
+int8_t primaryLink() {
+  for (uint8_t h = 0; h < LINKS; h++) if (links[h].used && links[h].app && linkRole(h) != ROLE_TRAINER) return h;
+  for (uint8_t h = 0; h < LINKS; h++) if (links[h].used) return h;
+  return -1;
+}
+uint8_t linkCount() { uint8_t n = 0; for (uint8_t h = 0; h < LINKS; h++) if (links[h].used) n++; return n; }
+/** appMode / liveMode follow the primary link whenever no command is being served. */
+void syncPrimaryMode() {
+  const int8_t p = primaryLink();
+  appMode  = p >= 0 && links[p].app;
+  liveMode = p >= 0 && links[p].live;
+}
+
+void bleSendTo(uint8_t h, const String& s) {
+  if (h >= LINKS || !links[h].used) return;
+  if (!Bluefruit.connected(h) || !bleuart.notifyEnabled(h)) return;
+
+  BLEConnection* conn = Bluefruit.Connection(h);
   uint16_t chunk = conn ? conn->getMtu() - 3 : 20;
   if (chunk < 20) chunk = 20;
 
@@ -873,15 +954,21 @@ void bleSend(const String& s) {
     const size_t n = (len - off < chunk) ? (len - off) : chunk;
     bool ok = false;
     for (uint8_t r = 0; r < BLE_SEND_RETRIES && !ok; r++) {
-      ok = bleuart.write(bleConnHandle, p + off, n) == n;
+      ok = bleuart.write(h, p + off, n) == n;
       if (!ok) {
-        if (!Bluefruit.connected(bleConnHandle)) return;
+        if (!Bluefruit.connected(h)) return;
         delay(BLE_RETRY_MS);
       }
     }
     if (!ok) return;   // connection stuck, drop the rest
     off += n;
   }
+}
+
+// An answer goes to the link that asked; everything else to the primary link
+void bleSend(const String& s) {
+  const int8_t h = curLink >= 0 ? curLink : primaryLink();
+  if (h >= 0) bleSendTo(h, s);
 }
 
 void sendLine(const String& s) {
@@ -1240,6 +1327,19 @@ uint32_t crc32(const void* data, size_t len) {
 }
 
 bool recKnown(const LogRec& r) { return r.magic == REC_MAGIC || r.magic == END_MAGIC; }
+// The archer of a session, in the reserved bytes of its record: id (8 bytes, all 0xFF = none)
+// and name (12 bytes). Records from before 7.0 are all 0xFF there, i.e. no owner.
+bool recOwnerUnset(const LogRec& r) { for (uint8_t i = 0; i < 20; i++) if (r.reserved[i] != 0) return false; return true; }
+bool recHasOwner(const LogRec& r) { for (uint8_t i = 0; i < 8; i++) if (r.reserved[i] != 0xFF) return !recOwnerUnset(r); return false; }
+void recSetOwner(LogRec& r, const uint8_t* id, const char* name) {
+  memset(r.reserved, 0xFF, sizeof(r.reserved));
+  if (!id || id[0] == 0xFF) { bool none = true; for (uint8_t i = 0; id && i < 8; i++) if (id[i] != 0xFF) none = false; if (none) return; }
+  memcpy(r.reserved, id, 8);
+  memset(r.reserved + 8, 0, 12);
+  strncpy((char*)r.reserved + 8, name ? name : "", 12);
+}
+String recOwnerName(const LogRec& r) { char n[13]; memcpy(n, r.reserved + 8, 12); n[12] = 0; for (uint8_t i = 0; i < 12; i++) if ((uint8_t)n[i] == 0xFF) n[i] = 0; return String(n); }
+
 bool recValid(const LogRec& r) {
   return recKnown(r) && r.seq != 0 && r.crc == crc32(&r, 60);
 }
@@ -1318,7 +1418,9 @@ bool logAppend(LogRec& r, bool justSaved) {
       logRecount();
     }
     if (r.magic != END_MAGIC) {                // end records bring their own layout
-      memset(r.reserved, 0xFF, sizeof(r.reserved));
+      // the owner lives in the reserved bytes (see recSetOwner); without one they stay blank
+      if (recOwnerUnset(r)) memset(r.reserved, 0xFF, sizeof(r.reserved));
+      else memset(r.reserved + 20, 0xFF, sizeof(r.reserved) - 20);
       r.magic = REC_MAGIC;
     }
     r.seq   = logLastSeq + 1;
@@ -2651,6 +2753,7 @@ String sessionJson() {
          ",\"avg\":" + fmtAvg(scoreSum, scoreCount) +
          ",\"min\":" + String((millis() - sessionStartMs) / 60000UL) +
          ",\"pending\":" + jbool(pendingScore);
+    if (!noId(sessOwnerId)) j += ",\"owner\":\"" + idHex(sessOwnerId) + "\",\"ownerName\":" + jstr(String(sessOwnerName));
   }
   return j + "}";
 }
@@ -2665,6 +2768,9 @@ void startSession(uint32_t now) {
   sessRowN = 0; sessOffset = 0;
   rangeWarn = false; rangeBadSince = rangeGoodSince = 0;
   sessionActive     = true;
+  // the archer: the primary link's app, if it named itself (never a trainer looking in)
+  memset(sessOwnerId, 0xFF, 8); memset(sessOwnerName, 0, sizeof(sessOwnerName));
+  { const int8_t p = primaryLink(); if (p >= 0) { const LinkRole r = linkRole(p); if (r == ROLE_USER || r == ROLE_OPEN) { memcpy(sessOwnerId, links[p].id, 8); strncpy(sessOwnerName, links[p].name, 12); } } }
   sessionStartMs    = now;
   sessionLastShotMs = now;
   shotCount = endShots = endCount = 0;
@@ -3207,6 +3313,7 @@ String slotJson(const LogRec& s) {
          ",\"min\":" + String(s.minutes) + ",\"invalidEnds\":" + String(s.invalidEnds) +
          ",\"invalidArrows\":" + String(s.invalidArrows) +
          ",\"mismatch\":" + jbool(s.flags & SLOT_MISMATCH) +
+         (recHasOwner(s) ? ",\"owner\":\"" + idHex(s.reserved) + "\",\"ownerName\":" + jstr(recOwnerName(s)) : String("")) +
          ",\"manual\":" + jbool(s.flags & SLOT_MANUAL) + "}";
 }
 
@@ -3270,6 +3377,7 @@ void finishSession(bool manual) {
   s.epoch = shotState.epoch;
   s.id    = sessionId;
   s.start = unixAt(sessionStartMs);
+  recSetOwner(s, sessOwnerId, sessOwnerName);
   stateSave();                         // session number must never repeat
   const bool ok = logAppend(s, true);
   if (!ok) s.seq = 0;                  // the app must not take a number that was never written
@@ -3351,6 +3459,8 @@ void printEnds(String args) {
   lsEpoch = (uint32_t)strtoul((sp < 0 ? args : args.substring(0, sp)).c_str(), nullptr, 10);
   lsId    = sp < 0 ? 0 : (uint32_t)strtoul(args.substring(sp + 1).c_str(), nullptr, 10);
   if (!lsEpoch || !lsId) { err("Format: log ends <epoch> <id>"); return; }
+  collectHidden(0);
+  if (hiddenKey(lsEpoch, lsId)) { err("Not your session."); return; }
   out("--- Ends of session " + String(lsEpoch) + "-" + String(lsId) + " ---");
   logForEachKind(0, [](const LogRec& r) {
     const EndRec& e = *(const EndRec*)&r;
@@ -3380,14 +3490,39 @@ void printLogInfo() {
   if (migratedCount) out("Taken over from the old log at this start: " + String(migratedCount) + " sessions");
 }
 
+// A user link sees its own sessions and those without an owner; a trainer and a single-mode app see all.
+// The other archers' sessions are collected first (by key), so their ends can be skipped too.
+const uint8_t HIDE_MAX = 128;
+static uint32_t hideEpoch[HIDE_MAX], hideId[HIDE_MAX]; static uint8_t hideN; static const uint8_t* filterId;
+bool logFiltered() { if (curLink < 0) return false; const LinkRole r = linkRole(curLink); return r == ROLE_USER || r == ROLE_OPEN; }
+bool hiddenKey(uint32_t epoch, uint32_t id) { for (uint8_t i = 0; i < hideN; i++) if (hideEpoch[i] == epoch && hideId[i] == id) return true; return false; }
+void collectHidden(uint32_t since) {
+  hideN = 0;
+  if (!logFiltered()) return;
+  filterId = links[curLink].id;
+  logForEach(since, [](const LogRec& r) {
+    if (recHasOwner(r) && !sameId(r.reserved, filterId) && hideN < HIDE_MAX) { hideEpoch[hideN] = r.epoch; hideId[hideN] = r.id; hideN++; }
+    return true;
+  });
+  // ends of the running session belong to its archer
+  if (sessionActive && !noId(sessOwnerId) && !sameId(sessOwnerId, filterId) && hideN < HIDE_MAX) { hideEpoch[hideN] = shotState.epoch; hideId[hideN] = sessionId; hideN++; }
+}
+bool recVisible(const LogRec& r) {
+  if (!logFiltered()) return true;
+  if (r.magic == END_MAGIC) { const EndRec& e = *(const EndRec*)&r; return !hiddenKey(e.epoch, e.id); }
+  return !(recHasOwner(r) && !sameId(r.reserved, filterId));
+}
+
 // App: every record newer than "since". Terminal: the newest LOG_PRINT_LAST, or all.
 static uint32_t logSentN;   // records in the current answer, so the app can tell a lost line
 void printLog(uint32_t since, bool all) {
   if (appMode) {
+    collectHidden(since);
     sendLine("{\"t\":\"logStart\",\"since\":" + String(since) + ",\"last\":" + String(logLastSeq) +
              ",\"total\":" + String(logVisibleCount()) + ",\"epoch\":" + String(shotState.epoch) + "}");
     logSentN = 0;
     logForEachKind(since, [](const LogRec& r) {
+      if (!recVisible(r)) return true;
       sendLine(r.magic == END_MAGIC ? endJson(*(const EndRec*)&r) : slotJson(r));
       logSentN++;
       return true;
@@ -3639,7 +3774,8 @@ void printHelp() {
   out("level style normal|inverted  blink faster when tilted / when level");
   out("level cal         calibration step 1");
   out("level cal2        calibration step 2");
-  out("app on|off        JSON output for the app");
+  out("app on|off        JSON output for the app ('app on <id> <name>' names the archer)");
+  out("auth <password>   unlock a shared sight; group ...  password and trainers (see README)");
   out("awake <s>         stay reachable without movement (max 900 s, 0 = off)");
   out("bat               runtime estimate and measured current draw");
   out("bat reset         clear the battery history");
@@ -3707,8 +3843,15 @@ void logPut(String args) {
                      ",\"id\":" + String(n > 1 ? v[1] : 0) + ",\"result\":";
   if (n != 12 || v[0] == 0 || v[1] == 0) {
     say("Format: log put <epoch> <id> <start> <ends> <shots> <scored> <avgX100> <x> <min> "
-        "<invalidEnds> <invalidArrows> <flags>", key + "\"error\"}");
+        "<invalidEnds> <invalidArrows> <flags> [<ownerId> <ownerName>]", key + "\"error\"}");
     return;
+  }
+  // optional: the archer the session belongs to (16 hex digits and a name)
+  uint8_t ownerId[8]; memset(ownerId, 0xFF, 8); char ownerName[13] = "";
+  if (args.length()) {
+    int sp = args.indexOf(' ');
+    String idTxt = sp < 0 ? args : args.substring(0, sp); idTxt.toUpperCase();
+    if (parseId(idTxt, ownerId)) cleanName(sp < 0 ? String("") : args.substring(sp + 1), ownerName, 12); else memset(ownerId, 0xFF, 8);
   }
   if (!qfOk) { say("Log flash not available.", key + "\"error\"}"); return; }
   // Copying from the app: stay awake while sessions keep coming
@@ -3723,6 +3866,7 @@ void logPut(String args) {
   r.ends = v[3];   r.shots = v[4];  r.scores = v[5];  r.avgX100 = v[6];  r.xCount = v[7];
   r.minutes = v[8];  r.invalidEnds = v[9];  r.invalidArrows = v[10];
   r.flags = v[11] & (SLOT_MISMATCH | SLOT_MANUAL);
+  recSetOwner(r, ownerId, ownerName);
   const bool ok = logAppend(r, false);
   // Never hand out a session number twice in the current log
   if (ok && r.epoch == shotState.epoch && r.id > shotState.lastId) { shotState.lastId = r.id; stateSave(); }
@@ -3808,7 +3952,16 @@ void setupsLoad() {
   File f(InternalFS);
   if (f.open(SETUP_FILE, FILE_O_READ)) {
     SetupTable tmp;
-    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == SETUP_MAGIC) setups = tmp;
+    const int n = f.read(&tmp, sizeof(tmp));
+    if (n == (int)sizeof(tmp) && tmp.magic == SETUP_MAGIC) setups = tmp;
+    else if (n == (int)sizeof(SetupTableOld) && ((const SetupTableOld*)&tmp)->magic == SETUP_MAGIC_OLD) {
+      // firmware before 7.0: take the 8 setups over, nobody owns them
+      const SetupTableOld& o = *(const SetupTableOld*)&tmp;
+      setups.magic = SETUP_MAGIC; setups.active = o.active;
+      for (uint8_t i = 0; i < SETUP_MAX_OLD; i++) { setups.s[i].used = o.s[i].used; memcpy(setups.s[i].name, o.s[i].name, sizeof(o.s[i].name)); memset(setups.s[i].owner, 0xFF, 8); }
+      for (uint8_t i = SETUP_MAX_OLD; i < SETUP_MAX; i++) memset(setups.s[i].owner, 0xFF, 8);
+      f.close(); setupsSave(); f.open(SETUP_FILE, FILE_O_READ);
+    }
     f.close();
   }
   if (setups.magic != SETUP_MAGIC || setups.active >= SETUP_MAX || setups.s[setups.active].used != 1) {
@@ -3817,8 +3970,36 @@ void setupsLoad() {
     setups.active = 0;
     setups.s[0].used = 1;
     strncpy(setups.s[0].name, "Standard", sizeof(setups.s[0].name) - 1);
+    for (uint8_t i = 0; i < SETUP_MAX; i++) memset(setups.s[i].owner, 0xFF, 8);
     setupsSave();
   }
+}
+
+/** A user's own setup on a shared sight: found or created (named after the user), and made active. */
+void setupForOwner(const uint8_t* id, const char* name) {
+  if (noId(id)) return;
+  int8_t mine = -1;
+  for (uint8_t i = 0; i < SETUP_MAX && mine < 0; i++) if (setups.s[i].used == 1 && sameId(setups.s[i].owner, id)) mine = i;
+  if (mine < 0) {
+    for (uint8_t i = 0; i < SETUP_MAX && mine < 0; i++) if (!setups.s[i].used) mine = i;
+    if (mine < 0) { err("All " + String(SETUP_MAX) + " setups are used; no own setup for " + String(name) + "."); return; }
+    setups.s[mine].used = 1;
+    memcpy(setups.s[mine].owner, id, 8);
+    setName(mine, String(name[0] ? name : "Archer"));
+  }
+  if (setups.active != mine) {
+    setups.active = mine;
+    sessOffset = 0; rangeFit(); rangeWarn = false;
+  }
+  setupsSave();
+  emit(rangeJson());
+}
+/** Setups a link may see: a user its own and the unowned ones, everyone else all. */
+bool setupVisible(uint8_t id) {
+  if (curLink < 0) return true;
+  const LinkRole r = linkRole(curLink);
+  if (r != ROLE_USER && r != ROLE_OPEN) return true;
+  return noId(setups.s[id].owner) || sameId(setups.s[id].owner, links[curLink].id);
 }
 
 // Printable name, at most 18 bytes, never cut inside a UTF-8 character
@@ -3840,6 +4021,7 @@ void setName(uint8_t id, String name) {
 String setupItemJson(uint8_t id) {
   const SetupModel& m = sm[id];
   String j = "{\"t\":\"setupItem\",\"id\":" + String(id) + ",\"name\":" + jstr(setupName(id)) +
+             (noId(setups.s[id].owner) ? String("") : ",\"owner\":\"" + idHex(setups.s[id].owner) + "\"") +
              ",\"deleted\":" + jbool(setups.s[id].used == 2) + ",\"state\":\"" +
              String(m.state == 2 ? "ready" : (m.state == 1 ? "anchor" : "learning")) + "\",\"ends\":" + String(m.ends);
   if (m.state) j += ",\"kmh\":" + String((int)lroundf(m.speed * 3.6f)) + ",\"min\":" + String(m.minD) + ",\"max\":" + String(m.maxD);
@@ -3849,7 +4031,7 @@ String setupItemJson(uint8_t id) {
 void printSetups() {
   if (appMode) {
     sendLine("{\"t\":\"setupsStart\",\"active\":" + String(setups.active) + "}");
-    for (uint8_t i = 0; i < SETUP_MAX; i++) if (setups.s[i].used) sendLine(setupItemJson(i));
+    for (uint8_t i = 0; i < SETUP_MAX; i++) if (setups.s[i].used && setupVisible(i)) sendLine(setupItemJson(i));
     sendLine("{\"t\":\"setupsEnd\"}");
     return;
   }
@@ -3870,7 +4052,7 @@ void handleSetup(const String& arg, const String& rawArg) {
   if (arg == "") { printSetups(); return; }
   if (arg.startsWith("use ")) {
     const int id = arg.substring(4).toInt();
-    if (id < 0 || id >= SETUP_MAX || setups.s[id].used != 1) { err("Unknown setup."); return; }
+    if (id < 0 || id >= SETUP_MAX || setups.s[id].used != 1 || !setupVisible(id)) { err("Unknown setup."); return; }
     setups.active = id;
     setupsSave();
     sessOffset = 0;
@@ -3883,8 +4065,10 @@ void handleSetup(const String& arg, const String& rawArg) {
   if (arg.startsWith("new ")) {
     int id = -1;
     for (uint8_t i = 0; i < SETUP_MAX && id < 0; i++) if (!setups.s[i].used) id = i;
-    if (id < 0) { err("All 8 setups are used."); return; }
+    if (id < 0) { err("All " + String(SETUP_MAX) + " setups are used."); return; }
     setups.s[id].used = 1;
+    // on a shared sight a user's new setup is theirs
+    if (curLink >= 0 && (linkRole(curLink) == ROLE_USER || linkRole(curLink) == ROLE_OPEN)) memcpy(setups.s[id].owner, links[curLink].id, 8); else memset(setups.s[id].owner, 0xFF, 8);
     setName(id, rawArg.substring(4));
     setupsSave();
     say("New setup " + String(id) + ": " + setupName(id), ack + "true,\"id\":" + String(id) + "}");
@@ -3982,6 +4166,41 @@ String deviceIdHex() {
 
 String bleNameFull() { return sightName[0] ? String(BLE_NAME) + " " + sightName : String(BLE_NAME); }
 
+// Manufacturer data of the advertisement: what a trainer's board shows without connecting.
+// Company id 0xFFFF, then "UV", version, flags, battery, end, shots in the end, session points,
+// scored arrows, X, the low 4 bytes of the chip id and the owner's name (8 bytes).
+const uint8_t ADV_LEN = 25;
+uint8_t  advLast[ADV_LEN];
+uint32_t advLastMs = 0;
+void advPayload(uint8_t* b) {
+  memset(b, 0, ADV_LEN);
+  b[0] = 0xFF; b[1] = 0xFF; b[2] = 'U'; b[3] = 'V'; b[4] = 1;
+  b[5] = (sessionActive ? 1 : 0) | (groupHasPw() ? 2 : 0) | (sessionActive && !noId(sessOwnerId) ? 4 : 0) | (shotState.shotsOn ? 8 : 0) | (linkCount() ? 16 : 0);
+  b[6] = (uint8_t)(lastPct < 0 ? 0 : (lastPct > 100 ? 100 : lastPct + 0.5f));
+  b[7] = sessionActive ? (uint8_t)(endCount + 1 > 255 ? 255 : endCount + 1) : 0;
+  b[8] = sessionActive ? endShots : 0;
+  const uint16_t pts = sessionActive ? (scoreSum > 65535 ? 65535 : scoreSum) : 0;
+  b[9] = pts & 0xFF; b[10] = pts >> 8;
+  b[11] = sessionActive ? (uint8_t)(scoreCount > 255 ? 255 : scoreCount) : 0;
+  b[12] = sessionActive ? (uint8_t)(xCount > 255 ? 255 : xCount) : 0;
+  const uint32_t did = NRF_FICR->DEVICEID[0];
+  b[13] = did & 0xFF; b[14] = (did >> 8) & 0xFF; b[15] = (did >> 16) & 0xFF; b[16] = (did >> 24) & 0xFF;
+  if (sessionActive && !noId(sessOwnerId)) { uint8_t n = 0; while (n < 8 && sessOwnerName[n]) n++; while (n > 0 && ((uint8_t)sessOwnerName[n] & 0xC0) == 0x80) n--; memcpy(b + 17, sessOwnerName, n); }
+}
+/** Rewrites the advertisement when its data changed (at most every 2 s); true if it did. */
+bool advRefresh(bool force) {
+  uint8_t b[ADV_LEN];
+  advPayload(b);
+  if (!force && (memcmp(b, advLast, ADV_LEN) == 0 || millis() - advLastMs < 2000)) return false;
+  memcpy(advLast, b, ADV_LEN); advLastMs = millis();
+  const bool was = Bluefruit.Advertising.isRunning();
+  if (was) Bluefruit.Advertising.stop();
+  Bluefruit.Advertising.clearData();
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addManufacturerData(b, ADV_LEN);
+  return true;
+}
+
 void sightNameLoad() {
   memset(sightName, 0, sizeof(sightName));
   File f(InternalFS);
@@ -4046,7 +4265,13 @@ void shotModelLoad() {
   File f(InternalFS);
   if (f.open(SHOTMODEL_FILE, FILE_O_READ)) {
     ShotModelFile tmp;
-    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == SHOTMODEL_MAGIC) shotModel = tmp;
+    const int n = f.read(&tmp, sizeof(tmp));
+    if (n == (int)sizeof(tmp) && tmp.magic == SHOTMODEL_MAGIC) shotModel = tmp;
+    else if (n == (int)sizeof(ShotModelFileOld) && ((const ShotModelFileOld*)&tmp)->magic == SHOTMODEL_MAGIC) {
+      const ShotModelFileOld& o = *(const ShotModelFileOld*)&tmp;         // before 7.0: 8 setups
+      shotModel.magic = SHOTMODEL_MAGIC; shotModel.on = o.on;
+      for (uint8_t i = 0; i < SETUP_MAX_OLD; i++) shotModel.m[i] = o.m[i];
+    }
     f.close();
   }
   if (shotModel.magic != SHOTMODEL_MAGIC) { memset(&shotModel, 0, sizeof(shotModel)); shotModel.magic = SHOTMODEL_MAGIC; shotModel.on = 1; }
@@ -4237,11 +4462,42 @@ void handleShot(String args) {
   } else err("Possible: shot list [m], shot trace [last] <i>, shot teach <end> <i>:<dx>:<dy> ..., shot model, shot reset [id], shot on|off");
 }
 
+String idHex(const uint8_t* id) { char b[17]; for (uint8_t i = 0; i < 8; i++) snprintf(b + 2 * i, 3, "%02X", id[i]); return String(b); }
+bool parseId(const String& hex, uint8_t* id) {
+  if (hex.length() != 16) return false;
+  for (uint8_t i = 0; i < 8; i++) {
+    char* end; char two[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+    const long v = strtol(two, &end, 16);
+    if (*end) return false;
+    id[i] = (uint8_t)v;
+  }
+  return !noId(id);
+}
+/** Printable name of at most 12 bytes, never cut inside a UTF-8 character. */
+void cleanName(const String& raw, char* dst, uint8_t cap) {
+  String clean;
+  for (unsigned int i = 0; i < raw.length(); i++) { const char c = raw[i]; if ((uint8_t)c < 0x20 || c == '"' || c == '\\') continue; clean += c; }
+  clean.trim();
+  uint8_t len = clean.length() > cap ? cap : clean.length();
+  while (len > 0 && len < clean.length() && ((uint8_t)clean[len] & 0xC0) == 0x80) len--;
+  memset(dst, 0, cap + 1);
+  memcpy(dst, clean.c_str(), len);
+}
+String groupJson() {
+  const LinkRole r = curLink >= 0 ? linkRole(curLink) : ROLE_NONE;
+  return "{\"t\":\"group\",\"pw\":" + jbool(groupHasPw()) + ",\"trainers\":" + String(group.nTrainers) + ",\"waiting\":" + String(group.nPending) +
+         ",\"role\":\"" + roleText(r) + "\",\"pending\":" + jbool(curLink >= 0 && links[curLink].pending) + "}";
+}
+
 void appOn() {
   appMode = true;
+  const LinkRole r = curLink >= 0 ? linkRole(curLink) : ROLE_NONE;
   sendLine("{\"t\":\"hello\",\"proto\":" + String(PROTO_VERSION) + ",\"fw\":\"" + FW_VERSION +
            "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) +
-           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + ",\"led\":" + jbool(ledPresent) + "}");
+           ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + ",\"led\":" + jbool(ledPresent) +
+           ",\"pw\":" + jbool(groupHasPw()) + ",\"role\":\"" + roleText(r) + "\",\"pending\":" + jbool(curLink >= 0 && links[curLink].pending) +
+           ",\"primary\":" + jbool(curLink < 0 || primaryLink() == curLink) + "}");
+  if (r == ROLE_LOCKED) return;        // the rest after "auth"
   sendCfg();
   sendLine(statusJson());
   sendLine(sessionJson());
@@ -4261,14 +4517,249 @@ bool keepsPendingScore(const String& l) {
          l == "log" || l == "log all" || l == "log info" || l.startsWith("log since ") ||
          l.startsWith("log ends ") || l.startsWith("log put ") || l.startsWith("log putend ") ||
          l.startsWith("time ") || l.startsWith("awake ") ||
-         l == "app on" || l == "app off" || l == "live on" || l == "live off";
+         l == "app on" || l.startsWith("app on ") || l == "app off" || l == "live on" || l == "live off" ||
+         l.startsWith("auth ") || l == "group" || l.startsWith("group ");
+}
+
+// ============================================================================
+// Group: password, trainers, roles of the links
+// ============================================================================
+// SHA-256 (FIPS 180-4), compact; the password hash is salted and stored, never the password
+static const uint32_t SHA_K[64] = {
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+static inline uint32_t rotr(uint32_t x, uint8_t n) { return (x >> n) | (x << (32 - n)); }
+void sha256(const uint8_t* msg, size_t len, uint8_t out[32]) {
+  uint32_t h[8] = { 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19 };
+  const size_t total = ((len + 9 + 63) / 64) * 64;
+  uint8_t block[64];
+  for (size_t off = 0; off < total; off += 64) {
+    for (uint8_t i = 0; i < 64; i++) {
+      const size_t k = off + i;
+      block[i] = k < len ? msg[k] : (k == len ? 0x80 : 0);
+    }
+    if (off + 64 == total) { const uint64_t bits = (uint64_t)len * 8; for (uint8_t i = 0; i < 8; i++) block[63 - i] = (uint8_t)(bits >> (8 * i)); }
+    uint32_t w[64];
+    for (uint8_t i = 0; i < 16; i++) w[i] = ((uint32_t)block[4 * i] << 24) | ((uint32_t)block[4 * i + 1] << 16) | ((uint32_t)block[4 * i + 2] << 8) | block[4 * i + 3];
+    for (uint8_t i = 16; i < 64; i++) {
+      const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (uint8_t i = 0; i < 64; i++) {
+      const uint32_t t1 = hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + SHA_K[i] + w[i];
+      const uint32_t t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+      hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  for (uint8_t i = 0; i < 8; i++) { out[4 * i] = h[i] >> 24; out[4 * i + 1] = h[i] >> 16; out[4 * i + 2] = h[i] >> 8; out[4 * i + 3] = h[i]; }
+}
+void pwHash(const String& pw, uint8_t out[32]) {
+  uint8_t buf[8 + 64];
+  memcpy(buf, group.salt, 8);
+  const uint8_t n = pw.length() > 64 ? 64 : pw.length();
+  memcpy(buf + 8, pw.c_str(), n);
+  sha256(buf, 8 + n, out);
+}
+
+bool groupSave() {
+  InternalFS.remove(GROUP_FILE);
+  File f(InternalFS);
+  if (!f.open(GROUP_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)&group, sizeof(group));
+  f.close();
+  return true;
+}
+void groupLoad() {
+  memset(&group, 0, sizeof(group));
+  File f(InternalFS);
+  if (f.open(GROUP_FILE, FILE_O_READ)) {
+    GroupFile tmp;
+    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == GROUP_MAGIC) group = tmp;
+    f.close();
+  }
+  if (group.magic != GROUP_MAGIC) { memset(&group, 0, sizeof(group)); group.magic = GROUP_MAGIC; }
+  if (group.nTrainers > TRAINER_MAX) group.nTrainers = TRAINER_MAX;
+  if (group.nPending > PENDING_MAX) group.nPending = PENDING_MAX;
+}
+void newSalt() { for (uint8_t t = 0; t < 20; t++) if (sd_rand_application_vector_get(group.salt, 8) == 0) return; for (uint8_t i = 0; i < 8; i++) group.salt[i] = (uint8_t)(millis() >> (i * 4)); }
+
+String trainerJson(const Trainer& t, bool pending) { return "{\"t\":\"trainer\",\"id\":\"" + idHex(t.id) + "\",\"name\":" + jstr(String(t.name)) + ",\"pending\":" + jbool(pending) + "}"; }
+void printTrainers() {
+  if (!appMode) {
+    out("--- Trainers ---");
+    for (uint8_t i = 0; i < group.nTrainers; i++) out("  " + String(group.trainers[i].name) + " (" + idHex(group.trainers[i].id) + ")");
+    for (uint8_t i = 0; i < group.nPending; i++) out("  waiting: " + String(group.pending[i].name) + " (" + idHex(group.pending[i].id) + ")");
+    return;
+  }
+  sendLine("{\"t\":\"trainersStart\",\"n\":" + String(group.nTrainers + group.nPending) + "}");
+  for (uint8_t i = 0; i < group.nTrainers; i++) sendLine(trainerJson(group.trainers[i], false));
+  for (uint8_t i = 0; i < group.nPending; i++) sendLine(trainerJson(group.pending[i], true));
+  sendLine("{\"t\":\"trainersEnd\"}");
+}
+bool addTrainer(const uint8_t* id, const char* name) {
+  if (trainerIndex(id) >= 0) return true;
+  if (group.nTrainers >= TRAINER_MAX) return false;
+  Trainer& t = group.trainers[group.nTrainers++];
+  memset(&t, 0, sizeof(t)); memcpy(t.id, id, 8); strncpy(t.name, name, 12);
+  const int8_t p = pendingIndex(id);
+  if (p >= 0) { for (uint8_t i = p; i + 1 < group.nPending; i++) group.pending[i] = group.pending[i + 1]; group.nPending--; }
+  return true;
+}
+/** Which commands a link may run: whoever looks in beside the archer must not disturb them, a user must not wipe the sight. */
+bool linkAllows(uint8_t h, const String& l) {
+  const LinkRole r = linkRole(h);
+  {
+    // another app is the archer's: this link only reads, ends the session and (as a trainer) manages the group
+    const int8_t p = primaryLink();
+    if (p >= 0 && p != h) {
+      const bool ok = l == "status" || l == "?" || l == "get" || l == "config" || l == "help" || l == "h" || l == "shots" || l == "shots stop" ||
+                      l == "level" || l == "bat" || l == "range" || l == "setup" || l == "angle" || l == "name" || l.startsWith("name ") ||
+                      l.startsWith("shot list") || l == "shot model" || l == "log" || l == "log all" || l == "log info" || l.startsWith("log since ") ||
+                      l.startsWith("log ends ") || l.startsWith("log put ") || l.startsWith("log putend ") || l.startsWith("log del ") ||
+                      l.startsWith("time ") || l.startsWith("awake ") || l == "app on" || l.startsWith("app on ") || l == "app off" || l == "live on" || l == "live off";
+      if (!ok) { if (appMode) sendLine("{\"t\":\"err\",\"code\":\"busy\",\"text\":\"Another archer is connected: this link only reads while they shoot.\"}"); else err("Another archer is connected."); return false; }
+    }
+  }
+  if (r == ROLE_USER || r == ROLE_OPEN) {
+    if (l == "log clear" || l.startsWith("log clear ") || l == "log test" || l.startsWith("name ") || l == "bat reset" || l == "defaults") {
+      if (groupHasPw() || group.nTrainers) { if (appMode) sendLine("{\"t\":\"err\",\"code\":\"trainer\",\"text\":\"Only a trainer may do this on a shared sight.\"}"); else err("Only a trainer may do this."); return false; }
+    }
+  }
+  return true;
+}
+/** After "app on <id>" or "auth": the role is known. A second archer is told so (and stays a reader,
+ *  see linkAllows); the archer's own setup is chosen. */
+void linkSettled(uint8_t h) {
+  const LinkRole r = linkRole(h);
+  if (r == ROLE_USER || r == ROLE_OPEN) {
+    const int8_t p = primaryLink();
+    if (p >= 0 && p != h) { sendLine("{\"t\":\"err\",\"code\":\"busy\",\"text\":\"Another archer is connected to this sight.\"}"); return; }
+    setupForOwner(links[h].id, links[h].name);
+  }
+}
+void handleAuth(String pw) {
+  if (curLink < 0) { err("auth works over Bluetooth only."); return; }
+  pw.trim();
+  Link& L = links[curLink];
+  const bool wasLocked = linkRole(curLink) == ROLE_LOCKED;
+  bool ok = !groupHasPw();
+  if (!ok) { uint8_t hsh[32]; pwHash(pw, hsh); ok = memcmp(hsh, group.hash, 32) == 0; }
+  L.authed = ok;
+  if (ok) { L.pending = pendingIndex(L.id) >= 0; linkSettled(curLink); }
+  const LinkRole r = linkRole(curLink);
+  say(ok ? "Password accepted, role " + String(roleText(r)) : String("Wrong password."),
+      "{\"t\":\"auth\",\"ok\":" + jbool(ok) + ",\"role\":\"" + roleText(r) + "\",\"pending\":" + jbool(L.pending) + "}");
+  if (ok && wasLocked && L.app && L.used) {   // the greeting's second half, held back while locked
+    sendCfg(); sendLine(statusJson()); sendLine(sessionJson()); sendLine(levelJson()); sendLine(logInfoJson()); sendLine(rangeJson()); sendLine(shotModelJson()); printSetups();
+  }
+}
+// group | group set <password> | group set - | group trainers | group request | group approve <id> | group remove <id> | group clear (USB only)
+void handleGroup(String arg, String rawArg) {
+  arg.trim(); rawArg.trim();
+  const bool trainer = curLink >= 0 && linkRole(curLink) == ROLE_TRAINER;
+  const bool usb = curLink < 0;
+  if (arg == "") { say(groupHasPw() ? "Password set, " + String(group.nTrainers) + " trainers, " + String(group.nPending) + " waiting" : String("No password set."), groupJson()); return; }
+  if (arg == "trainers") { printTrainers(); return; }
+  if (arg == "clear") {
+    if (!usb) { err("group clear works over USB only."); return; }
+    memset(&group, 0, sizeof(group)); group.magic = GROUP_MAGIC; groupSave();
+    for (uint8_t h = 0; h < LINKS; h++) links[h].authed = true;
+    say("Group cleared: no password, no trainers.", groupJson()); return;
+  }
+  if (arg.startsWith("set")) {
+    String pw = rawArg.length() > 3 ? rawArg.substring(3) : String(""); pw.trim();
+    if (curLink < 0 && !usb) return;
+    // first password: whoever sets it becomes the first trainer; later only a trainer may change it
+    const bool first = !groupHasPw() && group.nTrainers == 0;
+    if (!first && !trainer && !usb) { err("Only a trainer may change the password."); return; }
+    if (pw == "-" || pw.length() == 0) { memset(group.hash, 0, 32); }
+    else {
+      if (pw.length() < 4) { err("Password: at least 4 characters."); return; }
+      newSalt(); pwHash(pw, group.hash);
+    }
+    if (first && curLink >= 0 && !noId(links[curLink].id)) addTrainer(links[curLink].id, links[curLink].name);
+    if (!groupSave()) { err("ERROR while saving!"); return; }
+    for (uint8_t h = 0; h < LINKS; h++) if (links[h].used) links[h].authed = (h == curLink) || !groupHasPw();
+    say(groupHasPw() ? String("Password set.") : String("Password removed."), "{\"t\":\"ack\",\"cmd\":\"group\",\"what\":\"set\",\"pw\":" + jbool(groupHasPw()) + "}");
+    emit(groupJson());
+    return;
+  }
+  if (arg == "request") {
+    if (curLink < 0 || noId(links[curLink].id)) { err("Name the app first (app on <id> <name>)."); return; }
+    Link& L = links[curLink];
+    if (trainerIndex(L.id) >= 0) { say("Already a trainer.", "{\"t\":\"ack\",\"cmd\":\"group\",\"what\":\"request\",\"pending\":false}"); return; }
+    if (pendingIndex(L.id) < 0) {
+      if (group.nPending >= PENDING_MAX) { err("Too many requests waiting."); return; }
+      Trainer& t = group.pending[group.nPending++];
+      memset(&t, 0, sizeof(t)); memcpy(t.id, L.id, 8); strncpy(t.name, L.name, 12);
+      groupSave();
+    }
+    L.pending = true;
+    say("Trainer access requested; a trainer has to approve it.", "{\"t\":\"ack\",\"cmd\":\"group\",\"what\":\"request\",\"pending\":true}");
+    return;
+  }
+  if (arg.startsWith("approve ") || arg.startsWith("remove ")) {
+    if (!trainer && !usb) { err("Only a trainer may do this."); return; }
+    uint8_t id[8];
+    String idTxt = rawArg.substring(rawArg.indexOf(' ') + 1); idTxt.trim(); idTxt.toUpperCase();
+    if (!parseId(idTxt, id)) { err("Format: group approve|remove <16 hex digits>"); return; }
+    if (arg.startsWith("approve ")) {
+      const int8_t p = pendingIndex(id);
+      if (p < 0 && trainerIndex(id) < 0) { err("No request from this id."); return; }
+      if (p >= 0 && !addTrainer(id, group.pending[p].name)) { err("All " + String(TRAINER_MAX) + " trainer places are used."); return; }
+    } else {
+      const int8_t t = trainerIndex(id);
+      if (t < 0) { const int8_t p = pendingIndex(id); if (p < 0) { err("Not a trainer."); return; } for (uint8_t i = p; i + 1 < group.nPending; i++) group.pending[i] = group.pending[i + 1]; group.nPending--; }
+      else {
+        if (group.nTrainers <= 1 && !usb) { err("The last trainer can only be removed over USB."); return; }
+        for (uint8_t i = t; i + 1 < group.nTrainers; i++) group.trainers[i] = group.trainers[i + 1];
+        group.nTrainers--;
+      }
+    }
+    if (!groupSave()) { err("ERROR while saving!"); return; }
+    for (uint8_t h = 0; h < LINKS; h++) if (links[h].used) links[h].pending = pendingIndex(links[h].id) >= 0;
+    say(arg.startsWith("approve ") ? "Trainer approved." : "Removed.", "{\"t\":\"ack\",\"cmd\":\"group\",\"what\":\"" + String(arg.startsWith("approve ") ? "approve" : "remove") + "\",\"id\":\"" + idHex(id) + "\"}");
+    printTrainers();
+    return;
+  }
+  err("Possible: group, group set <password>|-, group trainers, group request, group approve <id>, group remove <id>, group clear (USB)");
 }
 
 void handleCommand(String line) {
   line.trim();
-  const String raw = line;                        // original case (setup names)
+  const String raw = line;                        // original case (setup names, passwords)
   line.toLowerCase();
   if (line.length() == 0) return;
+
+  // "app on <id> <name>": the app names its owner (16 hex digits) before the greeting
+  if (line.startsWith("app on ") && curLink >= 0) {
+    String rest = raw.substring(7); rest.trim();
+    const int sp = rest.indexOf(' ');
+    const String idTxt = sp < 0 ? rest : rest.substring(0, sp);
+    Link& L = links[curLink];
+    if (!parseId(idTxt, L.id)) { memset(L.id, 0xFF, 8); err("Format: app on <16 hex digits> <name>"); return; }
+    cleanName(sp < 0 ? String("") : rest.substring(sp + 1), L.name, 12);
+    if (!groupHasPw()) L.authed = true;
+    L.pending = pendingIndex(L.id) >= 0;
+    linkSettled(curLink);
+    appOn();
+    return;
+  }
+  // A sight with a password answers only the greeting, "auth" and the clock until the password was given
+  if (curLink >= 0 && groupHasPw() && !links[curLink].authed &&
+      !(line == "app on" || line.startsWith("auth ") || line == "group" || line.startsWith("time ") || line == "app off" || line == "help" || line == "h")) {
+    if (appMode) sendLine("{\"t\":\"err\",\"code\":\"auth\",\"text\":\"Password needed (auth <password>).\"}");
+    else err("Password needed: auth <password>");
+    return;
+  }
+  if (line.startsWith("auth "))  { handleAuth(raw.substring(5)); return; }
+  if (line == "group" || line.startsWith("group ")) { handleGroup(line.substring(5), raw.substring(5)); return; }
+  if (curLink >= 0 && !linkAllows(curLink, line)) return;
 
   // Setting the distance must not discard an open score question
   if (line == "dist" || line.startsWith("dist ")) { handleDist(line.substring(4)); return; }
@@ -4312,7 +4803,7 @@ void handleCommand(String line) {
     if (appMode) sendCfg();
     else         out("Default values loaded (permanent with 'save').");
   }
-  else if (line == "app on")    appOn();
+  else if (line == "app on")    { if (curLink >= 0) { memset(links[curLink].id, 0xFF, 8); if (!groupHasPw()) links[curLink].authed = true; } appOn(); }
   else if (line == "dfu")       enterDfu();
   else if (line == "app off")   { appMode = false; out("App mode off, human-readable output."); }
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
@@ -4361,7 +4852,7 @@ void handleCommand(String line) {
   lastSensorMs = millis() - SENSOR_INTERVAL_MS;  // apply changes immediately
 }
 
-void feedChar(char c) {
+void feedChar(char c) {                // USB serial console
   if (c == '\n' || c == '\r') {
     if (rxBuf.length()) { handleCommand(rxBuf); rxBuf = ""; }
   } else if (rxBuf.length() < 240) {   // the longest app command is about 150 characters
@@ -4369,8 +4860,39 @@ void feedChar(char c) {
   }
 }
 
+// BLE event task: the bytes a link wrote go into its queue (the UART FIFO is shared, the
+// callback says which connection wrote)
+void onBleRx(uint16_t h) {
+  while (bleuart.available() > 0) {
+    const int c = bleuart.read();
+    if (c < 0) break;
+    if (h >= LINKS) continue;
+    RxQueue& q = rxq[h];
+    const uint16_t nh = (uint16_t)((q.head + 1) % RXQ);
+    if (nh == q.tail) continue;        // full: drop
+    q.buf[q.head] = (char)c; q.head = nh;
+  }
+}
+void runLinkCommand(uint8_t h, const String& line) {
+  curLink = h; appMode = links[h].app; liveMode = links[h].live;
+  handleCommand(line);
+  if (h < LINKS && links[h].used) { links[h].app = appMode; links[h].live = liveMode; }
+  curLink = -1;
+  syncPrimaryMode();
+}
+void feedLink(uint8_t h, char c) {
+  Link& L = links[h];
+  if (c == '\n' || c == '\r') {
+    if (L.rx.length()) { const String line = L.rx; L.rx = ""; runLinkCommand(h, line); }
+  } else if (L.rx.length() < 240) L.rx += c;
+}
 void readCommands() {
-  while (bleuart.available()) feedChar((char)bleuart.read());
+  // bytes the callback did not take (one link only: they can only be its)
+  if (linkCount() == 1 && bleuart.available() > 0) { const int8_t p = primaryLink(); onBleRx(p >= 0 ? p : 0); }
+  for (uint8_t h = 0; h < LINKS; h++) {
+    RxQueue& q = rxq[h];
+    while (q.tail != q.head) { const char c = q.buf[q.tail]; q.tail = (uint16_t)((q.tail + 1) % RXQ); if (links[h].used) feedLink(h, c); }
+  }
   while (Serial && Serial.available()) feedChar((char)Serial.read());
 }
 
@@ -4378,23 +4900,31 @@ void readCommands() {
 // Bluetooth
 // ============================================================================
 void onConnect(uint16_t connHandle) {
-  bleConnHandle = connHandle;
+  if (connHandle < LINKS) {
+    Link& L = links[connHandle];
+    L.used = true; L.app = false; L.live = false; L.pending = false; L.welcomed = false;
+    L.authed = !groupHasPw();
+    memset(L.id, 0xFF, 8); memset(L.name, 0, sizeof(L.name)); L.rx = "";
+    rxq[connHandle].head = rxq[connHandle].tail = 0;
+  }
   BLEConnection* conn = Bluefruit.Connection(connHandle);
   if (conn) {
     conn->requestMtuExchange(BLE_MTU);   // whole lines per packet
     conn->requestDataLengthUpdate();
   }
+  syncPrimaryMode();
 }
 
 void onDisconnect(uint16_t connHandle, uint8_t reason) {
   (void)reason;
-  if (connHandle == bleConnHandle) bleConnHandle = BLE_CONN_HANDLE_INVALID;
+  if (connHandle < LINKS) { links[connHandle].used = false; links[connHandle].app = false; links[connHandle].live = false; links[connHandle].rx = ""; }
+  syncPrimaryMode();
 }
 
 void bleInit() {
   Bluefruit.autoConnLed(false);                  // blue board LED off (saves power)
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);  // large packets + bigger send queue
-  Bluefruit.begin();
+  Bluefruit.begin(LINKS, 0);                     // the archer's app and a trainer looking in
   cfg.txPower = snapTxPower(cfg.txPower);
   Bluefruit.setTxPower(cfg.txPower);
   Bluefruit.setName(bleNameFull().c_str());
@@ -4402,10 +4932,13 @@ void bleInit() {
   Bluefruit.Periph.setConnectCallback(onConnect);
   Bluefruit.Periph.setDisconnectCallback(onDisconnect);
   bleuart.begin();
+  bleuart.setRxCallback(onBleRx, false);         // in the BLE task, so every byte is tied to its link
 
+  // The advertisement carries the trainer's board data (manufacturer data, see advPayload); the
+  // name goes into the scan response. The 128-bit service UUID has no room left, apps and the
+  // web page find the sight by name and by the manufacturer data.
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addTxPower();
-  Bluefruit.Advertising.addService(bleuart);
+  advRefresh(true);
   Bluefruit.ScanResponse.addName();
   Bluefruit.Advertising.restartOnDisconnect(false);  // handled by the sketch
   Bluefruit.Advertising.setInterval(ADV_FAST_INTERVAL, ADV_SLOW_INTERVAL);
@@ -4418,7 +4951,10 @@ void bleUpdate(bool active) {
   const bool connected = Bluefruit.connected();
 
   if (active) {
-    if (!connected && !adv) Bluefruit.Advertising.start(0);
+    // keep advertising while a link is free (a trainer may look in), with fresh board data
+    if (linkCount() < LINKS) { if (advRefresh(false) || !adv) Bluefruit.Advertising.start(0); }
+    else if (adv) Bluefruit.Advertising.stop();
+    (void)connected;
     return;
   }
 
@@ -4553,6 +5089,7 @@ void setup() {
   // logInit() runs after bleInit(): the random epoch needs the SoftDevice
   levelLoad();
   sightNameLoad();
+  groupLoad();
   shotModelLoad();
 
   imuOk = imuInit();
@@ -4584,11 +5121,7 @@ void loop() {
   const bool connected = Bluefruit.connected();
   imuBus(true);
 
-  if (!connected) { liveMode = false; welcomed = false; appMode = false; }
-  // A command cut off by a lost connection must not be glued to the first one
-  // of the next connection: start every connection with an empty line buffer
-  static bool wasConnected = false;
-  if (connected != wasConnected) { rxBuf = ""; wasConnected = connected; }
+  syncPrimaryMode();                       // appMode / liveMode of the archer's link
 
   // Only movement keeps the board active (a connection does not)
   if (imuMotionSinceLastCheck()) lastMotionMs = now;
@@ -4669,14 +5202,17 @@ void loop() {
   readCommands();
   now = millis();
 
-  // Greeting as soon as the app is ready
-  if (connected && bleuart.notifyEnabled() && !welcomed) {
-    welcomed = true;
+  // Greeting of every new link as soon as it listens
+  for (uint8_t h = 0; h < LINKS; h++) {
+    if (!links[h].used || links[h].welcomed || !Bluefruit.connected(h) || !bleuart.notifyEnabled(h)) continue;
+    links[h].welcomed = true;
+    curLink = h; appMode = links[h].app;
     out("UV-Sight connected. 'help' lists all commands.");
     if (!imuOk) out("Note: IMU not found, motion detection off.");
     sendStatus();
     if (sessionActive) out(sessionLine());
     if (lvl.on && !lvl.calibrated) out("Note: tilt indicator not calibrated ('level cal').");
+    curLink = -1; syncPrimaryMode();
     lastReportMs = now;
   }
 

@@ -201,9 +201,10 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 | `/uvcfg.bin` | internal | Settings | With `save` |
 | `/shotstate.bin` | internal | Shot counter on/off, log epoch, last session number | Automatically |
 | `/level.bin` | internal | Cant indicator mode, calibration, LED switch, signals | Automatically |
-| `/setups.bin` | internal | Arrow/bow setups | Automatically |
+| `/setups.bin` | internal | Arrow/bow setups (32 since 7.0, with their owner on a shared sight; the 8 of older firmware are taken over) | Automatically |
+| `/group.bin` | internal | Shared sight: salted password hash, trainers, trainer requests | Automatically |
 | `/sightname.txt` | internal | Name of this sight (`name <text>`) | Automatically |
-| `/shotmodel.bin` | internal | Shot matching model per setup and its on/off switch | Automatically |
+| `/shotmodel.bin` | internal | Shot matching model per setup and its on/off switch (8 setups of older firmware are taken over) | Automatically |
 | `/bathist.bin` | internal | Battery history for the runtime estimate | Automatically |
 | session log | external 2 MB QSPI flash | Sessions and ends as 64-byte records with CRC, ring buffer | Automatically |
 | `/shots.old` | internal | Backup of the log format of firmware 1.2 to 2.1 after the migration | Once |
@@ -278,6 +279,19 @@ Each step waits 3 s, then measures for about 0.6 s. If the two positions differ 
 
 With the shot counter running, the sight also records how the bow moved at each release and tells the app, per shot, where it expects the arrow relative to the end's mean: the height from the aiming angle, the sideways position from the bow's rotation in the last 30 ms before the impact (gyroscope, read from the IMU FIFO, shot mode only). The app matches these predictions to the arrow positions it sees on the photo and reports the sure pairs back (`shot teach`). From them, each setup learns its own factors and the remaining spread, so the predictions and the app's confidence improve with every end. Everything is stored per setup in `/shotmodel.bin`; `shot model` shows the state, `shot reset` starts over, `shot off` turns matching and the gyro off. The gyro adds about 0.5 mA while the bow is active.
 
+## Shared sight (several archers, trainers)
+
+A sight can be used by several archers in turn, for example in youth training, and watched by trainers. Nothing of this is active until an app names itself or a password is set; a sight used as before behaves as before.
+
+- **Owner per session.** An app that greets with `app on <id> <name>` (a 16-digit hex id and a name of up to 12 characters) is the archer: every session that starts while it is connected carries that id and name (in the reserved bytes of the session record, `owner` / `ownerName` in `slot` and `session`). Sessions started without such an app have no owner.
+- **Two links at once.** The sight accepts two Bluetooth connections. The archer's link is the primary one: it gets every live line (shots, status, events). A second link, a trainer looking in or a second archer, only gets the answers to its own commands, may only read (`status`, `shots`, `log …`, `setup`, `range`, `name`), end the session (`shots stop`) and, as a trainer, manage the group; anything that would disturb the archer answers `{"t":"err","code":"busy"}`. The second archer is told so in the greeting (`primary:false`). While a link is free the sight keeps advertising, so a trainer can always look in.
+- **Password.** `group set <password>` (at least 4 characters) locks the sight: until a link sends `auth <password>` it answers only the greeting, `auth`, `group` and `time`, everything else with `{"t":"err","code":"auth"}`. The password is stored as a salted SHA-256 hash, never in clear; the link itself is not encrypted (no pairing), the password keeps strangers from reading the sessions. `group set -` removes it. Whoever sets the first password becomes the first trainer.
+- **Roles.** `hello` and `auth` report the link's `role`: `none` (no id, as before), `open` (id, no password on the sight), `locked` (password not given yet), `user` (password given) or `trainer`. Users see their own sessions and those without an owner in `log since`, `log ends` and the setup list; trainers and single-mode apps see everything.
+- **Trainers.** `group trainers` lists them (`trainersStart` / `trainer` / `trainersEnd`, `pending:true` for requests). A further trainer sends `group request` after `auth`; an existing trainer approves with `group approve <id>` or removes with `group remove <id>` (the last trainer only over USB). `group clear` wipes password and trainers and works over the USB console only, so nobody can take a sight over by radio.
+- **Setups per archer.** On a shared sight every archer gets their own setup (named after them, created on the first greeting) and the sight switches to it when they connect, so the speed model and the shot matching learn per bow. There are 32 setups since 7.0.
+- **Board data in the advertisement.** While it advertises, the sight puts manufacturer data (company id `0xFFFF`) into the packet: `"UV"`, version 1, flags (bit 0 session running, bit 1 password set, bit 2 session has an owner, bit 3 counter on, bit 4 a link is connected), battery %, end number, shots in the end, session points (16 bit), scored arrows, X count, the low 4 bytes of the chip id and the archer's name (8 bytes). A trainer's phone shows a whole range of sights from this without connecting. The 128-bit service UUID is no longer advertised (no room): apps find the sight by name and by this data.
+- **Copying sessions in** (`log put …`) takes the owner as two optional trailing tokens, `<id> <name>`.
+
 ## Battery and charging
 
 | Item | Value |
@@ -337,12 +351,15 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `range`, `range signal on` / `off` | Learned distances and arrow speed; warning when the aim does not fit | Immediately |
 | `setup`, `setup use` / `new` / `name` / `del` | Arrow/bow setups, each learns its own speed | Immediately |
 | `log all`, `log since <n>`, `log ends <e> <id>`, `log info`, `log test` | Whole log, records after #n, ends of a session, flash status, flash self-test | – |
-| `log put …`, `log putend …` | Write a session / end from a backup (used by the app) | Yes |
+| `log put …`, `log putend …` | Write a session / end from a backup (used by the app); `log put` takes the owner as two trailing tokens | Yes |
 | `log del <e> <id>`, `log clear confirm` | Delete one session / all sessions on the sight | Yes |
 | `bat`, `bat reset` | Runtime estimate and measured current draw; clear the battery history | – / Yes |
 | `time <unix> [tz]` | Set the clock (the app does this on every connect) | Until reboot |
 | `awake <s>` | Stay reachable without movement, max 900 s | No |
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
+| `app on <id> <name>` | As `app on`, naming the archer (16 hex digits, up to 12 characters); their sessions get this owner | No |
+| `auth <password>` | Unlock a shared sight for this link | No |
+| `group`, `group set <password>` / `-`, `group trainers`, `group request`, `group approve <id>`, `group remove <id>`, `group clear` (USB only) | Shared sight: password and trainers, see above | Yes |
 | `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "UV-Sight" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
 | `shot list [m]` | Shots of the open end, one line each (`shotsStart`, `shotItem`…, `shotsEnd`): time, aiming angle, hold spread and duration, sinking before release, cant, bow rotation at release and the model's predicted position. The same lines follow every closed end | – |
 | `shot trace [last] <i>` | Aim trace of one shot: angle and cant over the 1.9 s before the release, sent as `trace` lines of 8 samples each (`k` = index of the first, `n` = total) | – |
@@ -459,7 +476,7 @@ The archive is stored in Chrome's site data. Clearing Chrome's site data deletes
 
 ---
 
-## JSON protocol (version 16)
+## JSON protocol (version 23)
 
 After `app on` the device sends **only JSON, one object per line**, until `app off` or disconnect. Commands stay the same text commands. Every object has a type field `t`. Lines that do not start with `{` (for example the greeting before `app on`) can be ignored.
 
@@ -467,30 +484,33 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 
 | Type | Fields | Sent |
 |---|---|---|
-| `hello` | `proto`, `fw`, `name`, `imu`, `log` | On `app on` |
+| `hello` | `proto`, `fw`, `name`, `imu`, `log`, `twim89`, `id`, `sname`, `led`, `pw` (password set), `role`, `pending`, `primary` | On `app on`; a locked link gets nothing else until `auth` |
+| `auth` | `ok`, `role`, `pending` | Answer to `auth` |
+| `group` | `pw`, `trainers`, `waiting`, `role`, `pending` | On `group`, after a change |
+| `trainersStart` / `trainer` / `trainersEnd` | `n`; per trainer `id`, `name`, `pending` | On `group trainers`, after a change |
 | `status` | `light`, `dark`, `vbat`, `pct`, `chg` (`charging`/`full`/`no USB`), `led` (`on`/`off`/`blinking`/`warning`/`pulsing`), `duty` (0–4095), `bright` (%), `mode`, `lowbat`, `tilt` (degrees or `null`), `session`, `awake`, `rwarn`, `lastShotG`, `lastShotClip`, `end`, `endShots` | On `status`, with `live on` every 2 s, every `report` s |
 | `bat` | `light`, `rest` (hours), `full` (minutes or `null`), `src` (`measured`/`estimate`), `idleMa`, `activeMa`, `ledK`, `cap` | With every status |
 | `cfgStart` | `n` | Start of the settings list |
 | `cfgItem` | `k`, `v`, `def`, `min`, `max`, `dec`, `zero`, `unit`, `d` | One per setting |
 | `cfgEnd` | – | End of the settings list |
-| `session` | `counter`, `active`; if active also `epoch`, `nextId`, `dist`, `distSrc`, `end`, `endShots`, `ends`, `invalidEnds`, `shots`, `scored`, `sum`, `x`, `avg`, `min`, `pending` | On `shots`, after every change |
+| `session` | `counter`, `active`; if active also `epoch`, `nextId`, `dist`, `distSrc`, `end`, `endShots`, `ends`, `invalidEnds`, `shots`, `scored`, `sum`, `x`, `avg`, `min`, `pending`, `owner`, `ownerName` | On `shots`, after every change |
 | `shot` | `end`, `endShots`, `total`, `g`, `clip`, `ang`, `cant` | Every detected shot |
 | `end` | `n`, `valid`, `arrows`, `dist`, `distSrc`, `setup`, `ang`, `angSd`, `angN`, `cant`, `cantMax`, `canted`, `cantN`, `stored`; valid: `sum`, `x`, `avg`; invalid: `reason` | An end was closed |
 | `confirm` | `end`, `counted`, `entered`, `split` | Mismatch, answer with `yes`, `no` or `split` |
 | `discarded` | `end` | Input discarded, end still open |
 | `sessionEnd` | `manual`, `stored`, `epoch`, `id`, `seq` (0 if not stored), `error` | Session ended (`stored:false` for empty sessions or a flash error); a `slot` line with the details follows |
 | `logStart` | `since`, `last`, `total`, `epoch` | Start of a log answer |
-| `slot` | `seq`, `epoch`, `id`, `start`, `ago`, `ends`, `shots`, `scored`, `avg`, `x`, `min`, `invalidEnds`, `invalidArrows`, `mismatch`, `manual` | One per stored session |
+| `slot` | `seq`, `epoch`, `id`, `start`, `ago`, `ends`, `shots`, `scored`, `avg`, `x`, `min`, `invalidEnds`, `invalidArrows`, `mismatch`, `manual`; `owner`, `ownerName` when the session has an archer | One per stored session |
 | `endrec` | `seq`, `epoch`, `id`, `n`, `valid`, `arrows`, `skipped`, `sum`, `x`, `dist`, `auto`, `setup`, `ang`, `angSd`, `angN`, `cant`, `cantMax`, `canted`, `cantN`, `scores` | One per stored end |
 | `logEnd` | `last`, `n` (records sent in this answer) | End of a log answer. The app compares `n` with what it received and asks again if a line was lost |
 | `loginfo` | `ok`, `jedec`, `count`, `capacity`, `last`, `clock`, `migrated`, `error`, `initErr`, `resets` | On `log info` and `app on` |
 | `range` | `setup`, `name`, `state` (`learning`/`anchor`/`ready`), `ends`, `dists`, `min`, `max`, `speed`, `kmh`, `drag`, `dist`, `distSrc`, `estimated`, `signal`, `warn`, `ok` | On `range`, after changes |
-| `setupsStart` / `setupItem` / `setupsEnd` | `active`; per item `id`, `name`, `deleted`, `state`, `ends`, `kmh`, `min`, `max` | On `setup`, after changes |
+| `setupsStart` / `setupItem` / `setupsEnd` | `active`; per item `id`, `name`, `owner` (shared sight), `deleted`, `state`, `ends`, `kmh`, `min`, `max` | On `setup`, after changes |
 | `logtest` | `step`, `ok`, `detail` | During `log test` |
 | `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `cal`, `angle` (`off`/`auto`/`on`), `cantSignal`, `rangeSignal` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
 | `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`), `range` (+`warn`: `low`/`high`/empty, `ok`) | Device events. `range` is sent whenever the aiming-range signal changes, so an app can mirror the LED (e.g. by vibrating) |
-| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`) | Confirmation of a command |
+| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `group` (+`what`, `pw` / `id` / `pending`) | Confirmation of a command |
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |
 

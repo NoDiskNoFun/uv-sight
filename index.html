@@ -635,11 +635,11 @@
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_RX      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // app -> device (write)
 const NUS_TX      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // device -> app (notify)
-const PROTO_EXPECTED  = 22;
+const PROTO_EXPECTED  = 23;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.17";
+const APP_VERSION     = "5.18";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1138,6 +1138,10 @@ function checkProto() {
     w.textContent = p < PROTO_EXPECTED
       ? "The sight's firmware is older than this app. Please update the firmware on the sight."
       : "This app is older than the sight's firmware. Please update the app.";
+  } else if (state.hello && state.hello.role === "locked") {
+    // a shared sight (firmware 7.0): it answers only after the password, which this page does not ask for
+    w.hidden = false;
+    w.textContent = "This sight has a password (shared sight). Use the Android app to connect to it.";
   } else {
     w.hidden = true;
   }

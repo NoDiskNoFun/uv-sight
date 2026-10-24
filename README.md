@@ -203,6 +203,7 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 | `/level.bin` | internal | Cant indicator mode, calibration, LED switch, signals | Automatically |
 | `/setups.bin` | internal | Arrow/bow setups (32 since 7.0, with their owner on a shared sight; the 8 of older firmware are taken over) | Automatically |
 | `/group.bin` | internal | Shared sight: salted password hash, trainers, trainer requests | Automatically |
+| `/badges.bin` | internal | Play-mode badges a trainer stored (rules only, up to 16) | Automatically |
 | `/sightname.txt` | internal | Name of this sight (`name <text>`) | Automatically |
 | `/shotmodel.bin` | internal | Shot matching model per setup and its on/off switch (8 setups of older firmware are taken over) | Automatically |
 | `/bathist.bin` | internal | Battery history for the runtime estimate | Automatically |
@@ -291,6 +292,7 @@ A sight can be used by several archers in turn, for example in youth training, a
 - **Setups per archer.** On a shared sight every archer gets their own setup (named after them, created on the first greeting) and the sight switches to it when they connect, so the speed model and the shot matching learn per bow. There are 32 setups since 7.0.
 - **Board data in the advertisement.** While it advertises, the sight puts manufacturer data (company id `0xFFFF`) into the packet: `"UV"`, version 1, flags (bit 0 session running, bit 1 password set, bit 2 session has an owner, bit 3 counter on, bit 4 a link is connected), battery %, end number, shots in the end, session points (16 bit), scored arrows, X count, the low 4 bytes of the chip id and the archer's name (8 bytes). A trainer's phone shows a whole range of sights from this without connecting. The 128-bit service UUID is no longer advertised (no room): apps find the sight by name and by this data.
 - **Copying sessions in** (`log put …`) takes the owner as two optional trailing tokens, `<id> <name>`.
+- **Badges.** A trainer stores the play-mode badges of the group on the sight: `badge set <id> <metric> <scope> <min|max> <l1>[,<l2>[,<l3>]] <emoji> <title>` (up to 16; id 8 characters, metric and scope as the app names them, one to three thresholds for bronze, silver and gold), `badge del <id>`, `badge clear`, `badge list` (`badgesStart` / `badgeItem` / `badgesEnd`). On a shared sight only a trainer writes. The sight stores the rules only; every archer's app fetches them on connecting and works out what it earned from its own history, and keeps what it earned even when a badge is removed again.
 
 ## Battery and charging
 
@@ -358,6 +360,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `awake <s>` | Stay reachable without movement, max 900 s | No |
 | `app on` / `app off` | JSON output for the app / human-readable output | No (off on disconnect) |
 | `app on <id> <name>` | As `app on`, naming the archer (16 hex digits, up to 12 characters); their sessions get this owner | No |
+| `badge list`, `badge set …`, `badge del <id>`, `badge clear` | Play-mode badges stored on the sight, see above | Yes |
 | `auth <password>` | Unlock a shared sight for this link | No |
 | `group`, `group set <password>` / `-`, `group trainers`, `group request`, `group approve <id>`, `group remove <id>`, `group clear` (USB only) | Shared sight: password and trainers, see above | Yes |
 | `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "UV-Sight" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
@@ -476,7 +479,7 @@ The archive is stored in Chrome's site data. Clearing Chrome's site data deletes
 
 ---
 
-## JSON protocol (version 23)
+## JSON protocol (version 24)
 
 After `app on` the device sends **only JSON, one object per line**, until `app off` or disconnect. Commands stay the same text commands. Every object has a type field `t`. Lines that do not start with `{` (for example the greeting before `app on`) can be ignored.
 
@@ -488,6 +491,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `auth` | `ok`, `role`, `pending` | Answer to `auth` |
 | `group` | `pw`, `trainers`, `waiting`, `role`, `pending` | On `group`, after a change |
 | `trainersStart` / `trainer` / `trainersEnd` | `n`; per trainer `id`, `name`, `pending` | On `group trainers`, after a change |
+| `badgesStart` / `badgeItem` / `badgesEnd` | `n`; per badge `id`, `emoji`, `title`, `metric`, `scope`, `op`, `levels` | On `badge list`, after a change |
 | `status` | `light`, `dark`, `vbat`, `pct`, `chg` (`charging`/`full`/`no USB`), `led` (`on`/`off`/`blinking`/`warning`/`pulsing`), `duty` (0–4095), `bright` (%), `mode`, `lowbat`, `tilt` (degrees or `null`), `session`, `awake`, `rwarn`, `lastShotG`, `lastShotClip`, `end`, `endShots` | On `status`, with `live on` every 2 s, every `report` s |
 | `bat` | `light`, `rest` (hours), `full` (minutes or `null`), `src` (`measured`/`estimate`), `idleMa`, `activeMa`, `ledK`, `cap` | With every status |
 | `cfgStart` | `n` | Start of the settings list |
@@ -510,7 +514,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `cal`, `angle` (`off`/`auto`/`on`), `cantSignal`, `rangeSignal` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
 | `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`), `range` (+`warn`: `low`/`high`/empty, `ok`) | Device events. `range` is sent whenever the aiming-range signal changes, so an app can mirror the LED (e.g. by vibrating) |
-| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `group` (+`what`, `pw` / `id` / `pending`) | Confirmation of a command |
+| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `group` (+`what`, `pw` / `id` / `pending`), `badge` (+`what`, `id`) | Confirmation of a command |
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |
 

@@ -194,8 +194,8 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.0";
-const uint8_t  PROTO_VERSION     = 23;
+const char*    FW_VERSION        = "7.1";
+const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
 const char*    BLE_NAME          = "UV-Sight";
@@ -699,6 +699,26 @@ GroupFile group;
 // Owner of the running session: the primary link's app when it started; all 0xFF = none
 uint8_t  sessOwnerId[8];
 char     sessOwnerName[13];
+
+// Badges a trainer put on the sight (play mode): only the rules, the archers' apps work out who earned
+// what. Stored in /badges.bin; up to BADGE_MAX of them.
+const char*    BADGE_FILE  = "/badges.bin";
+const uint32_t BADGE_MAGIC = 0x31474442;   // "BDG1"
+const uint8_t  BADGE_MAX   = 16;
+struct BadgeDef {
+  uint8_t used;
+  char    id[9];           // 8 characters
+  char    emoji[9];        // one emoji, UTF-8
+  char    title[19];
+  char    metric[11];
+  char    scope[9];
+  char    op[4];           // "min" / "max"
+  uint8_t nLevels;
+  uint8_t pad[3];
+  float   levels[3];       // bronze, silver, gold
+};
+struct BadgeFile { uint32_t magic; uint8_t n; uint8_t pad[3]; BadgeDef b[BADGE_MAX]; };
+BadgeFile badges;
 LedMode  ledMode           = MODE_AUTO;
 uint8_t  darkCount         = 0;
 uint8_t  brightCount       = 0;
@@ -3776,6 +3796,7 @@ void printHelp() {
   out("level cal2        calibration step 2");
   out("app on|off        JSON output for the app ('app on <id> <name>' names the archer)");
   out("auth <password>   unlock a shared sight; group ...  password and trainers (see README)");
+  out("badge list|set|del|clear  play-mode badges a trainer stores on the sight (see README)");
   out("awake <s>         stay reachable without movement (max 900 s, 0 = off)");
   out("bat               runtime estimate and measured current draw");
   out("bat reset         clear the battery history");
@@ -4518,7 +4539,7 @@ bool keepsPendingScore(const String& l) {
          l.startsWith("log ends ") || l.startsWith("log put ") || l.startsWith("log putend ") ||
          l.startsWith("time ") || l.startsWith("awake ") ||
          l == "app on" || l.startsWith("app on ") || l == "app off" || l == "live on" || l == "live off" ||
-         l.startsWith("auth ") || l == "group" || l.startsWith("group ");
+         l.startsWith("auth ") || l == "group" || l.startsWith("group ") || l == "badge" || l.startsWith("badge ");
 }
 
 // ============================================================================
@@ -4730,6 +4751,107 @@ void handleGroup(String arg, String rawArg) {
   err("Possible: group, group set <password>|-, group trainers, group request, group approve <id>, group remove <id>, group clear (USB)");
 }
 
+// ============================================================================
+// Badges (play mode rules a trainer stores on the sight)
+// ============================================================================
+bool badgesSave() {
+  InternalFS.remove(BADGE_FILE);
+  File f(InternalFS);
+  if (!f.open(BADGE_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)&badges, sizeof(badges));
+  f.close();
+  return true;
+}
+void badgesLoad() {
+  memset(&badges, 0, sizeof(badges));
+  File f(InternalFS);
+  if (f.open(BADGE_FILE, FILE_O_READ)) {
+    BadgeFile tmp;
+    if (f.read(&tmp, sizeof(tmp)) == (int)sizeof(tmp) && tmp.magic == BADGE_MAGIC) badges = tmp;
+    f.close();
+  }
+  if (badges.magic != BADGE_MAGIC) { memset(&badges, 0, sizeof(badges)); badges.magic = BADGE_MAGIC; }
+}
+String badgeJson(const BadgeDef& b) {
+  String j = "{\"t\":\"badgeItem\",\"id\":" + jstr(String(b.id)) + ",\"emoji\":" + jstr(String(b.emoji)) + ",\"title\":" + jstr(String(b.title)) +
+             ",\"metric\":" + jstr(String(b.metric)) + ",\"scope\":" + jstr(String(b.scope)) + ",\"op\":" + jstr(String(b.op)) + ",\"levels\":[";
+  for (uint8_t i = 0; i < b.nLevels && i < 3; i++) { if (i) j += ","; j += String(b.levels[i], 2); }
+  return j + "]}";
+}
+void printBadges() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < BADGE_MAX; i++) if (badges.b[i].used) n++;
+  if (!appMode) {
+    out("--- Badges on this sight: " + String(n) + " ---");
+    for (uint8_t i = 0; i < BADGE_MAX; i++) if (badges.b[i].used) out("  " + String(badges.b[i].emoji) + " " + String(badges.b[i].title) + ": " + String(badges.b[i].metric) + "/" + String(badges.b[i].scope) + " " + String(badges.b[i].op));
+    return;
+  }
+  sendLine("{\"t\":\"badgesStart\",\"n\":" + String(n) + "}");
+  for (uint8_t i = 0; i < BADGE_MAX; i++) if (badges.b[i].used) sendLine(badgeJson(badges.b[i]));
+  sendLine("{\"t\":\"badgesEnd\"}");
+}
+static void copyField(char* dst, size_t cap, const String& src) {
+  String clean;
+  for (unsigned int i = 0; i < src.length(); i++) { const char c = src[i]; if ((uint8_t)c < 0x20 || c == '"' || c == '\\') continue; clean += c; }
+  uint8_t len = clean.length() > cap - 1 ? cap - 1 : clean.length();
+  while (len > 0 && len < clean.length() && ((uint8_t)clean[len] & 0xC0) == 0x80) len--;
+  memset(dst, 0, cap);
+  memcpy(dst, clean.c_str(), len);
+}
+// badge | badge list | badge set <id> <metric> <scope> <min|max> <l1>[,<l2>[,<l3>]] <emoji> <title...> | badge del <id> | badge clear
+void handleBadge(String arg, String rawArg) {
+  arg.trim(); rawArg.trim();
+  if (arg == "" || arg == "list") { printBadges(); return; }
+  // on a shared sight only a trainer writes
+  if (curLink >= 0 && (groupHasPw() || group.nTrainers) && linkRole(curLink) != ROLE_TRAINER) {
+    if (appMode) sendLine("{\"t\":\"err\",\"code\":\"trainer\",\"text\":\"Only a trainer may change the badges of a shared sight.\"}"); else err("Only a trainer may change the badges."); return;
+  }
+  const String ack = "{\"t\":\"ack\",\"cmd\":\"badge\",\"what\":";
+  if (arg == "clear") {
+    memset(&badges, 0, sizeof(badges)); badges.magic = BADGE_MAGIC;
+    if (!badgesSave()) { err("ERROR while saving!"); return; }
+    say("All badges removed.", ack + "\"clear\"}"); printBadges(); return;
+  }
+  if (arg.startsWith("del ")) {
+    String id = rawArg.substring(4); id.trim();
+    for (uint8_t i = 0; i < BADGE_MAX; i++) if (badges.b[i].used && id == badges.b[i].id) {
+      badges.b[i].used = 0;
+      if (!badgesSave()) { err("ERROR while saving!"); return; }
+      say("Badge removed.", ack + "\"del\",\"id\":" + jstr(id) + "}"); printBadges(); return;
+    }
+    err("No badge with this id."); return;
+  }
+  if (arg.startsWith("set ")) {
+    // tokens: id metric scope op levels emoji, the rest is the title
+    String rest = rawArg.substring(4); rest.trim();
+    String tok[6];
+    for (uint8_t k = 0; k < 6; k++) {
+      const int sp = rest.indexOf(' ');
+      if (sp < 0) { if (k < 5) { err("Format: badge set <id> <metric> <scope> <min|max> <levels> <emoji> <title>"); return; } tok[k] = rest; rest = ""; break; }
+      tok[k] = rest.substring(0, sp); rest = rest.substring(sp + 1); rest.trim();
+    }
+    if (tok[0].length() == 0 || tok[0].length() > 8 || rest.length() == 0) { err("Format: badge set <id> <metric> <scope> <min|max> <levels> <emoji> <title>"); return; }
+    int8_t slot = -1;
+    for (uint8_t i = 0; i < BADGE_MAX && slot < 0; i++) if (badges.b[i].used && tok[0] == badges.b[i].id) slot = i;
+    for (uint8_t i = 0; i < BADGE_MAX && slot < 0; i++) if (!badges.b[i].used) slot = i;
+    if (slot < 0) { err("All " + String(BADGE_MAX) + " badge places are used."); return; }
+    BadgeDef& b = badges.b[slot];
+    memset(&b, 0, sizeof(b));
+    b.used = 1;
+    copyField(b.id, sizeof(b.id), tok[0]); copyField(b.metric, sizeof(b.metric), tok[1]); copyField(b.scope, sizeof(b.scope), tok[2]);
+    copyField(b.op, sizeof(b.op), tok[3] == "max" ? String("max") : String("min"));
+    String lv = tok[4]; uint8_t n = 0;
+    while (lv.length() && n < 3) { const int c = lv.indexOf(','); const String one = c < 0 ? lv : lv.substring(0, c); b.levels[n++] = one.toFloat(); lv = c < 0 ? String("") : lv.substring(c + 1); }
+    b.nLevels = n ? n : 1;
+    copyField(b.emoji, sizeof(b.emoji), tok[5]); copyField(b.title, sizeof(b.title), rest);
+    if (!badgesSave()) { err("ERROR while saving!"); return; }
+    say("Badge " + String(b.title) + " stored.", ack + "\"set\",\"id\":" + jstr(String(b.id)) + "}");
+    printBadges();
+    return;
+  }
+  err("Possible: badge list, badge set <id> <metric> <scope> <min|max> <levels> <emoji> <title>, badge del <id>, badge clear");
+}
+
 void handleCommand(String line) {
   line.trim();
   const String raw = line;                        // original case (setup names, passwords)
@@ -4759,6 +4881,7 @@ void handleCommand(String line) {
   }
   if (line.startsWith("auth "))  { handleAuth(raw.substring(5)); return; }
   if (line == "group" || line.startsWith("group ")) { handleGroup(line.substring(5), raw.substring(5)); return; }
+  if (line == "badge" || line.startsWith("badge ")) { handleBadge(line.substring(5), raw.substring(5)); return; }
   if (curLink >= 0 && !linkAllows(curLink, line)) return;
 
   // Setting the distance must not discard an open score question
@@ -5090,6 +5213,7 @@ void setup() {
   levelLoad();
   sightNameLoad();
   groupLoad();
+  badgesLoad();
   shotModelLoad();
 
   imuOk = imuInit();

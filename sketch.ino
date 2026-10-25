@@ -194,7 +194,7 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.1";
+const char*    FW_VERSION        = "7.2";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
@@ -4695,9 +4695,11 @@ void handleGroup(String arg, String rawArg) {
   if (arg.startsWith("set")) {
     String pw = rawArg.length() > 3 ? rawArg.substring(3) : String(""); pw.trim();
     if (curLink < 0 && !usb) return;
-    // first password: whoever sets it becomes the first trainer; later only a trainer may change it
+    // first password: whoever sets it becomes the first trainer (if the app named itself); later only a
+    // trainer may change it, or, on a sight without trainers (single mode), whoever gave the current password
     const bool first = !groupHasPw() && group.nTrainers == 0;
-    if (!first && !trainer && !usb) { err("Only a trainer may change the password."); return; }
+    const bool ownerAlone = group.nTrainers == 0 && curLink >= 0 && links[curLink].authed;
+    if (!first && !trainer && !usb && !ownerAlone) { err("Only a trainer may change the password."); return; }
     if (pw == "-" || pw.length() == 0) { memset(group.hash, 0, 32); }
     else {
       if (pw.length() < 4) { err("Password: at least 4 characters."); return; }

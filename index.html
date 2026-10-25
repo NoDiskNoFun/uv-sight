@@ -640,7 +640,7 @@ const PROTO_EXPECTED  = 24;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.21";
+const APP_VERSION     = "5.22";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1111,7 +1111,7 @@ function handleLine(line) {
         else afterClear(m.count);
       }
       if (m.cmd === "dfu") toast("The sight now shows up as a drive on your computer. Copy the new firmware onto it.");
-      if (m.cmd === "factory" && m.ok) { toast("Everything on the sight is erased. It restarts without name, password and settings."); afterClear(state.loginfo ? state.loginfo.count : 0); }
+      if (m.cmd === "factory" && m.ok) toast("Everything on the sight is erased. It restarts as a new sight, without name, password and settings.");
       break;
     case "cal":
       onCal(m);
@@ -3064,7 +3064,7 @@ $("btnDefaults").addEventListener("click", async () => {
 });
 $("btnFactory").addEventListener("click", async () => {
   const ok = await dialog({ title: "Reset the sight to factory state?",
-    text: "Erases everything on the sight: settings, calibration, setups and learned arrow speeds, all sessions, the name, password and trainers, badges and the battery statistics. The sight then restarts as if freshly built. Everything in this app is kept.",
+    text: "Erases everything on the sight: settings, calibration, setups and learned arrow speeds, all sessions, the name, password and trainers, badges and the battery statistics. The sight then restarts as a new sight with a new id, as if freshly built. Everything in this app is kept; the old sight stays in the history with its sessions.",
     yes: "Erase", no: "Cancel", danger: true });
   if (!ok) return;
   if (!(await withConnection(() => {}))) return;

@@ -194,7 +194,7 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.4";
+const char*    FW_VERSION        = "7.5";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
@@ -1602,11 +1602,13 @@ void factoryReset(String args) {
     return;
   }
   factoryArmedMs = 0;
-  say("Erasing everything. The sight restarts without name, password and settings.", "{\"t\":\"ack\",\"cmd\":\"factory\",\"ok\":true}");
-  delay(300);                                  // let the message go out
   uvOff();
   const char* files[] = { CFG_FILE, STATE_FILE, LEGACY_FILE, LEGACY_BACKUP, BH_FILE, LEVEL_FILE, GROUP_FILE, BADGE_FILE, SHOTMODEL_FILE, SETUP_FILE, NAME_FILE };
   for (const char* f : files) InternalFS.remove(f);
+  const bool newId = sightIdRenew();          // a new sight to the app from now on
+  say("Erasing everything. The sight restarts as a new sight (id " + deviceIdHex() + "), without name, password and settings.",
+      "{\"t\":\"ack\",\"cmd\":\"factory\",\"ok\":true,\"id\":" + jstr(deviceIdHex()) + ",\"newId\":" + jbool(newId) + "}");
+  delay(300);                                  // let the message go out
   // the session log: every sector that holds anything (an erased sector reads as all 0xFF), the test sector included
   if (qspiOpen()) {
     LogRec r;
@@ -4213,12 +4215,38 @@ void setClock(String args) {
 }
 
 // ============================================================================
-// Sight identity: a fixed id from the chip and a name the owner can set, so the
-// app can tell two sights apart (sessions, sync, preferences per sight)
+// Sight identity: an id and a name the owner can set, so the app can tell two
+// sights apart (sessions, sync, preferences per sight). The id is the chip's
+// own until a factory reset, which draws a new random one and keeps it in a
+// file: to the app the sight is then a new one, nothing of the old flows back.
 // ============================================================================
+const char* ID_FILE = "/sightid.bin";
+uint32_t sightId[2] = { 0, 0 };          // low, high word; 0/0 until loaded
+void sightIdLoad() {
+  sightId[0] = NRF_FICR->DEVICEID[0]; sightId[1] = NRF_FICR->DEVICEID[1];
+  File f(InternalFS);
+  if (f.open(ID_FILE, FILE_O_READ)) {
+    uint32_t v[2];
+    if (f.read(v, sizeof(v)) == (int)sizeof(v) && (v[0] || v[1])) { sightId[0] = v[0]; sightId[1] = v[1]; }
+    f.close();
+  }
+}
+/** A fresh random id, written for the next boot (factory reset). */
+bool sightIdRenew() {
+  uint32_t v[2] = { 0, 0 };
+  for (uint8_t t = 0; t < 20 && !(v[0] || v[1]); t++) if (sd_rand_application_vector_get((uint8_t*)v, sizeof(v)) != 0) { v[0] = 0; v[1] = 0; delay(2); }
+  if (!(v[0] || v[1])) { v[0] = millis() ^ NRF_FICR->DEVICEID[0]; v[1] = (millis() * 2654435761UL) ^ NRF_FICR->DEVICEID[1]; }
+  InternalFS.remove(ID_FILE);
+  File f(InternalFS);
+  if (!f.open(ID_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)v, sizeof(v));
+  f.close();
+  sightId[0] = v[0]; sightId[1] = v[1];
+  return true;
+}
 String deviceIdHex() {
   char b[17];
-  snprintf(b, sizeof(b), "%08lX%08lX", (unsigned long)NRF_FICR->DEVICEID[1], (unsigned long)NRF_FICR->DEVICEID[0]);
+  snprintf(b, sizeof(b), "%08lX%08lX", (unsigned long)sightId[1], (unsigned long)sightId[0]);
   return String(b);
 }
 
@@ -4241,7 +4269,7 @@ void advPayload(uint8_t* b) {
   b[9] = pts & 0xFF; b[10] = pts >> 8;
   b[11] = sessionActive ? (uint8_t)(scoreCount > 255 ? 255 : scoreCount) : 0;
   b[12] = sessionActive ? (uint8_t)(xCount > 255 ? 255 : xCount) : 0;
-  const uint32_t did = NRF_FICR->DEVICEID[0];
+  const uint32_t did = sightId[0];
   b[13] = did & 0xFF; b[14] = (did >> 8) & 0xFF; b[15] = (did >> 16) & 0xFF; b[16] = (did >> 24) & 0xFF;
   if (sessionActive && !noId(sessOwnerId)) { uint8_t n = 0; while (n < 8 && sessOwnerName[n]) n++; while (n > 0 && ((uint8_t)sessOwnerName[n] & 0xC0) == 0x80) n--; memcpy(b + 17, sessOwnerName, n); }
 }
@@ -5248,6 +5276,7 @@ void setup() {
   analogSampleTime(40);
 
   InternalFS.begin();
+  sightIdLoad();
   cfgLoad();
   // logInit() runs after bleInit(): the random epoch needs the SoftDevice
   levelLoad();

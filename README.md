@@ -1,6 +1,6 @@
-# UV-Sight
+# Anchored
 
-Automatic UV illumination, cant indicator and shot counter for a compound bow hunting sight, with a companion web app.
+**Anchored** is a bow sight add-on: automatic UV illumination, cant indicator and shot counter for a compound bow hunting sight. **Nocked** is its companion app, as a web app in this repository and as a native Android app in [uv-sight-android](https://github.com/NoDiskNoFun/uv-sight-android). The repositories keep their original name `uv-sight`.
 
 > **Disclaimer: AI-generated project**
 >
@@ -14,7 +14,7 @@ Automatic UV illumination, cant indicator and shot counter for a compound bow hu
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 5.8, protocol 16, app 5.11 |
+> | Firmware / protocol / app | Firmware 7.3, protocol 24, app 5.20 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -324,7 +324,7 @@ Measurements taken with a USB power meter are not meaningful for battery runtime
 
 ## Bluetooth commands
 
-Connect with any Nordic UART terminal (for example the Android app "Serial Bluetooth Terminal", line ending LF or CR+LF), with `ble-serial` on Linux, or with the web app. The board advertises as **UV-Sight** only while it is active.
+Connect with any Nordic UART terminal (for example the Android app "Serial Bluetooth Terminal", line ending LF or CR+LF), with `ble-serial` on Linux, or with the web app. The board advertises as **Anchored** (**UV-Sight** before firmware 7.3) only while it is active.
 
 | Command | Effect | Saved |
 |---|---|---|
@@ -363,7 +363,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `badge list`, `badge set …`, `badge del <id>`, `badge clear` | Play-mode badges stored on the sight, see above | Yes |
 | `auth <password>` | Unlock a shared sight for this link | No |
 | `group`, `group set <password>` / `-`, `group trainers`, `group request`, `group approve <id>`, `group remove <id>`, `group clear` (USB only) | Shared sight: password and trainers, see above | Yes |
-| `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "UV-Sight" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
+| `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "Anchored" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
 | `shot list [m]` | Shots of the open end, one line each (`shotsStart`, `shotItem`…, `shotsEnd`): time, aiming angle, hold spread and duration, sinking before release, cant, bow rotation at release and the model's predicted position. The same lines follow every closed end | – |
 | `shot trace [last] <i>` | Aim trace of one shot: angle and cant over the 1.9 s before the release, sent as `trace` lines of 8 samples each (`k` = index of the first, `n` = total) | – |
 | `shot teach <end> <i>:<dx>:<dy> …` | Confirmed arrow positions (mm from the group's mean) for shots of the last closed end: the model learns from them | Yes |
@@ -431,7 +431,7 @@ These are set at the top of the sketch and need a rebuild.
 | `TWIM_ANOMALY_89` | 1 | nRF52840 erratum 89 workaround (I2C peripheral off between loop passes): 0 = never, 1 = automatic (the firmware asks the Nordic MDK whether the chip revision is affected; only Engineering A is), 2 = always. `bat` shows whether it is active |
 | `ADV_FAST_INTERVAL` / `ADV_SLOW_INTERVAL` | 100 ms / ~1 s | Advertising for the first 10 s / afterwards |
 | `CONN_INT_MIN` / `CONN_INT_MAX` | 200 / 400 ms | Requested connection interval |
-| `BLE_NAME` | `UV-Sight` | Bluetooth name |
+| `BLE_NAME` | `Anchored` | Bluetooth name |
 
 ---
 
@@ -528,7 +528,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 
 | Problem | Cause and fix |
 |---|---|
-| App or terminal does not find `UV-Sight` | The board is idle. Move the bow, then search within 10 s. |
+| App or terminal does not find `Anchored` | The board is idle. Move the bow, then search within 10 s. |
 | PC finds the sight only briefly or not at all | Weak adapter: use a USB extension cable, avoid USB 3 ports, or raise `tx_power`. On Linux connect directly with `ble-serial -d <MAC> -t 15`; pairing is not needed. |
 | Connection drops | After `timeout` without movement the board disconnects on purpose. Move the bow or raise `timeout`. |
 | Settings tab says "Loading settings…" for long | Lines got lost. The app retries three times; move closer and tap *Try again*. |

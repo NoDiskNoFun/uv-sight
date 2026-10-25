@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#E9ECE6" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#141C17" media="(prefers-color-scheme: dark)">
-<title>UV-Sight</title>
+<title>Nocked</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
@@ -338,7 +338,7 @@
 <body>
 
 <header>
-  <h1>UV-Sight</h1>
+  <h1>Nocked</h1>
   <span class="conn" id="conn" data-s="off"><span class="dot"></span><span id="connText">Not connected</span></span>
 </header>
 
@@ -537,7 +537,7 @@
       </div>
       <div class="switchrow" id="installRow" hidden>
         <div><div class="lbl">Install app</div>
-          <div class="desc">Adds UV-Sight to your home screen. It then also works without internet.</div></div>
+          <div class="desc">Adds Nocked to your home screen. It then also works without internet.</div></div>
         <button class="btn secondary" id="btnInstall">Install</button>
       </div>
       <div class="switchrow" id="dfuRow" hidden>
@@ -639,7 +639,7 @@ const PROTO_EXPECTED  = 24;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.19";
+const APP_VERSION     = "5.20";
 
 // ---------------------------------------------------------------------------
 // State
@@ -747,7 +747,7 @@ async function connect() {
   if (!navigator.bluetooth) return;
   try {
     device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [NUS_SERVICE] }, { namePrefix: "UV-Sight" }],
+      filters: [{ services: [NUS_SERVICE] }, { namePrefix: "Anchored" }, { namePrefix: "UV-Sight" }],   // "UV-Sight": firmware before 7.3
       optionalServices: [NUS_SERVICE],
     });
     device.addEventListener("gattserverdisconnected", onDisconnected);
@@ -1395,7 +1395,7 @@ function ensureConnected() {
       // Known device from this app session, or one Chrome remembers
       if (!device && navigator.bluetooth && navigator.bluetooth.getDevices) {
         const list = await navigator.bluetooth.getDevices();
-        device = list.find((d) => d.name && d.name.startsWith("UV-Sight")) || null;
+        device = list.find((d) => d.name && (d.name.startsWith("Anchored") || d.name.startsWith("UV-Sight"))) || null;
         if (device) device.addEventListener("gattserverdisconnected", onDisconnected);
       }
       if (!device) {                      // first time: the chooser needs this tap
@@ -2149,7 +2149,7 @@ function exportBackup() {
     format: "uv-sight-backup", version: 1, app: APP_VERSION, exported: new Date().toISOString(),
     sessions: loadArchive(), ends: loadEnds(), deleted: [...loadDeleted()],
   };
-  download(`uv-sight-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data), "application/json");
+  download(`nocked-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data), "application/json");
 }
 
 function parseCsv(text) {
@@ -2269,7 +2269,7 @@ async function importFile(file) {
     const text = await file.text();
     if (file.name.toLowerCase().endsWith(".json") || text.trim().startsWith("{")) {
       const d = JSON.parse(text);
-      if (d.format !== "uv-sight-backup" || !Array.isArray(d.sessions)) throw new Error("not a UV-Sight backup");
+      if (d.format !== "uv-sight-backup" || !Array.isArray(d.sessions)) throw new Error("not a Nocked backup");
       result = importSessions(d.sessions, d.ends || {});
       what = "backup";
     } else {
@@ -2582,7 +2582,7 @@ function exportCsv() {
   const blob = new Blob([lines.join("\r\n") + "\r\n"], { type: "text/csv;charset=utf-8" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `uv-sight-ends-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = `nocked-ends-${new Date().toISOString().slice(0, 10)}.csv`;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
@@ -2775,7 +2775,7 @@ function cantRows(lv) {
   const cw = document.createDocumentFragment();
   const lvMode = lv.mode || "off";
   if (lvMode !== "off" && hasLed()) {
-    cw.appendChild(switchRow("Blink when canted", "Off: the cant is still measured and stored, the LED just stays calm.",
+    cw.appendChild(switchRow("Blinking on", "The LED blinks while the bow is canted. Off: the cant is still measured and stored, the LED just stays calm.",
       lv.cantSignal !== false, (on) => setLevel(on ? "level signal on" : "level signal off", { cantSignal: on })));
     const st = lv.style || "normal";
     cw.appendChild(segRow("Cant blinking mode",
@@ -3044,7 +3044,7 @@ window.addEventListener("beforeinstallprompt", (e) => {
 window.addEventListener("appinstalled", () => {
   installEvent = null;
   $("installRow").hidden = true;
-  toast("Installed. Start UV-Sight from the home screen.");
+  toast("Installed. Start Nocked from the home screen.");
 });
 $("btnInstall").addEventListener("click", async () => {
   if (!installEvent) return;

@@ -1,6 +1,6 @@
 /*
   ============================================================================
-  UV sight illumination + shot counter for compound bows
+  Anchored: UV sight illumination + shot counter for compound bows
   Board: Seeed XIAO nRF52840 Sense
   ============================================================================
 
@@ -194,11 +194,11 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.2";
+const char*    FW_VERSION        = "7.3";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
-const char*    BLE_NAME          = "UV-Sight";
+const char*    BLE_NAME          = "Anchored";   // "UV-Sight" before firmware 7.3; the apps find both names
 const char*    NAME_FILE         = "/sightname.txt";   // the name the owner gave this sight ("name <text>")
 char           sightName[20]     = "";                 // shown in the app and appended to the BLE name
 const uint16_t ADV_FAST_INTERVAL = 160;   // 100 ms (unit 0.625 ms), first 10 s
@@ -5333,7 +5333,7 @@ void loop() {
     if (!links[h].used || links[h].welcomed || !Bluefruit.connected(h) || !bleuart.notifyEnabled(h)) continue;
     links[h].welcomed = true;
     curLink = h; appMode = links[h].app;
-    out("UV-Sight connected. 'help' lists all commands.");
+    out("Anchored connected. 'help' lists all commands.");
     if (!imuOk) out("Note: IMU not found, motion detection off.");
     sendStatus();
     if (sessionActive) out(sessionLine());

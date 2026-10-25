@@ -1,6 +1,6 @@
 /*
   ============================================================================
-  UV sight illumination + shot counter for compound bows
+  Anchored: UV sight illumination + shot counter for compound bows
   Board: Seeed XIAO nRF52840 Sense
   ============================================================================
 
@@ -194,11 +194,11 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.1";
+const char*    FW_VERSION        = "7.3";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
-const char*    BLE_NAME          = "UV-Sight";
+const char*    BLE_NAME          = "Anchored";   // "UV-Sight" before firmware 7.3; the apps find both names
 const char*    NAME_FILE         = "/sightname.txt";   // the name the owner gave this sight ("name <text>")
 char           sightName[20]     = "";                 // shown in the app and appended to the BLE name
 const uint16_t ADV_FAST_INTERVAL = 160;   // 100 ms (unit 0.625 ms), first 10 s
@@ -4695,9 +4695,11 @@ void handleGroup(String arg, String rawArg) {
   if (arg.startsWith("set")) {
     String pw = rawArg.length() > 3 ? rawArg.substring(3) : String(""); pw.trim();
     if (curLink < 0 && !usb) return;
-    // first password: whoever sets it becomes the first trainer; later only a trainer may change it
+    // first password: whoever sets it becomes the first trainer (if the app named itself); later only a
+    // trainer may change it, or, on a sight without trainers (single mode), whoever gave the current password
     const bool first = !groupHasPw() && group.nTrainers == 0;
-    if (!first && !trainer && !usb) { err("Only a trainer may change the password."); return; }
+    const bool ownerAlone = group.nTrainers == 0 && curLink >= 0 && links[curLink].authed;
+    if (!first && !trainer && !usb && !ownerAlone) { err("Only a trainer may change the password."); return; }
     if (pw == "-" || pw.length() == 0) { memset(group.hash, 0, 32); }
     else {
       if (pw.length() < 4) { err("Password: at least 4 characters."); return; }
@@ -5331,7 +5333,7 @@ void loop() {
     if (!links[h].used || links[h].welcomed || !Bluefruit.connected(h) || !bleuart.notifyEnabled(h)) continue;
     links[h].welcomed = true;
     curLink = h; appMode = links[h].app;
-    out("UV-Sight connected. 'help' lists all commands.");
+    out("Anchored connected. 'help' lists all commands.");
     if (!imuOk) out("Note: IMU not found, motion detection off.");
     sendStatus();
     if (sessionActive) out(sessionLine());

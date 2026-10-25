@@ -1,8 +1,8 @@
-// UV-Sight service worker: makes the app start without internet.
+// Nocked service worker: makes the app start without internet.
 // Strategy: try the network first (so updates arrive automatically when the
 // server is reachable), fall back to the cached copy after a short timeout.
 
-const CACHE = "uv-sight-v1";
+const CACHE = "nocked-v1";
 const FILES = [
   "./",
   "./index.html",

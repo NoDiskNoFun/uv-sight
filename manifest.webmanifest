@@ -1,12 +1,12 @@
 {
-  "name": "UV-Sight",
-  "short_name": "UV-Sight",
-  "description": "Status, training scores and settings for the UV sight light.",
+  "name": "Nocked",
+  "short_name": "Nocked",
+  "description": "Status, training scores and settings for the Anchored bow sight.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#141C17",
+  "background_color": "#0E1424",
   "theme_color": "#141C17",
   "icons": [
     { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },

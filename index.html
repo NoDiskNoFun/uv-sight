@@ -499,6 +499,7 @@
       </div>
       <div style="text-align:center; margin: 18px 0 6px">
         <button class="btn secondary" id="btnDefaults">Restore defaults</button>
+        <button class="btn secondary" id="btnFactory" style="color:var(--red); box-shadow: inset 0 0 0 2px var(--red)">Factory reset</button>
       </div>
     </div>
 
@@ -639,7 +640,7 @@ const PROTO_EXPECTED  = 24;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.20";
+const APP_VERSION     = "5.21";
 
 // ---------------------------------------------------------------------------
 // State
@@ -1110,6 +1111,7 @@ function handleLine(line) {
         else afterClear(m.count);
       }
       if (m.cmd === "dfu") toast("The sight now shows up as a drive on your computer. Copy the new firmware onto it.");
+      if (m.cmd === "factory" && m.ok) { toast("Everything on the sight is erased. It restarts without name, password and settings."); afterClear(state.loginfo ? state.loginfo.count : 0); }
       break;
     case "cal":
       onCal(m);
@@ -3059,6 +3061,14 @@ $("btnDefaults").addEventListener("click", async () => {
   if (!ok) return;
   expectDefaults = true;
   send("defaults");
+});
+$("btnFactory").addEventListener("click", async () => {
+  const ok = await dialog({ title: "Reset the sight to factory state?",
+    text: "Erases everything on the sight: settings, calibration, setups and learned arrow speeds, all sessions, the name, password and trainers, badges and the battery statistics. The sight then restarts as if freshly built. Everything in this app is kept.",
+    yes: "Erase", no: "Cancel", danger: true });
+  if (!ok) return;
+  if (!(await withConnection(() => {}))) return;
+  send("factory"); send("factory confirm");
 });
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 7.3, protocol 24, app 5.20 |
+> | Firmware / protocol / app | Firmware 7.4, protocol 24, app 5.21 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -210,7 +210,7 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 | session log | external 2 MB QSPI flash | Sessions and ends as 64-byte records with CRC, ring buffer | Automatically |
 | `/shots.old` | internal | Backup of the log format of firmware 1.2 to 2.1 after the migration | Once |
 
-When a firmware update changes the layout of an internal file, that file starts over with defaults. The session log on the external flash keeps its format. Export a backup from the app before updating anyway.
+`factory confirm` (asked for with `factory` first; in the apps under *Settings → Advanced settings → Factory reset*) erases all of it, the session log included, and restarts the sight: it is then as freshly flashed, only the chip id stays. When a firmware update changes the layout of an internal file, that file starts over with defaults. The session log on the external flash keeps its format. Export a backup from the app before updating anyway.
 
 ---
 
@@ -334,6 +334,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `set <name> <value>` | Change a setting, active immediately | Only with `save` |
 | `save` | Save settings to flash | Yes |
 | `defaults` | Load default settings | Only with `save` |
+| `factory`, then `factory confirm` within 30 s | Factory reset: erases every file above and the session log, then restarts. The sight is then as freshly flashed: no name, no password, defaults. On a shared sight trainers only. | – |
 | `live on` / `live off` | Status every 2 s | No |
 | `mode auto` / `on` / `off` | LED test mode | No |
 | `shots` | Counter status and running session | – |
@@ -514,7 +515,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `cal`, `angle` (`off`/`auto`/`on`), `cantSignal`, `rangeSignal` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
 | `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`), `range` (+`warn`: `low`/`high`/empty, `ok`) | Device events. `range` is sent whenever the aiming-range signal changes, so an app can mirror the LED (e.g. by vibrating) |
-| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `group` (+`what`, `pw` / `id` / `pending`), `badge` (+`what`, `id`) | Confirmation of a command |
+| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `factory` (+`armed` / `ok`), `group` (+`what`, `pw` / `id` / `pending`), `badge` (+`what`, `id`) | Confirmation of a command |
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |
 

@@ -194,7 +194,7 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.3";
+const char*    FW_VERSION        = "7.4";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
@@ -1583,6 +1583,42 @@ void logClear(String args) {
   const bool ok = stateSave();
   say(ok ? "Log on the sight cleared (" + String(n) + (n == 1 ? " session)." : " sessions).") : String("ERROR while saving!"),
       "{\"t\":\"ack\",\"cmd\":\"clear\",\"ok\":" + jbool(ok) + ",\"count\":" + String(n) + "}");
+}
+
+// Factory reset: everything the sight ever stored is erased, then it restarts as if freshly flashed.
+// "factory" arms it, "factory confirm" within 30 s does it, so a terminal cannot do it by accident.
+uint32_t factoryArmedMs = 0;
+void factoryReset(String args) {
+  args.trim();
+  if (args != "confirm") {
+    factoryArmedMs = millis();
+    say("This erases EVERYTHING on the sight: settings, calibration, setups, sessions, name, password, trainers, badges, battery statistics. Send 'factory confirm' within 30 s to do it.",
+        "{\"t\":\"ack\",\"cmd\":\"factory\",\"armed\":true}");
+    return;
+  }
+  if (!factoryArmedMs || millis() - factoryArmedMs > 30000UL) {
+    say("Send 'factory' first, then 'factory confirm' within 30 s.",
+        "{\"t\":\"err\",\"code\":\"factory\",\"text\":\"Send 'factory' first, then 'factory confirm' within 30 s.\"}");
+    return;
+  }
+  factoryArmedMs = 0;
+  say("Erasing everything. The sight restarts without name, password and settings.", "{\"t\":\"ack\",\"cmd\":\"factory\",\"ok\":true}");
+  delay(300);                                  // let the message go out
+  uvOff();
+  const char* files[] = { CFG_FILE, STATE_FILE, LEGACY_FILE, LEGACY_BACKUP, BH_FILE, LEVEL_FILE, GROUP_FILE, BADGE_FILE, SHOTMODEL_FILE, SETUP_FILE, NAME_FILE };
+  for (const char* f : files) InternalFS.remove(f);
+  // the session log: every sector that holds anything (an erased sector reads as all 0xFF), the test sector included
+  if (qspiOpen()) {
+    LogRec r;
+    for (uint16_t sec = 0; sec <= QF_SECTORS; sec++) {
+      const uint32_t addr = (uint32_t)sec * QF_SECTOR;
+      if (!qfRead(addr, r)) continue;
+      bool blank = true;
+      for (size_t i = 0; i < sizeof(r); i++) if (((const uint8_t*)&r)[i] != 0xFF) { blank = false; break; }
+      if (!blank) qfEraseSector(addr);
+    }
+  }
+  sd_nvic_SystemReset();
 }
 
 // Step-by-step check of the external flash, uses its last sector only
@@ -3767,6 +3803,7 @@ void printHelp() {
   out("set <n> <v>       change a setting");
   out("save              save settings");
   out("defaults          load default values");
+  out("factory           erase everything on the sight, then restart (asks for 'factory confirm')");
   out("live on|off       readings every 2 s");
   out("mode auto|on|off  LED: light sensor / always on / off (cant blinking works in all)");
   out("shots             counter status + running session");
@@ -4647,7 +4684,7 @@ bool linkAllows(uint8_t h, const String& l) {
     }
   }
   if (r == ROLE_USER || r == ROLE_OPEN) {
-    if (l == "log clear" || l.startsWith("log clear ") || l == "log test" || l.startsWith("name ") || l == "bat reset" || l == "defaults") {
+    if (l == "log clear" || l.startsWith("log clear ") || l == "log test" || l.startsWith("name ") || l == "bat reset" || l == "defaults" || l == "factory" || l.startsWith("factory ")) {
       if (groupHasPw() || group.nTrainers) { if (appMode) sendLine("{\"t\":\"err\",\"code\":\"trainer\",\"text\":\"Only a trainer may do this on a shared sight.\"}"); else err("Only a trainer may do this."); return false; }
     }
   }
@@ -4952,6 +4989,7 @@ void handleCommand(String line) {
   else if (line.startsWith("awake "))     setAwake(line.substring(6));
   else if (line == "bat")                 printBat();
   else if (line == "bat reset")           bhReset();
+  else if (line == "factory" || line.startsWith("factory ")) factoryReset(line.substring(7));
   else if (line.startsWith("log put "))   logPut(line.substring(8));
   else if (line.startsWith("log putend ")) logPutEnd(line.substring(11));
   else if (line.startsWith("log ends "))  printEnds(line.substring(9));

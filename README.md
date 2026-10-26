@@ -14,7 +14,7 @@
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 7.5, protocol 24, app 5.22 |
+> | Firmware / protocol / app | Firmware 7.6, protocol 24, app 5.23 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -225,13 +225,14 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 
 ### Illumination
 
+- In the normal mode (`mode auto`) the LED lights only while a session is running and it is dark. A session starts with the first shot the sight registers, or earlier with `shots start` (the app's *Start session*); so the first arrow of a session shot without starting it in the app is unlit. The cant blinking and the distance warning work with or without a session.
 - Every 2 s the light sensor is read (0 = dark, 4095 = bright).
 - `confirm` readings in a row are needed to switch. Right after picking up the bow the decision is immediate.
 - **Brightness in percent** on a perceptual scale: 50 % looks about half as bright as 100 %. 100 % is 15 mA average, the former default of 5 mA is 61 %.
 - **Fixed** (`bright_mode 0`): below `dark_on` the LED switches on with `bright`, above `dark_off` it switches off. The gap prevents flicker.
 - **Auto** (`bright_mode 1`): getting darker, the LED comes on at `dark_off` with `bright_min` and gets brighter until it reaches `bright` at `dark_on`; below that it stays at `bright`. Getting brighter, it dims the same way and goes off above `dark_off`. The blend follows the light sensor logarithmically and glides over `fade` seconds instead of jumping.
 - The brightness is kept steady by PWM (12 bit) as the battery voltage drops.
-- Test modes: `mode on` (always on), `mode off` (always off), `mode auto` (normal). The mode is not saved.
+- Modes: `mode auto` (normal: dark and session), `mode on` (always on), `mode off` (always off). The mode is kept over restarts.
 
 ### Cant indicator
 
@@ -337,7 +338,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `defaults` | Load default settings | Only with `save` |
 | `factory`, then `factory confirm` within 30 s | Factory reset: erases every file above and the session log, gives the sight a new id and restarts. The sight is then as freshly flashed: no name, no password, defaults, and a new sight to the apps. On a shared sight trainers only. | – |
 | `live on` / `live off` | Status every 2 s | No |
-| `mode auto` / `on` / `off` | LED test mode | No |
+| `mode auto` / `on` / `off` | LED mode: on when dark during a session / always on / off | Yes |
 | `shots` | Counter status and running session | – |
 | `shots on` / `shots off` | Shot counter on/off (off only without a running session) | Immediately |
 | `shots start` / `shots stop` | Start / end a session manually | Slot on end |

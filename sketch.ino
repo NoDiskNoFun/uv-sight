@@ -194,7 +194,7 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.5";
+const char*    FW_VERSION        = "7.6";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
@@ -2725,7 +2725,7 @@ void updateLed(uint32_t now) {
   else if (levelActive() && lvl.cantSignal && tilted && !tiltPause) st = LS_BLINK;
   else if (ledMode == MODE_ON)                    st = LS_ON;
   else if (ledMode == MODE_OFF)                   st = LS_OFF;
-  else if (isDark)                                st = LS_ON;    // auto: light sensor
+  else if (isDark && sessionActive)               st = LS_ON;    // auto: dark, and a session is running (from the first shot or "shots start")
   else                                            st = LS_OFF;
 
   // A started pattern (cant blink, double/triple blink, pulse) always plays its
@@ -3807,7 +3807,7 @@ void printHelp() {
   out("defaults          load default values");
   out("factory           erase everything on the sight, then restart (asks for 'factory confirm')");
   out("live on|off       readings every 2 s");
-  out("mode auto|on|off  LED: light sensor / always on / off (cant blinking works in all)");
+  out("mode auto|on|off  LED: on when dark during a session / always on / off (cant blinking works in all)");
   out("shots             counter status + running session");
   out("shots on|off      shot counter on/off");
   out("shots start|stop  start/end a session manually");
@@ -4999,7 +4999,7 @@ void handleCommand(String line) {
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
   else if (line == "live off")  { liveMode = false; say("Live output off.", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":false}"); }
   else if (!ledPresent && (line == "mode auto" || line == "mode on" || line == "level signal on" || line == "range signal on")) err("This sight has no UV LED.");
-  else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
+  else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (on when it is dark and a session is running)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
   else if (line == "mode on")   { ledMode = MODE_ON;   lvl.ledMode = ledMode; levelSave(); say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
   else if (line == "mode off")  { ledMode = MODE_OFF;  lvl.ledMode = ledMode; levelSave(); say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
   else if (line == "shots")               handleShots("");

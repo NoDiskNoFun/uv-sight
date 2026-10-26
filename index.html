@@ -640,7 +640,7 @@ const PROTO_EXPECTED  = 24;
 const STATUS_POLL_MS  = 5000;
 const WRITE_CHUNK     = 20;
 const CONSOLE_MAX     = 400;
-const APP_VERSION     = "5.22";
+const APP_VERSION     = "5.23";
 
 // ---------------------------------------------------------------------------
 // State
@@ -2880,7 +2880,7 @@ function renderSettings() {
   }
   const ledMode = (state.status && state.status.mode) || "auto";
   if (hasLed()) sw.appendChild(segRow("LED",
-    (ledMode === "auto" ? "Auto: switched by the light sensor."
+    (ledMode === "auto" ? "Auto: on when it is dark and a session is running. A session starts with the first shot, or earlier with Start session now."
       : ledMode === "on" ? "On: always lit." : "Off: stays dark.") +
     " Cant blinking works in every mode. Kept after a restart.",
     (state.status && state.status.mode) || "auto", ["off", "auto", "on"], (m) => {

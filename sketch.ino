@@ -194,7 +194,7 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.3";
+const char*    FW_VERSION        = "7.6";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
@@ -1585,6 +1585,44 @@ void logClear(String args) {
       "{\"t\":\"ack\",\"cmd\":\"clear\",\"ok\":" + jbool(ok) + ",\"count\":" + String(n) + "}");
 }
 
+// Factory reset: everything the sight ever stored is erased, then it restarts as if freshly flashed.
+// "factory" arms it, "factory confirm" within 30 s does it, so a terminal cannot do it by accident.
+uint32_t factoryArmedMs = 0;
+void factoryReset(String args) {
+  args.trim();
+  if (args != "confirm") {
+    factoryArmedMs = millis();
+    say("This erases EVERYTHING on the sight: settings, calibration, setups, sessions, name, password, trainers, badges, battery statistics. Send 'factory confirm' within 30 s to do it.",
+        "{\"t\":\"ack\",\"cmd\":\"factory\",\"armed\":true}");
+    return;
+  }
+  if (!factoryArmedMs || millis() - factoryArmedMs > 30000UL) {
+    say("Send 'factory' first, then 'factory confirm' within 30 s.",
+        "{\"t\":\"err\",\"code\":\"factory\",\"text\":\"Send 'factory' first, then 'factory confirm' within 30 s.\"}");
+    return;
+  }
+  factoryArmedMs = 0;
+  uvOff();
+  const char* files[] = { CFG_FILE, STATE_FILE, LEGACY_FILE, LEGACY_BACKUP, BH_FILE, LEVEL_FILE, GROUP_FILE, BADGE_FILE, SHOTMODEL_FILE, SETUP_FILE, NAME_FILE };
+  for (const char* f : files) InternalFS.remove(f);
+  const bool newId = sightIdRenew();          // a new sight to the app from now on
+  say("Erasing everything. The sight restarts as a new sight (id " + deviceIdHex() + "), without name, password and settings.",
+      "{\"t\":\"ack\",\"cmd\":\"factory\",\"ok\":true,\"id\":" + jstr(deviceIdHex()) + ",\"newId\":" + jbool(newId) + "}");
+  delay(300);                                  // let the message go out
+  // the session log: every sector that holds anything (an erased sector reads as all 0xFF), the test sector included
+  if (qspiOpen()) {
+    LogRec r;
+    for (uint16_t sec = 0; sec <= QF_SECTORS; sec++) {
+      const uint32_t addr = (uint32_t)sec * QF_SECTOR;
+      if (!qfRead(addr, r)) continue;
+      bool blank = true;
+      for (size_t i = 0; i < sizeof(r); i++) if (((const uint8_t*)&r)[i] != 0xFF) { blank = false; break; }
+      if (!blank) qfEraseSector(addr);
+    }
+  }
+  sd_nvic_SystemReset();
+}
+
 // Step-by-step check of the external flash, uses its last sector only
 void logTest() {
   auto step = [](const String& name, bool ok, const String& detail) {
@@ -2687,7 +2725,7 @@ void updateLed(uint32_t now) {
   else if (levelActive() && lvl.cantSignal && tilted && !tiltPause) st = LS_BLINK;
   else if (ledMode == MODE_ON)                    st = LS_ON;
   else if (ledMode == MODE_OFF)                   st = LS_OFF;
-  else if (isDark)                                st = LS_ON;    // auto: light sensor
+  else if (isDark && sessionActive)               st = LS_ON;    // auto: dark, and a session is running (from the first shot or "shots start")
   else                                            st = LS_OFF;
 
   // A started pattern (cant blink, double/triple blink, pulse) always plays its
@@ -3767,8 +3805,9 @@ void printHelp() {
   out("set <n> <v>       change a setting");
   out("save              save settings");
   out("defaults          load default values");
+  out("factory           erase everything on the sight, then restart (asks for 'factory confirm')");
   out("live on|off       readings every 2 s");
-  out("mode auto|on|off  LED: light sensor / always on / off (cant blinking works in all)");
+  out("mode auto|on|off  LED: on when dark during a session / always on / off (cant blinking works in all)");
   out("shots             counter status + running session");
   out("shots on|off      shot counter on/off");
   out("shots start|stop  start/end a session manually");
@@ -4176,12 +4215,38 @@ void setClock(String args) {
 }
 
 // ============================================================================
-// Sight identity: a fixed id from the chip and a name the owner can set, so the
-// app can tell two sights apart (sessions, sync, preferences per sight)
+// Sight identity: an id and a name the owner can set, so the app can tell two
+// sights apart (sessions, sync, preferences per sight). The id is the chip's
+// own until a factory reset, which draws a new random one and keeps it in a
+// file: to the app the sight is then a new one, nothing of the old flows back.
 // ============================================================================
+const char* ID_FILE = "/sightid.bin";
+uint32_t sightId[2] = { 0, 0 };          // low, high word; 0/0 until loaded
+void sightIdLoad() {
+  sightId[0] = NRF_FICR->DEVICEID[0]; sightId[1] = NRF_FICR->DEVICEID[1];
+  File f(InternalFS);
+  if (f.open(ID_FILE, FILE_O_READ)) {
+    uint32_t v[2];
+    if (f.read(v, sizeof(v)) == (int)sizeof(v) && (v[0] || v[1])) { sightId[0] = v[0]; sightId[1] = v[1]; }
+    f.close();
+  }
+}
+/** A fresh random id, written for the next boot (factory reset). */
+bool sightIdRenew() {
+  uint32_t v[2] = { 0, 0 };
+  for (uint8_t t = 0; t < 20 && !(v[0] || v[1]); t++) if (sd_rand_application_vector_get((uint8_t*)v, sizeof(v)) != 0) { v[0] = 0; v[1] = 0; delay(2); }
+  if (!(v[0] || v[1])) { v[0] = millis() ^ NRF_FICR->DEVICEID[0]; v[1] = (millis() * 2654435761UL) ^ NRF_FICR->DEVICEID[1]; }
+  InternalFS.remove(ID_FILE);
+  File f(InternalFS);
+  if (!f.open(ID_FILE, FILE_O_WRITE)) return false;
+  f.write((const uint8_t*)v, sizeof(v));
+  f.close();
+  sightId[0] = v[0]; sightId[1] = v[1];
+  return true;
+}
 String deviceIdHex() {
   char b[17];
-  snprintf(b, sizeof(b), "%08lX%08lX", (unsigned long)NRF_FICR->DEVICEID[1], (unsigned long)NRF_FICR->DEVICEID[0]);
+  snprintf(b, sizeof(b), "%08lX%08lX", (unsigned long)sightId[1], (unsigned long)sightId[0]);
   return String(b);
 }
 
@@ -4204,7 +4269,7 @@ void advPayload(uint8_t* b) {
   b[9] = pts & 0xFF; b[10] = pts >> 8;
   b[11] = sessionActive ? (uint8_t)(scoreCount > 255 ? 255 : scoreCount) : 0;
   b[12] = sessionActive ? (uint8_t)(xCount > 255 ? 255 : xCount) : 0;
-  const uint32_t did = NRF_FICR->DEVICEID[0];
+  const uint32_t did = sightId[0];
   b[13] = did & 0xFF; b[14] = (did >> 8) & 0xFF; b[15] = (did >> 16) & 0xFF; b[16] = (did >> 24) & 0xFF;
   if (sessionActive && !noId(sessOwnerId)) { uint8_t n = 0; while (n < 8 && sessOwnerName[n]) n++; while (n > 0 && ((uint8_t)sessOwnerName[n] & 0xC0) == 0x80) n--; memcpy(b + 17, sessOwnerName, n); }
 }
@@ -4647,7 +4712,7 @@ bool linkAllows(uint8_t h, const String& l) {
     }
   }
   if (r == ROLE_USER || r == ROLE_OPEN) {
-    if (l == "log clear" || l.startsWith("log clear ") || l == "log test" || l.startsWith("name ") || l == "bat reset" || l == "defaults") {
+    if (l == "log clear" || l.startsWith("log clear ") || l == "log test" || l.startsWith("name ") || l == "bat reset" || l == "defaults" || l == "factory" || l.startsWith("factory ")) {
       if (groupHasPw() || group.nTrainers) { if (appMode) sendLine("{\"t\":\"err\",\"code\":\"trainer\",\"text\":\"Only a trainer may do this on a shared sight.\"}"); else err("Only a trainer may do this."); return false; }
     }
   }
@@ -4934,7 +4999,7 @@ void handleCommand(String line) {
   else if (line == "live on")   { liveMode = true;  say("Live output on (every 2 s).", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":true}"); }
   else if (line == "live off")  { liveMode = false; say("Live output off.", "{\"t\":\"ack\",\"cmd\":\"live\",\"on\":false}"); }
   else if (!ledPresent && (line == "mode auto" || line == "mode on" || line == "level signal on" || line == "range signal on")) err("This sight has no UV LED.");
-  else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (light sensor)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
+  else if (line == "mode auto") { ledMode = MODE_AUTO; lvl.ledMode = ledMode; levelSave(); say("LED: auto (on when it is dark and a session is running)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"auto\"}"); }
   else if (line == "mode on")   { ledMode = MODE_ON;   lvl.ledMode = ledMode; levelSave(); say("LED: always on (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"on\"}"); }
   else if (line == "mode off")  { ledMode = MODE_OFF;  lvl.ledMode = ledMode; levelSave(); say("LED: off (cant blinking still works)", "{\"t\":\"ack\",\"cmd\":\"mode\",\"mode\":\"off\"}"); }
   else if (line == "shots")               handleShots("");
@@ -4952,6 +5017,7 @@ void handleCommand(String line) {
   else if (line.startsWith("awake "))     setAwake(line.substring(6));
   else if (line == "bat")                 printBat();
   else if (line == "bat reset")           bhReset();
+  else if (line == "factory" || line.startsWith("factory ")) factoryReset(line.substring(7));
   else if (line.startsWith("log put "))   logPut(line.substring(8));
   else if (line.startsWith("log putend ")) logPutEnd(line.substring(11));
   else if (line.startsWith("log ends "))  printEnds(line.substring(9));
@@ -5210,6 +5276,7 @@ void setup() {
   analogSampleTime(40);
 
   InternalFS.begin();
+  sightIdLoad();
   cfgLoad();
   // logInit() runs after bleInit(): the random epoch needs the SoftDevice
   levelLoad();

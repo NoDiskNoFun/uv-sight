@@ -14,7 +14,7 @@
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 7.3, protocol 24, app 5.20 |
+> | Firmware / protocol / app | Firmware 7.6, protocol 24, app 5.23 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -205,12 +205,13 @@ The USB cable must be connected, otherwise the command is refused (the board wou
 | `/group.bin` | internal | Shared sight: salted password hash, trainers, trainer requests | Automatically |
 | `/badges.bin` | internal | Play-mode badges a trainer stored (rules only, up to 16) | Automatically |
 | `/sightname.txt` | internal | Name of this sight (`name <text>`) | Automatically |
+| `/sightid.bin` | internal | The sight's id after a factory reset (random; without the file the chip's own id is used) | At the factory reset |
 | `/shotmodel.bin` | internal | Shot matching model per setup and its on/off switch (8 setups of older firmware are taken over) | Automatically |
 | `/bathist.bin` | internal | Battery history for the runtime estimate | Automatically |
 | session log | external 2 MB QSPI flash | Sessions and ends as 64-byte records with CRC, ring buffer | Automatically |
 | `/shots.old` | internal | Backup of the log format of firmware 1.2 to 2.1 after the migration | Once |
 
-When a firmware update changes the layout of an internal file, that file starts over with defaults. The session log on the external flash keeps its format. Export a backup from the app before updating anyway.
+`factory confirm` (asked for with `factory` first; in the apps under *Settings → Advanced settings → Factory reset*) erases all of it, the session log included, draws a new random id and restarts the sight: it is then as freshly flashed, and to the apps it is a new sight, so nothing the app holds about the old one (sessions, settings) is copied back. When a firmware update changes the layout of an internal file, that file starts over with defaults. The session log on the external flash keeps its format. Export a backup from the app before updating anyway.
 
 ---
 
@@ -224,13 +225,14 @@ When a firmware update changes the layout of an internal file, that file starts 
 
 ### Illumination
 
+- In the normal mode (`mode auto`) the LED lights only while a session is running and it is dark. A session starts with the first shot the sight registers, or earlier with `shots start` (the app's *Start session*); so the first arrow of a session shot without starting it in the app is unlit. The cant blinking and the distance warning work with or without a session.
 - Every 2 s the light sensor is read (0 = dark, 4095 = bright).
 - `confirm` readings in a row are needed to switch. Right after picking up the bow the decision is immediate.
 - **Brightness in percent** on a perceptual scale: 50 % looks about half as bright as 100 %. 100 % is 15 mA average, the former default of 5 mA is 61 %.
 - **Fixed** (`bright_mode 0`): below `dark_on` the LED switches on with `bright`, above `dark_off` it switches off. The gap prevents flicker.
 - **Auto** (`bright_mode 1`): getting darker, the LED comes on at `dark_off` with `bright_min` and gets brighter until it reaches `bright` at `dark_on`; below that it stays at `bright`. Getting brighter, it dims the same way and goes off above `dark_off`. The blend follows the light sensor logarithmically and glides over `fade` seconds instead of jumping.
 - The brightness is kept steady by PWM (12 bit) as the battery voltage drops.
-- Test modes: `mode on` (always on), `mode off` (always off), `mode auto` (normal). The mode is not saved.
+- Modes: `mode auto` (normal: dark and session), `mode on` (always on), `mode off` (always off). The mode is kept over restarts.
 
 ### Cant indicator
 
@@ -334,8 +336,9 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `set <name> <value>` | Change a setting, active immediately | Only with `save` |
 | `save` | Save settings to flash | Yes |
 | `defaults` | Load default settings | Only with `save` |
+| `factory`, then `factory confirm` within 30 s | Factory reset: erases every file above and the session log, gives the sight a new id and restarts. The sight is then as freshly flashed: no name, no password, defaults, and a new sight to the apps. On a shared sight trainers only. | – |
 | `live on` / `live off` | Status every 2 s | No |
-| `mode auto` / `on` / `off` | LED test mode | No |
+| `mode auto` / `on` / `off` | LED mode: on when dark during a session / always on / off | Yes |
 | `shots` | Counter status and running session | – |
 | `shots on` / `shots off` | Shot counter on/off (off only without a running session) | Immediately |
 | `shots start` / `shots stop` | Start / end a session manually | Slot on end |
@@ -363,7 +366,7 @@ Connect with any Nordic UART terminal (for example the Android app "Serial Bluet
 | `badge list`, `badge set …`, `badge del <id>`, `badge clear` | Play-mode badges stored on the sight, see above | Yes |
 | `auth <password>` | Unlock a shared sight for this link | No |
 | `group`, `group set <password>` / `-`, `group trainers`, `group request`, `group approve <id>`, `group remove <id>`, `group clear` (USB only) | Shared sight: password and trainers, see above | Yes |
-| `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "Anchored" in the Bluetooth name. `-` removes the name. The app also receives a fixed chip id, so two sights are told apart even without a name | Yes |
+| `name [text]`, `name -` | Name this sight (max. 16 characters); it appears in the app and behind "Anchored" in the Bluetooth name. `-` removes the name. The app also receives the sight's id (the chip's own, a new random one after a factory reset), so two sights are told apart even without a name | Yes |
 | `shot list [m]` | Shots of the open end, one line each (`shotsStart`, `shotItem`…, `shotsEnd`): time, aiming angle, hold spread and duration, sinking before release, cant, bow rotation at release and the model's predicted position. The same lines follow every closed end | – |
 | `shot trace [last] <i>` | Aim trace of one shot: angle and cant over the 1.9 s before the release, sent as `trace` lines of 8 samples each (`k` = index of the first, `n` = total) | – |
 | `shot teach <end> <i>:<dx>:<dy> …` | Confirmed arrow positions (mm from the group's mean) for shots of the last closed end: the model learns from them | Yes |
@@ -514,7 +517,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | `level` | `mode` (`off`/`auto`/`on`), `style` (`normal`/`inverted`), `cal`, `angle` (`off`/`auto`/`on`), `cantSignal`, `rangeSignal` | On `level`, after changes |
 | `cal` | `step`, `state` (`countdown`/`ok`/`error`), `text` | During calibration |
 | `event` | `e`: `idle`, `lowbat`, `charge` (+`state`), `light` (+`dark`), `range` (+`warn`: `low`/`high`/empty, `ok`) | Device events. `range` is sent whenever the aiming-range signal changes, so an app can mirror the LED (e.g. by vibrating) |
-| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `group` (+`what`, `pw` / `id` / `pending`), `badge` (+`what`, `id`) | Confirmation of a command |
+| `ack` | `cmd`: `set` (+`k`, `v`), `save`, `live` (+`on`), `mode` (+`mode`), `dfu`, `dist`, `awake`, `time`, `batreset`, `setup` (+`ok`, `id`), `put` / `putend` (+`result`), `del` (+`result`), `clear` (+`ok`, `count`), `factory` (+`armed` / `ok`, `id`, `newId`), `group` (+`what`, `pw` / `id` / `pending`), `badge` (+`what`, `id`) | Confirmation of a command |
 | `err` | `text` | Error |
 | `msg` | `text` | Any other human-readable message |
 

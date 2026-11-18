@@ -194,7 +194,7 @@ const uint32_t CAL_COUNTDOWN_MS  = 3000;  // wait time before a calibration meas
 const uint8_t  MAX_SCORES_LINE = 40;
 
 // Firmware / protocol
-const char*    FW_VERSION        = "7.6";
+const char*    FW_VERSION        = "7.7";
 const uint8_t  PROTO_VERSION     = 24;
 
 // Bluetooth
@@ -250,6 +250,7 @@ struct Config {
   float    blinkMaxHz;    // blink rate from tiltFullDeg on (normal style)
   float    fadeS;         // auto brightness: time to follow a change, s (0 = instant)
   uint16_t batMah;        // battery capacity, for the runtime estimate
+  uint8_t  bowType;       // the bow this sight is on: 0 compound, 1 recurve (with sight), 2 barebow, 3 traditional (hunting bow, longbow)
                          // (new fields are appended at the end so older stored
                          //  settings stay valid and get the default for them)
 };
@@ -285,7 +286,8 @@ const Config DEFAULTS = {
   1.0f,    // blinkMinHz
   8.0f,    // blinkMaxHz
   5.0f,    // fadeS
-  85       // batMah
+  85,      // batMah
+  0        // bowType (compound)
 };
 
 Config cfg = DEFAULTS;
@@ -327,6 +329,7 @@ const SettingDef SETTINGS[] = {
   {"report",    S_U32, offsetof(Config, reportS),     2,    600,  0, true,  "s",      "between status reports, 0 = off"},
   {"tx_power",  S_I8,  offsetof(Config, txPower),     -20,  8,    0, false, "dBm",    "radio power, higher = more range and current"},
   {"bat_mah",   S_U16, offsetof(Config, batMah),      10,   5000, 0, false, "mAh",    "battery capacity, for the runtime estimate"},
+  {"bow",       S_U8,  offsetof(Config, bowType),     0,    3,    0, false, "",       "bow: 0 compound, 1 recurve, 2 barebow, 3 traditional (the app's hints follow it)"},
 };
 const uint8_t SETTING_COUNT = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
 
@@ -4261,7 +4264,8 @@ uint32_t advLastMs = 0;
 void advPayload(uint8_t* b) {
   memset(b, 0, ADV_LEN);
   b[0] = 0xFF; b[1] = 0xFF; b[2] = 'U'; b[3] = 'V'; b[4] = 1;
-  b[5] = (sessionActive ? 1 : 0) | (groupHasPw() ? 2 : 0) | (sessionActive && !noId(sessOwnerId) ? 4 : 0) | (shotState.shotsOn ? 8 : 0) | (linkCount() ? 16 : 0);
+  b[5] = (sessionActive ? 1 : 0) | (groupHasPw() ? 2 : 0) | (sessionActive && !noId(sessOwnerId) ? 4 : 0) | (shotState.shotsOn ? 8 : 0) | (linkCount() ? 16 : 0)
+       | ((cfg.bowType & 3) << 5);   // bits 5..6: the bow type, for the trainer's board
   b[6] = (uint8_t)(lastPct < 0 ? 0 : (lastPct > 100 ? 100 : lastPct + 0.5f));
   b[7] = sessionActive ? (uint8_t)(endCount + 1 > 255 ? 255 : endCount + 1) : 0;
   b[8] = sessionActive ? endShots : 0;
@@ -4582,7 +4586,7 @@ void appOn() {
            "\",\"name\":\"" + BLE_NAME + "\",\"imu\":" + jbool(imuOk) + ",\"log\":" + jbool(qfOk) +
            ",\"twim89\":" + jbool(twimWorkaround) + ",\"id\":\"" + deviceIdHex() + "\",\"sname\":" + jstr(String(sightName)) + ",\"led\":" + jbool(ledPresent) +
            ",\"pw\":" + jbool(groupHasPw()) + ",\"role\":\"" + roleText(r) + "\",\"pending\":" + jbool(curLink >= 0 && links[curLink].pending) +
-           ",\"primary\":" + jbool(curLink < 0 || primaryLink() == curLink) + "}");
+           ",\"primary\":" + jbool(curLink < 0 || primaryLink() == curLink) + ",\"bow\":" + String(cfg.bowType) + "}");
   if (r == ROLE_LOCKED) return;        // the rest after "auth"
   sendCfg();
   sendLine(statusJson());

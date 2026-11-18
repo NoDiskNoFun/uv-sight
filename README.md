@@ -14,7 +14,7 @@
 > | Human role | Requirements and feature decisions, choice and purchase of parts, soldering and assembly, compiling and flashing, testing on the real bow, bug reports |
 > | AI role | Part selection and wiring, all firmware and app code, protocol design, research of datasheets and pinouts, documentation |
 > | Testing by the AI | Syntax and type checks of the firmware against mock libraries, JSON validity checks, and an end-to-end test of the app in Chromium against the firmware running natively with mocked IMU, flash and Bluetooth. The AI never ran the code on real hardware. |
-> | Firmware / protocol / app | Firmware 7.6, protocol 24, app 5.23 |
+> | Firmware / protocol / app | Firmware 7.7, protocol 24, app 5.23 |
 >
 > Several values in this project are estimates or were only checked in the field by the owner (runtimes, thresholds, shot detection). Treat them as starting points, not as guarantees. LiPo batteries can be dangerous if handled wrongly. Build and use this at your own risk.
 
@@ -292,7 +292,7 @@ A sight can be used by several archers in turn, for example in youth training, a
 - **Roles.** `hello` and `auth` report the link's `role`: `none` (no id, as before), `open` (id, no password on the sight), `locked` (password not given yet), `user` (password given) or `trainer`. Users see their own sessions and those without an owner in `log since`, `log ends` and the setup list; trainers and single-mode apps see everything.
 - **Trainers.** `group trainers` lists them (`trainersStart` / `trainer` / `trainersEnd`, `pending:true` for requests). A further trainer sends `group request` after `auth`; an existing trainer approves with `group approve <id>` or removes with `group remove <id>` (the last trainer only over USB). `group clear` wipes password and trainers and works over the USB console only, so nobody can take a sight over by radio.
 - **Setups per archer.** On a shared sight every archer gets their own setup (named after them, created on the first greeting) and the sight switches to it when they connect, so the speed model and the shot matching learn per bow. There are 32 setups since 7.0.
-- **Board data in the advertisement.** While it advertises, the sight puts manufacturer data (company id `0xFFFF`) into the packet: `"UV"`, version 1, flags (bit 0 session running, bit 1 password set, bit 2 session has an owner, bit 3 counter on, bit 4 a link is connected), battery %, end number, shots in the end, session points (16 bit), scored arrows, X count, the low 4 bytes of the chip id and the archer's name (8 bytes). A trainer's phone shows a whole range of sights from this without connecting. The 128-bit service UUID is no longer advertised (no room): apps find the sight by name and by this data.
+- **Board data in the advertisement.** While it advertises, the sight puts manufacturer data (company id `0xFFFF`) into the packet: `"UV"`, version 1, flags (bit 0 session running, bit 1 password set, bit 2 session has an owner, bit 3 counter on, bit 4 a link is connected, bits 5..6 the bow type), battery %, end number, shots in the end, session points (16 bit), scored arrows, X count, the low 4 bytes of the chip id and the archer's name (8 bytes). A trainer's phone shows a whole range of sights from this without connecting. The 128-bit service UUID is no longer advertised (no room): apps find the sight by name and by this data.
 - **Copying sessions in** (`log put …`) takes the owner as two optional trailing tokens, `<id> <name>`.
 - **Badges.** A trainer stores the play-mode badges of the group on the sight: `badge set <id> <metric> <scope> <min|max> <l1>[,<l2>[,<l3>]] <emoji> <title>` (up to 16; id 8 characters, metric and scope as the app names them, one to three thresholds for bronze, silver and gold), `badge del <id>`, `badge clear`, `badge list` (`badgesStart` / `badgeItem` / `badgesEnd`). On a shared sight only a trainer writes. The sight stores the rules only; every archer's app fetches them on connecting and works out what it earned from its own history, and keeps what it earned even when a badge is removed again.
 
@@ -406,6 +406,7 @@ Change with `set <name> <value>`, keep with `save`. Out-of-range values are reje
 | `report` | Automatic status while connected, 0 = off. A status the app asks for restarts this timer, so polling and reports do not double up | s | 10 | 0 or 2 | 600 |
 | `tx_power` | Bluetooth transmit power, rounded to −20, −16, −12, −8, −4, 0, 2…8 | dBm | 0 | −20 | 8 |
 | `bat_mah` | Battery capacity, for the runtime estimate | mAh | 85 | 10 | 5000 |
+| `bow` | The bow this sight is on: 0 compound, 1 recurve with sight, 2 barebow, 3 traditional (hunting bow, longbow). The app's hints and its suggested settings follow it; the sight itself behaves the same | – | 0 | 0 | 3 |
 
 **Calibrating the light thresholds:** at dusk send `live on`, watch the `Light=` value, set `dark_on` where the fibre no longer glows by itself and `dark_off` about 300 higher. Then `live off` and `save`.
 
@@ -490,7 +491,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 
 | Type | Fields | Sent |
 |---|---|---|
-| `hello` | `proto`, `fw`, `name`, `imu`, `log`, `twim89`, `id`, `sname`, `led`, `pw` (password set), `role`, `pending`, `primary` | On `app on`; a locked link gets nothing else until `auth` |
+| `hello` | `proto`, `fw`, `name`, `imu`, `log`, `twim89`, `id`, `sname`, `led`, `pw` (password set), `role`, `pending`, `primary`, `bow` (0..3, see `bow` setting) | On `app on`; a locked link gets nothing else until `auth` |
 | `auth` | `ok`, `role`, `pending` | Answer to `auth` |
 | `group` | `pw`, `trainers`, `waiting`, `role`, `pending` | On `group`, after a change |
 | `trainersStart` / `trainer` / `trainersEnd` | `n`; per trainer `id`, `name`, `pending` | On `group trainers`, after a change |

@@ -19,11 +19,14 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install Seeeduino:nrf52
           arduino-cli lib install "Seeed Arduino LSM6DS3"
+          # the core's post-build step packs a DFU zip with adafruit-nrfutil
+          pip3 install --user adafruit-nrfutil && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           arduino-cli core list; arduino-cli lib list
       - name: Compile
         # arduino-cli wants the sketch in a folder of the same name
         run: |
           mkdir -p build/anchored && cp sketch.ino build/anchored/anchored.ino
+          set -o pipefail
           arduino-cli compile --fqbn Seeeduino:nrf52:xiaonRF52840Sense --export-binaries --warnings default build/anchored 2>&1 | tee build/compile.log
           find build/anchored/build -type f | sort
       - name: UF2 and version.json

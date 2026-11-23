@@ -1,0 +1,67 @@
+name: Firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # the beta release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Board package and library
+        run: |
+          arduino-cli config init --additional-urls https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+          arduino-cli core update-index
+          arduino-cli core install Seeeduino:nrf52
+          arduino-cli lib install "Seeed Arduino LSM6DS3"
+          arduino-cli core list; arduino-cli lib list
+      - name: Compile
+        # arduino-cli wants the sketch in a folder of the same name
+        run: |
+          mkdir -p build/anchored && cp sketch.ino build/anchored/anchored.ino
+          arduino-cli compile --fqbn Seeeduino:nrf52:xiaonRF52840Sense --export-binaries --warnings default build/anchored 2>&1 | tee build/compile.log
+          find build/anchored/build -type f | sort
+      - name: UF2 and version.json
+        run: |
+          set -e
+          UF2=$(find build/anchored/build -name '*.uf2' | head -1)
+          HEX=$(find build/anchored/build -name '*.hex' | head -1)
+          if [ -n "$UF2" ]; then cp "$UF2" build/anchored.uf2
+          else
+            # the core left no UF2: make one from the hex (nRF52840 family id; the hex carries the addresses)
+            curl -sSL -o build/uf2conv.py https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py
+            curl -sSL -o build/uf2families.json https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json
+            python3 build/uf2conv.py -c -f 0xADA52840 -o build/anchored.uf2 "$HEX"
+          fi
+          FW=$(grep -oP 'FW_VERSION\s*=\s*"\K[^"]+' sketch.ino)
+          PROTO=$(grep -oP 'PROTO_VERSION\s*=\s*\K[0-9]+' sketch.ino)
+          cp build/anchored.uf2 "build/anchored-$FW.uf2"
+          SHA=$(sha256sum build/anchored.uf2 | cut -d' ' -f1)
+          printf '{"firmware":"%s","proto":%s,"file":"anchored.uf2","sha256":"%s","commit":"%s","built":"%s"}\n' \
+            "$FW" "$PROTO" "$SHA" "${GITHUB_SHA::7}" "$(date -u +%FT%TZ)" > build/version.json
+          cat build/version.json; ls -la build/*.uf2
+          echo "FW=$FW" >> "$GITHUB_ENV"
+          { echo "## Firmware $FW (protocol $PROTO)"; echo; echo '```'; cat build/version.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anchored-uf2
+          path: |
+            build/anchored.uf2
+            build/anchored-*.uf2
+            build/version.json
+            build/compile.log
+      - name: Beta release
+        # One rolling release "beta": https://github.com/<owner>/<repo>/releases/latest/download/anchored.uf2 is always the newest build
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete beta --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create beta build/anchored.uf2 "build/anchored-$FW.uf2" build/version.json --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "Anchored firmware $FW" \
+            --notes "Firmware $FW of commit ${GITHUB_SHA::7}, built by GitHub Actions. The Nocked app installs it over USB (Settings → App and firmware → Firmware update); by hand: put the sight into update mode and copy anchored.uf2 onto the drive it shows."

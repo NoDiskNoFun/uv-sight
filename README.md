@@ -50,7 +50,7 @@
 - **Bluetooth:** Everything can be read and configured over Bluetooth LE (Nordic UART Service), either with a serial terminal app or with the included web app.
 - **Web app (PWA):** Status, training keypad, history with chart, CSV export, backup and import, settings with guided calibration, automatic sync of sessions in both directions. Works offline once installed.
 - **Aiming range (optional):** With the distance set per end, the sight learns which aiming angle belongs to which distance and can warn when the aim does not fit the distance. Several arrow/bow setups can be kept.
-- **Update mode:** Reboot into the UF2 bootloader from the app, no double click on the reset button needed.
+- **Updates:** GitHub Actions compiles every push to `main` and publishes `anchored.uf2` as the rolling release `beta`. The Nocked app notices a newer firmware and installs it over a USB-C cable between the sight and the phone, step by step; by hand, copy the file onto the sight's UF2 drive.
 
 ---
 
@@ -185,14 +185,13 @@ arduino-cli upload  --fqbn Seeeduino:nrf52:xiaonRF52840Sense -p /dev/ttyACM0 pat
 
 The sketch file must have the same name as its folder, for example `uv_visier/uv_visier.ino`.
 
-### Update mode (UF2)
+### Ready-built firmware and updates
 
-Instead of double-clicking the reset button you can reboot the board into its UF2 bootloader:
+The workflow `.github/workflows/firmware.yml` compiles `sketch.ino` with `arduino-cli` (Seeed nRF52 core, board XIAO nRF52840 Sense) on every push and pull request and keeps the UF2 as the artifact `anchored-uf2`. A push to `main` also replaces the rolling GitHub release **beta**, so <https://github.com/NoDiskNoFun/uv-sight/releases/latest/download/anchored.uf2> is always the newest firmware; next to it lie `anchored-<version>.uf2` and `version.json` (`firmware`, `proto`, `sha256`, `commit`, `built`), which the Nocked app reads to notice a new version. Beta testers and the final version receive the firmware the same way.
 
-- in the app: *Settings → Firmware and app → Update mode*, or
-- in a terminal: send `dfu`.
+Installing with the app: *Settings → App and firmware → Firmware … is available → Update*. A window leads through six steps: the app downloads the file, you plug a USB-C cable into the sight and the phone (the phone powers the sight and acts as USB host), the app sends `dfu` over Bluetooth so the sight reboots into its UF2 bootloader, Android asks once whether the app may use the sight's USB drive, the app copies `anchored.uf2` onto that drive directly (no file manager), and the sight restarts with the new firmware and connects again.
 
-The USB cable must be connected, otherwise the command is refused (the board would sit in the bootloader and drain the battery). The board appears as a USB drive. Copy a `.uf2` firmware onto it, or upload with the Arduino tools.
+Installing by hand: plug the sight into a computer, send `dfu` from a terminal or the app's console (or double-click the reset button), and copy the `.uf2` onto the drive that appears. `dfu` is refused without a USB cable, since the board would sit in the bootloader and drain the battery.
 
 ### What is stored in flash
 
@@ -536,7 +535,7 @@ On `app on` the device sends `hello`, the settings (`cfgStart`, `cfgItem` …, `
 | PC finds the sight only briefly or not at all | Weak adapter: use a USB extension cable, avoid USB 3 ports, or raise `tx_power`. On Linux connect directly with `ble-serial -d <MAC> -t 15`; pairing is not needed. |
 | Connection drops | After `timeout` without movement the board disconnects on purpose. Move the bow or raise `timeout`. |
 | Settings tab says "Loading settings…" for long | Lines got lost. The app retries three times; move closer and tap *Try again*. |
-| Protocol warning in the app | Firmware and app versions do not match. Update both. |
+| Protocol warning in the app | Firmware and app versions do not match. Update both (the app offers both updates under *Settings → App and firmware*). |
 | Status reports keep coming after `live off` | That is the periodic `report`. Set `report 0` to switch it off. |
 | Linker error about `GPIOTE_IRQHandler` | The sketch owns the GPIOTE interrupt for the IMU line. Nothing else in the sketch may call `attachInterrupt`. |
 | LED switches nervously at dusk | Raise `confirm` or widen the gap between `dark_on` and `dark_off`. |
